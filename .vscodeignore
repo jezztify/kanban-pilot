@@ -1,0 +1,22 @@
+.vscode/**
+.vscode-test/**
+.claude/**
+.github/**
+docs/**
+node_modules/**
+src/**
+# compile-tests (tsc) now shares dist/ with the webpack bundle (extension.js) —
+# these are its unbundled, per-file output; only the bundle ships.
+dist/board/**
+dist/chat/**
+dist/model/**
+dist/test/**
+.gitignore
+.yarnrc
+webpack.config.js
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/eslint.config.mjs
+**/*.map
+**/*.ts
+**/.vscode-test.*

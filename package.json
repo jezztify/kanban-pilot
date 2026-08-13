@@ -1,0 +1,275 @@
+{
+  "name": "kanban-pilot",
+  "displayName": "Kanban Pilot",
+  "description": "A Kanban-first Copilot Chat Driver",
+  "repository": "https://github.com/jezztify/kanban-pilot.git",
+  "version": "0.0.1",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kanban-pilot",
+          "title": "Kanban Pilot",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "kanban-pilot": [
+        {
+          "id": "kanban-pilot.boardView",
+          "name": "Board",
+          "type": "webview",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "kanban-pilot.openBoard",
+        "title": "Open Board",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.newTask",
+        "title": "New Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.acceptTask",
+        "title": "Accept Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.refineTask",
+        "title": "Refine Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.splitTask",
+        "title": "Split Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.approveTask",
+        "title": "Approve Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.developTask",
+        "title": "Develop Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.continueRun",
+        "title": "Continue Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.stopRun",
+        "title": "Stop Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.validateTask",
+        "title": "Validate Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.reopenTask",
+        "title": "Reopen Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.openTaskFile",
+        "title": "Open Task File",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.deleteTask",
+        "title": "Delete Task",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.openTaskChat",
+        "title": "Open Task Chat",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.markRunComplete",
+        "title": "Mark Run Complete",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.seedSampleTasks",
+        "title": "Seed Sample Tasks",
+        "category": "Kanban Pilot"
+      }
+    ],
+    "configuration": {
+      "title": "Kanban Pilot",
+      "properties": {
+        "kanbanPilot.tasksDir": {
+          "type": "string",
+          "default": ".kanban-pilot/tasks",
+          "description": "Workspace-relative folder holding task markdown files."
+        },
+        "kanbanPilot.gates.backlogToRefine": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto accepts a new Backlog task and launches its refine run automatically, hands-off end to end. manual (default) waits for Accept, then Refine, to be clicked."
+        },
+        "kanbanPilot.gates.scopedToApproved": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto approves a freshly-scoped task into the Approved ready-queue automatically. Does not also start development — approvedToInProgress decides that separately, since Approved is a deliberate queue (§8.4), not a pass-through."
+        },
+        "kanbanPilot.gates.approvedToInProgress": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto starts development on the next Approved task automatically, once no other task is currently in-progress/running. manual (default) waits for Develop to be clicked."
+        },
+        "kanbanPilot.gates.validationAutoStart": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto launches Validate automatically the moment a task lands in Validation. manual (default) waits for Validate to be clicked."
+        },
+        "kanbanPilot.chat.mode": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "ask"
+          ],
+          "default": "agent",
+          "description": "Chat mode requested at injection."
+        },
+        "kanbanPilot.chat.sessionPrefix": {
+          "type": "string",
+          "default": "kanban-pilot-",
+          "description": "Session-id prefix; <prefix><taskId> is the per-task session (§6.7)."
+        },
+        "kanbanPilot.chat.closeTabOnDone": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close the task's chat tab when it reaches Done (session is retained)."
+        },
+        "kanbanPilot.chat.resetOnApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default: Develop and Validate deliberately continue the same conversation Refine started, and every prompt inlines the current task content regardless, which is the actual mitigation for stale agent reasoning."
+        },
+        "kanbanPilot.refine.toolsInclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Optional allowlist restricting which tools the refine stage may use. Empty (default) means no restriction — refine relies on its own prompt instruction not to touch code, the same trust G4 already places in develop and validate. Only set this to real tool ids confirmed via the Configure Tools picker: an allowlist that omits a file-edit tool blocks refine from writing its own Refined/Scope/receipt output."
+        },
+        "kanbanPilot.chat.toolsExclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "memory",
+            "resolveMemoryFileUri"
+          ],
+          "description": "Tools denied on every injection, every stage — the R12 mitigation (§6.8 layer 0)."
+        },
+        "kanbanPilot.chat.modelSelector": {
+          "type": "object",
+          "default": {},
+          "description": "Optional {id, vendor} to pin a model per run."
+        },
+        "kanbanPilot.chat.agentNames": {
+          "type": "object",
+          "default": {},
+          "description": "Per-stage overrides for the persona name each prompt opens with (@name). Keys: refine, develop, validate — split reuses refine's. Missing/empty keys fall back to the built-in defaults (Bro Refiner / Bro Coder / Bro QA). Editable from the board via each column's Agent edit icon."
+        },
+        "kanbanPilot.run.timeoutMinutes": {
+          "type": "number",
+          "default": 20,
+          "description": "Run marked failed after this many minutes."
+        },
+        "kanbanPilot.board.openOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open the board on workspace load."
+        },
+        "kanbanPilot.layout.dockChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the selected task's chat beside the board (§6.10)."
+        },
+        "kanbanPilot.layout.dockChatOnSelect": {
+          "type": "boolean",
+          "default": false,
+          "description": "Dock the chat when a card is selected. Off by default — selecting a card only opens the detail pane; open the chat explicitly via its \"Open Chat\" button, or let a stage run open it."
+        },
+        "kanbanPilot.chat.allowTaskProposals": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let develop and validate runs file follow-up work as new backlog tasks (§6.12) via a propose-task log line, capped at 5 per run. Off disables the capability entirely — any propose-task lines an agent writes are simply ignored."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir dist",
+    "watch-tests": "tsc -p . -w --outDir dist",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test",
+    "vsix": "vsce package -o dist/"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.9.2",
+    "eslint": "^10.5.0",
+    "ts-loader": "^9.6.2",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1",
+    "webpack": "^5.107.2",
+    "webpack-cli": "^7.0.3"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
