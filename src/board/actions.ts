@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { COLUMNS, Column } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { applyAction, TaskAction } from './stateMachine';
 
@@ -21,6 +22,16 @@ export type InvokeOutcome =
 	| { kind: 'illegal' }
 	| { kind: 'not-found' };
 
+export type MoveOutcome =
+	| { kind: 'applied' }
+	| { kind: 'no-op' }
+	| { kind: 'invalid' }
+	| { kind: 'not-found' };
+
+function isColumn(value: unknown): value is Column {
+	return typeof value === 'string' && (COLUMNS as readonly string[]).includes(value);
+}
+
 export async function invokeTaskAction(
 	store: TaskStore,
 	taskId: string,
@@ -39,6 +50,28 @@ export async function invokeTaskAction(
 
 	await store.patch(taskId, { state: result.state, status: result.status });
 	return { kind: 'applied', needsAgent: result.needsAgent };
+}
+
+export async function moveTask(
+	store: TaskStore,
+	taskId: unknown,
+	destination: unknown,
+): Promise<MoveOutcome> {
+	if (typeof taskId !== 'string' || !/^TASK-\d+$/.test(taskId) || !isColumn(destination)) {
+		return { kind: 'invalid' };
+	}
+
+	const { tasks } = await store.readAll();
+	const task = tasks.find((candidate) => candidate.id === taskId);
+	if (!task) {
+		return { kind: 'not-found' };
+	}
+	if (task.state === destination) {
+		return { kind: 'no-op' };
+	}
+
+	await store.patch(task.id, { state: destination, status: 'idle', run: undefined });
+	return { kind: 'applied' };
 }
 
 /**

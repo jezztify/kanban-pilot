@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { invokeTaskAction } from '../board/actions';
+import { invokeTaskAction, moveTask as moveTaskToColumn } from '../board/actions';
+import type { MoveOutcome } from '../board/actions';
 import { TaskAction } from '../board/stateMachine';
 import { Column, Status } from '../model/task';
 import { TaskStore } from '../model/taskStore';
@@ -179,6 +180,10 @@ export class RunManager {
 				await invokeTaskAction(this.store, taskId, action);
 				return;
 		}
+	}
+
+	async moveTask(taskId: unknown, destination: unknown): Promise<MoveOutcome> {
+		return moveTaskToColumn(this.store, taskId, destination);
 	}
 
 	/** §6.10: open the task's session beside the board. */

@@ -1010,6 +1010,7 @@ transition logic; it renders a snapshot and emits intents.
 | ext → view | `run/progress` | `{ taskId, elapsedMs }` for the running-card affordance |
 | view → ext | `task/select` | `{ taskId }` — open the task detail modal; docks that task's chat too only if `dockChatOnSelect` is on (§6.10) |
 | view → ext | `task/deselect` | `{}` — close the task detail modal (its × button, a backdrop click, or Escape) |
+| view → ext | `task/move` | `{ taskId, destination }` — manually move a card to another workflow column; the extension validates both values |
 | view → ext | `board/ready` | Webview mounted, request initial state |
 | view → ext | `action/invoke` | `{ taskId, action: 'accept' \| 'refine' \| ... }` |
 | view → ext | `task/create` | `{ title, description }` — the New Task modal (§6.16); `description` becomes `## Request`, falling back to `title` when left blank |
@@ -1018,6 +1019,14 @@ transition logic; it renders a snapshot and emits intents.
 | ext → view | `gates/state` | `{ gates }` — current value of all four `kanbanPilot.gates.*` settings (§6.15, §6.17) |
 | view → ext | `gates/set` | `{ key, value: 'manual' \| 'auto' }` — a Gates modal switch flip; also re-runs `applyGatePolicies()` immediately (§6.17) |
 | view → ext | `agentName/set` | `{ stage, value }` — the Edit agent name modal's Save (empty `value` resets to default); writes `kanbanPilot.chat.agentNames` (§6.17) |
+
+`task/move` is a manual state override, not a state-machine action: a valid cross-column move
+updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
+It preserves the task body and unrelated metadata, does not launch a stage or append a receipt,
+and clearing `run` makes any late result from the superseded run fail the existing staleness
+guard. Same-column, unknown-task, and invalid-column requests are no-ops. The normal task-file
+watcher may still apply an explicitly configured automatic gate after the write; the move path
+does not invoke that policy itself. Within-column reordering is not supported.
 
 Constraints: strict CSP with nonce, no external network, all styling via `--vscode-*` theme
 tokens so the board tracks the user's theme, full keyboard navigation.

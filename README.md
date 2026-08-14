@@ -7,6 +7,72 @@ composes and injects the right prompt into Copilot Chat at the right moment.
 Each task is a durable, git-diffable markdown file on disk. The board is a live projection of
 that folder: editing a task file by hand moves the card, and moving the card rewrites the file.
 
+## How It Works
+
+Kanban Pilot is a VS Code extension for driving GitHub Copilot Chat. It does not replace
+Copilot Chat or implement the work by itself. The Kanban board is the control plane: task cards,
+workflow columns, and gates decide what should happen next. GitHub Copilot Chat is the execution
+surface: Kanban Pilot opens a private session for the selected task, injects the stage prompt,
+and records the result back in the task file.
+
+The default workflow is deliberately staged so a task can be clarified and reviewed before
+Copilot Chat is asked to change code:
+
+| Stage | What happens |
+| --- | --- |
+| Backlog | Create or select a task, then click **Accept**. |
+| Refine | Click **Refine** to ask Copilot Chat to write the problem statement, acceptance criteria, and Scope. |
+| Scoped | Review the generated Scope and use the gate before approving it. |
+| Approved | Click **Approve** when the scope is ready for implementation. |
+| In Progress | Click **Develop** to ask Copilot Chat to implement the approved Scope. |
+| Validation | Click **Validate** to ask the QA stage to check the implementation against the criteria. |
+| Done | The task is complete after a successful validation receipt. |
+
+## Quick Start
+
+1. Install or enable GitHub Copilot Chat in VS Code, then install Kanban Pilot. GitHub Copilot
+  Chat is required because Kanban Pilot drives that chat surface.
+2. Open a workspace and run **Kanban Pilot: Open Board** from the Command Palette, or select the
+  Kanban Pilot activity-bar icon. The board is bound to the first workspace folder.
+3. Click **New Task** to enter a title and optional description, or select an existing card.
+  Selecting a card opens its task detail dialog; the task is stored as a markdown file under
+  `.kanban-pilot/tasks` by default.
+4. From **Backlog**, click **Accept**, then click **Refine**. Copilot Chat fills the task's
+  **Refined** and **Scope** sections and returns a receipt. Refine is a documentation step;
+  it must not write implementation code.
+5. Read the **Scope** in the task detail dialog. When it is ready, click **Approve**. This is
+  the review gate between planning and implementation.
+6. In **Approved**, click **Develop**. Copilot Chat receives the approved task and implements
+  the checklist. A task may show **Continue** when a run needs to resume.
+7. When the task reaches **Validation**, click **Validate**. The QA stage checks the actual
+  implementation against the acceptance criteria and moves successful work to **Done**.
+8. Use **Open Chat** in the task detail dialog to open that task's private Copilot Chat session
+  beside the board. Stage runs open the same task-specific session automatically when chat
+  docking is enabled.
+
+## Visual Walkthrough
+
+The board is the control plane for the task-specific Copilot Chat runs:
+
+![Kanban Pilot board showing the seven workflow columns and a task in In Progress](docs/media/board-workflow.png)
+
+The board shows the staged columns, per-stage agent labels, gate controls, and the card action
+for the current task.
+
+![Kanban Pilot New Task dialog with a title and description](docs/media/task-create.png)
+
+Use **New Task** to create a markdown-backed card with a title and an optional description.
+
+![Kanban Pilot task detail dialog with the Open Chat action](docs/media/task-copilot-chat.png)
+
+Select a card to review its Request, Refined, and Scope sections. **Open Chat** is the explicit
+handoff to that task's private GitHub Copilot Chat session, which opens beside the board.
+
+![Animated walkthrough of the Kanban Pilot board, task creation, and task detail handoff](docs/media/task-workflow.gif)
+
+This walkthrough uses the same board, New Task, and task detail surfaces in sequence so the
+control-plane-to-Copilot-Chat handoff is visible before running a stage.
+
 ## Features
 
 - **Staged workflow** — Backlog → Refine → Scoped → Approved → In Progress → Validation → Done,

@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import { COLUMNS, Column, STATUSES, Status } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { applyAction, TASK_ACTIONS, TaskAction } from '../board/stateMachine';
-import { invokeTaskAction, pickTaskFor } from '../board/actions';
+import { invokeTaskAction, moveTask, pickTaskFor } from '../board/actions';
 
 /** M2 — human transitions (PRD §5, §5.2, §6.8's Stop+reset precedent, §12 Q3). */
 
@@ -168,6 +168,69 @@ suite('M2 action invocation (src/board/actions.ts)', () => {
 	test('invokeTaskAction on a nonexistent task reports not-found', async () => {
 		const outcome = await invokeTaskAction(store, 'TASK-999', 'accept');
 		assert.deepStrictEqual(outcome, { kind: 'not-found' });
+	});
+
+	test('moveTask moves a card through every column and clears runtime state', async () => {
+		const task = await store.create('Move this task');
+		await store.patch(task.id, { status: 'running', run: 'r1' });
+
+		for (const destination of COLUMNS) {
+			if (destination === 'backlog') {
+				continue;
+			}
+			assert.deepStrictEqual(await moveTask(store, task.id, destination), { kind: 'applied' });
+		}
+
+		const after = (await store.readAll()).tasks[0];
+		assert.strictEqual(after.state, 'done');
+		assert.strictEqual(after.status, 'idle');
+		assert.strictEqual(after.run, undefined);
+	});
+
+	test('moveTask treats same-column and invalid moves as no-ops', async () => {
+		const task = await store.create('Keep this task');
+		const uri = store.fileFor(task.id);
+		const before = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+
+		assert.deepStrictEqual(await moveTask(store, task.id, 'backlog'), { kind: 'no-op' });
+		assert.deepStrictEqual(await moveTask(store, 'TASK-999', 'done'), { kind: 'not-found' });
+		assert.deepStrictEqual(await moveTask(store, 'not-a-task', 'done'), { kind: 'invalid' });
+		assert.deepStrictEqual(await moveTask(store, task.id, 'not-a-column'), { kind: 'invalid' });
+
+		const after = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		assert.strictEqual(after, before, 'no-op and invalid moves must not rewrite the task file');
+	});
+
+	test('moveTask preserves the task body and unrelated metadata', async () => {
+		const task = await store.create('Preserve this task');
+		const uri = store.fileFor(task.id);
+		const withBody = Buffer.from(await vscode.workspace.fs.readFile(uri))
+			.toString('utf8')
+			.replace('## Request\n', '## Request\nKeep this request.\n');
+		await vscode.workspace.fs.writeFile(uri, Buffer.from(withBody, 'utf8'));
+		await store.patch(task.id, {
+			state: 'scoped',
+			status: 'failed',
+			run: 'r2',
+			chat: 'kanban-pilot-TASK-001',
+			copilot_session_id: 'session-1',
+			scope_hash: 'abc1234',
+			checkpoint: 'deadbeef',
+			origin_task: 'TASK-001',
+		});
+
+		assert.deepStrictEqual(await moveTask(store, task.id, 'done'), { kind: 'applied' });
+
+		const after = (await store.readAll()).tasks[0];
+		assert.strictEqual(after.state, 'done');
+		assert.strictEqual(after.status, 'idle');
+		assert.strictEqual(after.run, undefined);
+		assert.strictEqual(after.chat, 'kanban-pilot-TASK-001');
+		assert.strictEqual(after.copilotSessionId, 'session-1');
+		assert.strictEqual(after.scopeHash, 'abc1234');
+		assert.strictEqual(after.checkpoint, 'deadbeef');
+		assert.strictEqual(after.originTask, 'TASK-001');
+		assert.ok(after.sections['Request'].includes('Keep this request.'));
 	});
 
 	test('pickTaskFor returns an explicit id without reading the store', async () => {

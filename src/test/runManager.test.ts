@@ -135,6 +135,21 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(executor.calls.length, 0, 'the executor must not have been called by accept');
 		});
 
+		test('manual move changes the column without launching a run', async () => {
+			const task = await store.create('Move without running');
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(store, executor, folder);
+
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'done'), { kind: 'applied' });
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(executor.calls.length, 0, 'a manual move must not invoke the executor');
+			assert.strictEqual(after.sections['Log'], '');
+		});
+
 		test('clicking Refine after Accept is what actually launches the run', async () => {
 			const task = await store.create('Set up billing webhook');
 			const executor = new StubExecutor(() => 'hang');
@@ -326,6 +341,27 @@ suite('M3 RunManager', () => {
 			const after = (await store.readAll()).tasks[0];
 			assert.strictEqual(after.status, 'idle', 'the stale resolution must not overwrite the superseding state');
 			assert.strictEqual(after.run, undefined);
+		});
+
+		test('a late result after a manual move cannot reclaim the card', async () => {
+			const task = await store.create('Move during a run');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			let resolveRun: ((r: ExecutorResult) => void) | undefined;
+			const executor = new StubExecutor(() => new Promise((resolve) => (resolveRun = resolve)));
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(() => executor.calls.length > 0);
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'done'), { kind: 'applied' });
+
+			resolveRun!({ ok: true, sessionId: 's1' });
+			await new Promise((r) => setTimeout(r, 200));
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(after.sections['Log'], '');
 		});
 
 		test('timeout marks the run failed and records it in the log', async () => {

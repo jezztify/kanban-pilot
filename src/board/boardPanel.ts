@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { AgentNameOverrides, NameableStage, resolveAgentName } from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
-import { COLUMN_LABELS, Column, Status, Task } from '../model/task';
+import { COLUMNS, COLUMN_LABELS, Column, Status, Task } from '../model/task';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
 import { TASK_ACTIONS, TaskAction } from './stateMachine';
@@ -156,6 +156,7 @@ const ACTION_LABELS: Record<TaskAction, string> = {
 interface InMessage {
 	type?: string;
 	taskId?: string;
+  destination?: unknown;
 	action?: string;
 	title?: string;
 	description?: string;
@@ -269,6 +270,12 @@ export class BoardPanel {
 					});
 				}
 				return;
+
+      case 'task/move':
+        if (message.taskId) {
+          await this.runManager.moveTask(message.taskId, message.destination);
+        }
+        return;
 
 			case 'task/select':
 				this.selectedTaskId = message.taskId;
@@ -411,6 +418,7 @@ export class BoardPanel {
 				scope: task.sections['Scope'] ?? '',
 				lastLog: logLines.at(-1) ?? '',
 				originTask: task.originTask,
+        moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
 				// The card face shows one button (primary); this is where the
 				// prototype's un-rendered secondary action (§5.2) lives instead.
 				secondary: secondaryAction(task.state),
@@ -467,7 +475,7 @@ export class BoardPanel {
 			`script-src 'nonce-${nonce}'`,
 		].join('; ');
 
-		const actionLabelsJson = JSON.stringify(ACTION_LABELS);
+    const actionLabelsJson = JSON.stringify(ACTION_LABELS);
 		const gatesJson = JSON.stringify(GATES);
 
 		return `<!DOCTYPE html>
@@ -652,6 +660,10 @@ export class BoardPanel {
     padding: var(--kp-pad-column);
     overflow: hidden;
   }
+  .column.drag-over {
+    border-color: var(--vscode-focusBorder);
+    background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+  }
   .column-head { flex: none; display: flex; flex-direction: column; gap: 3px; }
   .column-title-row { display: flex; align-items: center; gap: 6px; }
   .dot { width: 8px; height: 8px; border-radius: 100px; flex: none; }
@@ -689,6 +701,8 @@ export class BoardPanel {
     display: flex; flex-direction: column; gap: var(--kp-gap-card);
     cursor: pointer;
   }
+  .card[draggable="true"] { cursor: grab; }
+  .card.dragging { opacity: .55; cursor: grabbing; }
   .card:hover { border-color: var(--vscode-focusBorder); }
   .card.selected { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
   .card:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
@@ -928,6 +942,7 @@ export class BoardPanel {
   const vscode = acquireVsCodeApi();
   const ACTION_LABELS = ${actionLabelsJson};
   const GATES = ${gatesJson};
+  let draggedTaskId = null;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -1088,6 +1103,7 @@ export class BoardPanel {
 
   function actionButton(taskId, action) {
     const b = el('button', 'action', ACTION_LABELS[action]);
+    b.draggable = false;
     b.addEventListener('click', (e) => {
       e.stopPropagation();
       vscode.postMessage({ type: 'action/invoke', taskId, action });
@@ -1097,9 +1113,32 @@ export class BoardPanel {
 
   function renderCard(card, selectedId) {
     const node = el('div', 'card' + (card.id === selectedId ? ' selected' : ''));
+    node.draggable = true;
     node.tabIndex = 0;
     node.setAttribute('role', 'button');
     node.setAttribute('aria-label', card.id + ': ' + card.title);
+    let suppressClick = false;
+
+    node.addEventListener('dragstart', (e) => {
+      if (e.target instanceof Element && e.target.closest('button, select, input, textarea')) {
+        e.preventDefault();
+        return;
+      }
+      draggedTaskId = card.id;
+      suppressClick = false;
+      node.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', card.id);
+      }
+    });
+    node.addEventListener('dragend', () => {
+      node.classList.remove('dragging');
+      clearDropTargets();
+      draggedTaskId = null;
+      suppressClick = true;
+      setTimeout(() => { suppressClick = false; }, 0);
+    });
 
     const top = el('div', 'card-top');
     const idGroup = el('div', 'card-id-group');
@@ -1112,6 +1151,7 @@ export class BoardPanel {
     top.appendChild(idGroup);
     const del = el('button', 'icon-btn');
     del.innerHTML = trashIconSvg;
+    del.draggable = false;
     del.title = 'Delete task';
     del.setAttribute('aria-label', 'Delete task');
     del.addEventListener('click', (e) => {
@@ -1126,6 +1166,7 @@ export class BoardPanel {
     const foot = el('div', 'card-foot');
     const open = el('button', 'icon-btn');
     open.innerHTML = chatIconSvg;
+    open.draggable = false;
     open.title = 'Open task file';
     open.setAttribute('aria-label', 'Open task file');
     open.addEventListener('click', (e) => {
@@ -1137,6 +1178,7 @@ export class BoardPanel {
     if (card.canSplit) {
       const split = el('button', 'icon-btn');
       split.innerHTML = splitIconSvg;
+      split.draggable = false;
       split.title = 'Split into smaller tasks';
       split.setAttribute('aria-label', 'Split into smaller tasks');
       split.addEventListener('click', (e) => {
@@ -1156,11 +1198,21 @@ export class BoardPanel {
     node.appendChild(foot);
 
     const select = () => vscode.postMessage({ type: 'task/select', taskId: card.id });
-    node.addEventListener('click', select);
+    node.addEventListener('click', (e) => {
+      if (suppressClick) {
+        e.stopPropagation();
+        return;
+      }
+      select();
+    });
     node.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
     });
     return node;
+  }
+
+  function clearDropTargets() {
+    document.querySelectorAll('.column.drag-over').forEach((column) => column.classList.remove('drag-over'));
   }
 
   function renderBoard(snapshot, selectedId) {
@@ -1175,6 +1227,27 @@ export class BoardPanel {
 
     for (const column of snapshot.columns) {
       const node = el('div', 'column');
+
+      node.addEventListener('dragover', (e) => {
+        if (!draggedTaskId) { return; }
+        e.preventDefault();
+        if (e.dataTransfer) { e.dataTransfer.dropEffect = 'move'; }
+        clearDropTargets();
+        node.classList.add('drag-over');
+      });
+      node.addEventListener('dragleave', (e) => {
+        if (!e.relatedTarget || !node.contains(e.relatedTarget)) {
+          node.classList.remove('drag-over');
+        }
+      });
+      node.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const taskId = draggedTaskId || (e.dataTransfer && e.dataTransfer.getData('text/plain'));
+        clearDropTargets();
+        if (taskId) {
+          vscode.postMessage({ type: 'task/move', taskId, destination: column.id });
+        }
+      });
 
       const head = el('div', 'column-head');
       const titleRow = el('div', 'column-title-row');
@@ -1293,6 +1366,26 @@ export class BoardPanel {
     modal.appendChild(head);
 
     const body = el('div', 'modal-body');
+
+    const moveControl = el('label', 'field');
+    moveControl.appendChild(el('span', 'field-label', 'Move to column'));
+    const moveSelect = document.createElement('select');
+    moveSelect.className = 'field-input';
+    moveSelect.setAttribute('aria-label', 'Move task to column');
+    for (const target of task.moveTargets) {
+      const option = document.createElement('option');
+      option.value = target.id;
+      option.textContent = target.label;
+      moveSelect.appendChild(option);
+    }
+    moveSelect.value = task.state;
+    moveSelect.addEventListener('change', () => {
+      if (moveSelect.value !== task.state) {
+        vscode.postMessage({ type: 'task/move', taskId: task.id, destination: moveSelect.value });
+      }
+    });
+    moveControl.appendChild(moveSelect);
+    body.appendChild(moveControl);
 
     const links = el('div', 'modal-actions');
     const openLink = el('button', 'modal-link', 'Open task file →');
