@@ -154,6 +154,48 @@ suite('M3 prompt templates', () => {
 		}
 	});
 
+	test('each default template labels completion and non-completion with stage-specific receipt results', async () => {
+		const { folder, dispose } = await tempFolder();
+		try {
+			const expectedResults = {
+				refine: { completion: ['ok'], nonCompletion: ['blocked'] },
+				develop: { completion: ['ok'], nonCompletion: ['blocked'] },
+				validate: { completion: ['ok', 'failed'], nonCompletion: ['blocked'] },
+				split: { completion: ['ok'], nonCompletion: ['blocked'] },
+			} as const;
+
+			for (const stage of ['refine', 'develop', 'validate', 'split'] as const) {
+				const template = await loadPromptTemplate(folder, stage);
+				const rendered = renderTemplate(
+					template,
+					baseVars({ agentName: STAGE_AGENT_NAME[stage], projectName: folder.name, runId: 'r7' }),
+				);
+				const completionStart = rendered.indexOf('### Completion');
+				const nonCompletionStart = rendered.indexOf('### Non-completion');
+
+				assert.ok(completionStart >= 0, `${stage}: missing the Completion label`);
+				assert.ok(nonCompletionStart > completionStart, `${stage}: missing the Non-completion label`);
+
+				const completion = rendered.slice(completionStart, nonCompletionStart);
+				const nonCompletion = rendered.slice(nonCompletionStart);
+				for (const result of expectedResults[stage].completion) {
+					assert.ok(
+						completion.includes(`run:r7 task:TASK-142 stage:${stage} result:${result}`),
+						`${stage}: completion path must document result:${result}`,
+					);
+				}
+				for (const result of expectedResults[stage].nonCompletion) {
+					assert.ok(
+						nonCompletion.includes(`run:r7 task:TASK-142 stage:${stage} result:${result}`),
+						`${stage}: non-completion path must document result:${result}`,
+					);
+				}
+			}
+		} finally {
+			await dispose();
+		}
+	});
+
 	test('the develop template inlines Refined and Scope rather than referencing them (§6.8)', async () => {
 		const { folder, dispose } = await tempFolder();
 		try {

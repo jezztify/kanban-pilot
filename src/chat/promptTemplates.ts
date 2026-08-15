@@ -78,9 +78,14 @@ Do not write or edit any code. This stage is scoping only.
 {{request}}
 
 ## On Completion
-Append this line to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
+### Completion
+After completing the scoping work, append this line to the \`## Log\` section
+of \`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:refine result:ok note:"<one line summary>"
-If you could not proceed, use result:blocked with the reason in the note.
+### Non-completion
+If you could not proceed, append this line instead, with the reason in the
+note:
+- run:{{runId}} task:{{id}} stage:refine result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`.
 The extension owns that block and moves the card on its own once it sees your
@@ -108,9 +113,14 @@ something outside it blocks you, stop and report it rather than improvising.
 {{scope}}
 
 ## On Completion
-Append this line to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
+### Completion
+After completing the implementation work, append this line to the \`## Log\`
+section of \`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
-If you could not proceed, use result:blocked with the reason in the note.
+### Non-completion
+If you could not proceed, append this line instead, with the reason in the
+note:
+- run:{{runId}} task:{{id}} stage:develop result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`,
 \`## Refined\`, or \`## Scope\`. The extension owns the frontmatter and moves the
@@ -141,14 +151,17 @@ you're checking. Do not fix anything yourself; only report whether it passes.
 {{scope}}
 
 ## On Completion
-Append exactly one of these lines to the \`## Log\` section of
-\`.kanban-pilot/tasks/{{id}}.md\`:
+### Completion
+When validation reaches a pass/fail verdict, append exactly one of these lines
+to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:validate result:ok note:"<what you checked>"
   — the criteria are met.
 - run:{{runId}} task:{{id}} stage:validate result:failed note:"<what's missing>"
   — the criteria are not met; the ticket goes back to In Progress for another pass.
-If you could not determine a pass or fail, use result:blocked with the reason
-in the note.
+### Non-completion
+If you could not determine a pass or fail, append this line instead, with the
+reason in the note:
+- run:{{runId}} task:{{id}} stage:validate result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`,
 \`## Refined\`, or \`## Scope\`. The extension owns the frontmatter and moves the
@@ -194,6 +207,7 @@ that's the normal Refine stage's job, not this one.
 {{/scope}}
 
 ## On Completion
+### Completion
 If you split this ticket, file each smaller task first — one line per task,
 added to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
 - propose-task run:{{runId}} title:"<short title>" note:"<what this piece covers>"
@@ -202,6 +216,7 @@ Then append this line after them:
 This task becomes tracking-only once split — do not also give it an
 implementation Scope, and do not implement anything yourself here.
 
+### Non-completion
 If it does not need splitting, append this instead, and nothing else:
 - run:{{runId}} task:{{id}} stage:split result:blocked note:"<why one ticket is fine>"
 This leaves it exactly where a normal Refine can pick it up next.
