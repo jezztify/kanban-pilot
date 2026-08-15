@@ -3,7 +3,7 @@ import { deleteTask, pickTaskFor } from './board/actions';
 import { BoardPanel } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
 import { ChatSessionExecutor } from './chat/executor';
-import { RunManager } from './chat/runManager';
+import { normalizeMaxParallelTasks, RunManager } from './chat/runManager';
 import { TaskStore } from './model/taskStore';
 
 const executor = new ChatSessionExecutor();
@@ -43,6 +43,8 @@ function context(): { store: TaskStore; runManager: RunManager } | undefined {
  * rather than a panel toggle.
  */
 class BoardViewProvider implements vscode.WebviewViewProvider {
+	constructor(private readonly extensionUri: vscode.Uri) {}
+
 	resolveWebviewView(webviewView: vscode.WebviewView): void {
 		webviewView.webview.options = { enableScripts: false };
 		webviewView.webview.html = '';
@@ -62,7 +64,7 @@ class BoardViewProvider implements vscode.WebviewViewProvider {
 	private openBoard(): void {
 		const ctx = context();
 		if (ctx) {
-			BoardPanel.show(ctx.store, ctx.runManager);
+			BoardPanel.show(ctx.store, ctx.runManager, this.extensionUri);
 		}
 	}
 }
@@ -101,22 +103,49 @@ export function activate(context_: vscode.ExtensionContext) {
 	if (startupFolder) {
 		const store = storeFor(startupFolder);
 		const gateRunManager = new RunManager(store, executor, startupFolder);
-		void gateRunManager.reconcileOnActivation().then(() => gateRunManager.applyGatePolicies());
+		const runConfig = vscode.workspace.getConfiguration('kanbanPilot.run');
+		let previousMaxParallelTasks = normalizeMaxParallelTasks(runConfig.get<number>('maxParallelTasks', 1));
+		let watcherQueue: Promise<void> = Promise.resolve();
+		watcherQueue = watcherQueue
+			.then(() => gateRunManager.reconcileOnActivation())
+			.then(() => gateRunManager.applyGatePolicies())
+			.catch(() => undefined);
+		const enqueueWatcherChange = (taskId?: string): void => {
+			watcherQueue = watcherQueue
+				.then(() => gateRunManager.reconcileTaskChange(taskId))
+				.then(() => gateRunManager.applyGatePolicies())
+				.catch(() => undefined);
+		};
 		// §6.15: re-sweep on every change, not just at startup — disk is
 		// authoritative (G5), so a gate firing (or a human hand-editing a task
 		// file directly) both need to be picked up the same way.
-		context_.subscriptions.push(store.watch(() => void gateRunManager.applyGatePolicies()));
+		context_.subscriptions.push(store.watch(enqueueWatcherChange));
+		context_.subscriptions.push(
+			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (!event.affectsConfiguration('kanbanPilot.run.maxParallelTasks')) {
+					return;
+				}
+				const currentMaxParallelTasks = normalizeMaxParallelTasks(
+					vscode.workspace.getConfiguration('kanbanPilot.run').get<number>('maxParallelTasks', 1),
+				);
+				const increased = currentMaxParallelTasks > previousMaxParallelTasks;
+				previousMaxParallelTasks = currentMaxParallelTasks;
+				if (increased) {
+					enqueueWatcherChange();
+				}
+			}),
+		);
 	}
 
 	context_.subscriptions.push(
-		vscode.window.registerWebviewViewProvider('kanban-pilot.boardView', new BoardViewProvider()),
+		vscode.window.registerWebviewViewProvider('kanban-pilot.boardView', new BoardViewProvider(context_.extensionUri)),
 	);
 
 	context_.subscriptions.push(
 		vscode.commands.registerCommand('kanban-pilot.openBoard', () => {
 			const ctx = context();
 			if (ctx) {
-				BoardPanel.show(ctx.store, ctx.runManager);
+				BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
 			}
 		}),
 
@@ -265,7 +294,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			}
 
 			void vscode.window.showInformationMessage(`Seeded ${samples.length} tasks.`);
-			BoardPanel.show(ctx.store, ctx.runManager);
+			BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
 		}),
 	);
 
@@ -282,7 +311,7 @@ export function activate(context_: vscode.ExtensionContext) {
 	if (startupFolder && vscode.workspace.getConfiguration('kanbanPilot').get<boolean>('board.openOnStartup', false)) {
 		const ctx = context();
 		if (ctx) {
-			BoardPanel.show(ctx.store, ctx.runManager);
+			BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
 		}
 	}
 }

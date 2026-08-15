@@ -445,17 +445,17 @@ cooperative protocol with a non-deterministic party:
 
 ### 6.5 Prompt templates
 
-Stage prompts live at `.kanban-pilot/prompts/{refine,develop,validate}.md` and are user-editable
+Stage prompts live at `.kanban-pilot/prompts/{refine,develop,validate,split}.md` and are user-editable
 — they are the main tuning surface for output quality. Extension seeds each default on its
 first use (`chat/promptTemplates.ts`); once a file exists, it always wins over the built-in
 default, including when the built-in default text later changes.
 
 Templates are rendered with the task's fields and a mandatory receipt footer the extension
 appends (users can edit the body but not remove the receipt contract). Structure is fixed
-across all three templates — `@{{agentName}}`, then a `## [{{projectName}} {{id}}]` banner,
+across all four stage templates — `@{{agentName}}`, then a `## [{{projectName}} {{id}}]` banner,
 then `# {{title}}`, then the stage's own instructions, then `## Request` with the material
-this stage needs, then `## On Completion` with the receipt instructions. The **develop**
-template:
+this stage needs, then `## On Completion` with separately labelled `### Completion` and
+`### Non-completion` receipt instructions. The **develop** template:
 
 ```
 @{{agentName}}
@@ -479,15 +479,23 @@ something outside it blocks you, stop and report it rather than improvising.
 {{scope}}
 
 ## On Completion
-Append this line to the `## Log` section of `.kanban-pilot/tasks/{{id}}.md`:
+### Completion
+After completing the implementation work, append this line to the `## Log` section of
+`.kanban-pilot/tasks/{{id}}.md`:
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
-If you could not proceed, use result:blocked with the reason in the note.
+### Non-completion
+If a concrete blocker prevents implementation, do not append the completion receipt.
+Append exactly one non-completion receipt, with a concise, actionable explanation of
+the blocker, missing decision, required human input, or unresolved question in `note`:
+- run:{{runId}} task:{{id}} stage:develop result:blocked note:"<one line reason>"
 ```
 
 **Refine** is shaped the same way but its `## Request` holds the raw `## Request` section
 instead of `## Refined`/`## Scope` (nothing to inherit yet) and it explicitly forbids editing
 code. **Validate** reads `## Refined`/`## Scope` like develop does, but its `## On Completion`
-explains *two* outcome lines instead of one — see below.
+has two completion outcomes plus a non-completion outcome — see below. **Split** uses the
+same receipt sections while treating `propose-task` lines as its primary completion work;
+when no split is needed, its blocked note explains why one ticket is sufficient.
 
 Four details are load-bearing rather than cosmetic:
 
@@ -506,14 +514,21 @@ Four details are load-bearing rather than cosmetic:
 live outcomes instead of two:
 
 ```
-When finished, append exactly one of these lines to the `## Log` section of
+### Completion
+When validation reaches a pass/fail verdict, append exactly one of these completion lines
+to the `## Log` section of
 `.kanban-pilot/tasks/{{id}}.md`:
 - run:{{runId}} task:{{id}} stage:validate result:ok note:"<what you checked>"
   — the criteria are met.
 - run:{{runId}} task:{{id}} stage:validate result:failed note:"<what's missing>"
-  — the criteria are not met; the ticket goes back to In Progress for another pass.
-If you could not determine a pass or fail, use result:blocked with the reason
-in the note.
+  — validation completed, but the criteria are not met; the ticket goes back to In Progress
+  for another pass. This is a verdict, not a run error.
+### Non-completion
+If missing evidence, ambiguous criteria, or another concrete blocker prevents a pass/fail
+verdict, do not use `result:failed`. Append exactly one blocked receipt instead, with a
+concise, actionable explanation of the missing evidence, blocker, required human input, or
+unresolved question in the `note`.
+- run:{{runId}} task:{{id}} stage:validate result:blocked note:"<one line reason>"
 ```
 
 `result:failed` here is a genuine verdict the agent is being asked to *reach*, not merely an
@@ -941,9 +956,10 @@ markdown, code blocks, and tool cards that can only ever lag Copilot's own.
 
 The task's chat editor opens beside the board. It is not a copy of the chat — it *is* the chat.
 Docking is explicit rather than a side effect of browsing: the detail pane's **Open Chat**
-button opens it, and so does a stage run's own open+inject (§6.9) — but selecting a card by
-itself only shows the detail pane. `kanbanPilot.layout.dockChatOnSelect` (default `false`)
-opts back into the earlier behaviour of docking on every selection, for anyone who prefers it.
+button opens it, and clicking **Refine**, **Develop**, or **Validate** pre-opens it before the
+stage run's own open+inject (§6.9) — but selecting a card by itself only shows the detail pane.
+`kanbanPilot.layout.dockChatOnSelect` (default `false`) opts back into the earlier behaviour
+of docking on every selection, for anyone who prefers it.
 
 ```
 ┌──────────────────────────────────────┬────────────────────────────┐
@@ -958,7 +974,7 @@ opts back into the earlier behaviour of docking on every selection, for anyone w
         ViewColumn.One                       ViewColumn.Beside
 ```
 
-Opening it — from the Open Chat button, or via `dockChatOnSelect` — calls
+Opening it — from the Open Chat button, a named stage action, or via `dockChatOnSelect` — calls
 `vscode.open(sessionUriFor(task), { viewColumn: Beside, preserveFocus: true, pinned: false })`.
 `preserveFocus` keeps the user's cursor on the board; `pinned: false` gives preview-tab
 behaviour so opening another task's chat **replaces** this one rather than accumulating tabs.
@@ -1012,7 +1028,7 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `task/deselect` | `{}` — close the task detail modal (its × button, a backdrop click, or Escape) |
 | view → ext | `task/move` | `{ taskId, destination }` — manually move a card to another workflow column; the extension validates both values |
 | view → ext | `board/ready` | Webview mounted, request initial state |
-| view → ext | `action/invoke` | `{ taskId, action: 'accept' \| 'refine' \| ... }` |
+| view → ext | `action/invoke` | `{ taskId, action: 'accept' \| 'refine' \| ... }` — Refine, Develop, and Validate first dock the task's chat beside the board when `layout.dockChat` is enabled |
 | view → ext | `task/create` | `{ title, description }` — the New Task modal (§6.16); `description` becomes `## Request`, falling back to `title` when left blank |
 | view → ext | `task/open` | `{ taskId }` — opens the markdown file in an editor |
 | view → ext | `task/openChat` | `{ taskId }` — the modal's Open Chat button; docks that task's chat beside the board (§6.10) |
@@ -1183,7 +1199,7 @@ click for throughput, not a loophole.
 | --- | --- | --- |
 | `gates.backlogToRefine` | Backlog → Refine | Accepts a new Backlog task **and** launches its refine run, in one continuous step — Refine has no queue concept, so there's no reason to stop halfway |
 | `gates.scopedToApproved` | Scoped → Approved | Approves a freshly-scoped task into the Approved ready-queue only — does **not** also start development. Approved is §8.4's deliberate queue, not a pass-through, so this gate and the next stay independent even though `backlogToRefine` fuses its own equivalent pair |
-| `gates.approvedToInProgress` | Approved → In Progress | Starts development on the next Approved task, but only once no other task is `in-progress`/`running` — a minimal, hand-rolled single-slot check (below), not M4's real enforcement |
+| `gates.approvedToInProgress` | Approved → In Progress | Starts development on the next Approved task when the shared run-capacity limit has room |
 | `gates.validationAutoStart` | Validation → Done (via Validate) | Launches Validate the moment a task lands in Validation |
 
 **Corrected while implementing, not just documented:** the table's fourth row used to read
@@ -1209,16 +1225,13 @@ in a gated column and the matching setting is `auto`. Two things worth being exp
   click, and no gate setting overrides that. This wasn't a question left open for later; it's a
   deliberate line M5 draws even though nothing in G3 strictly requires it.
 
-**The single-slot check is real but minimal.** `approvedToInProgress`'s own description promises
-"once the slot is free," so a sweep that found three Approved/idle tasks with the gate on
-shouldn't auto-start all three. `applyGatePolicies` tracks a `slotTaken` flag seeded from
-whether any task is currently `in-progress`/`running`, and sets it the moment this same sweep
-fires a develop — enough for the gate's own description to hold. It is **not** M4's real
-enforcement (checkpointing, `revertToCheckpoint`, an actual reservation): a human could still
-click Develop on a second Approved task by hand and nothing here would stop them, same as
-before M5. Skipping M4 to build M5 first means this gap is now load-bearing for `auto` mode
-specifically, in a way it wasn't when every gate was a human decision — worth knowing before
-turning `approvedToInProgress` on in a workspace where that matters.
+The gate delegates admission to the same shared coordinator as every manual stage action. A
+sweep that finds more eligible tasks than the configured capacity starts only as many as fit;
+remaining tasks are left untouched in their current columns. The coordinator reserves capacity
+before applying a transition, counts persisted `status: running` tasks after reload, and releases
+reservations on completion, failure, timeout, stop, manual movement, or stale-run detection.
+The default remains one, while values above one are an explicit same-workspace concurrency opt-in
+and do not provide worktree isolation.
 
 ### 6.16 New Task modal
 
@@ -1309,7 +1322,7 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | --- | --- | --- | --- |
 | `kanbanPilot.gates.backlogToRefine` | `manual \| auto` | `manual` | Auto-accept a new Backlog task **and** launch its refine run — one continuous step (§6.15) |
 | `kanbanPilot.gates.scopedToApproved` | `manual \| auto` | `manual` | Auto-approve a freshly-scoped task into the Approved ready-queue. Does **not** also auto-develop — that's a separate gate below, deliberately, since Approved is §8.4's queue |
-| `kanbanPilot.gates.approvedToInProgress` | `manual \| auto` | `manual` | Auto-start development on the next Approved task once the in-progress slot is free (§6.15's minimal slot check, pending real M4 enforcement) |
+| `kanbanPilot.gates.approvedToInProgress` | `manual \| auto` | `manual` | Auto-start development on the next Approved task when the shared run-capacity limit has room (§6.15) |
 | `kanbanPilot.gates.validationAutoStart` | `manual \| auto` | `manual` | Auto-launch Validate the moment a task lands in Validation. Replaces an earlier `inProgressToDone` entry that stopped corresponding to anything once the Validation column was added — validate's own `result:ok` already lands on Done automatically, same as refine → scoped |
 | `kanbanPilot.tasksDir` | `string` | `.kanban-pilot/tasks` | Task folder, workspace-relative |
 | `kanbanPilot.chat.mode` | `agent \| ask` | `agent` | Chat mode requested at injection |
@@ -1321,6 +1334,7 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.chat.modelSelector` | `object` | `{}` | Optional `{id, vendor}` to pin a model per run |
 | `kanbanPilot.chat.agentNames` | `object` | `{}` | Per-stage persona overrides (`{refine, develop, validate}`) for the `@name` a prompt opens with — `split` reuses `refine`'s. Missing/empty keys fall back to the built-in defaults (Bro Refiner / Bro Coder / Bro QA). Editable from the board via each agent column's edit-pencil (§6.17) |
 | `kanbanPilot.run.timeoutMinutes` | `number` | `20` | Run marked `failed` after this |
+| `kanbanPilot.run.maxParallelTasks` | `number` | `1` | Maximum active Refine, Split, Develop/Continue, and Validate runs. Invalid, non-positive, or non-integer values normalize to `1`; values above one permit concurrent same-workspace edits without worktree isolation |
 | `kanbanPilot.develop.checkpoint` | `commit \| stash \| none` | `commit` | Pre-develop working-tree snapshot |
 | `kanbanPilot.board.openOnStartup` | `boolean` | `false` | Open the board on workspace load |
 | `kanbanPilot.layout.dockChat` | `boolean` | `true` | Master switch for docking the chat beside the board at all (§6.10) |
@@ -1399,44 +1413,28 @@ Shipping defaults that match the design means the out-of-box experience is fully
 Users open the throttle where they've earned trust — commonly `backlogToRefine: auto` (cheap,
 reversible, no code written) while keeping `approvedToInProgress: manual` forever.
 
-### 8.4 Single execution slot on the current branch
+### 8.4 Configurable execution capacity on the current branch
 
-v1 runs one task at a time and edits the working tree in place. No branch switching, no
-worktrees, no dependency-install duplication, no reconciling parallel agent edits.
+v1 edits the current working tree in place and exposes one global run-capacity setting:
+`kanbanPilot.run.maxParallelTasks`. It counts all active Refine, Split, Develop/Continue, and
+Validate runs, defaults to one, and treats invalid, non-positive, or non-integer values as one.
+The extension reserves capacity before changing a task into a running stage, coordinates
+reservations across independently-created `RunManager` instances, and also counts persisted
+`status: running` tasks after a reload. When capacity is full, a manual or automatic start is a
+no-op; the task remains in its current column, with Approved serving as the visible ready queue.
 
-Safety comes from the checkpoint instead: before a develop run, the extension commits the
-working tree (default) and records the sha in frontmatter, making `revertToCheckpoint` a
-one-click undo of everything the agent did.
+Values above one are an explicit opt-in to concurrent agent work in the same workspace. They do
+not isolate working trees, dependencies, or task-file edits, so the user accepts the risk of
+parallel code-writing runs colliding. The default of one preserves the safest current-branch
+behavior and the checkpoint story: before a develop run, the extension commits the working tree
+(default) and records the sha in frontmatter, making `revertToCheckpoint` a one-click undo of
+everything the agent did.
 
-The **Approved** column is what makes this bearable — it's an explicit ready-queue, so
-"one at a time" is a visible property of the board rather than a hidden limitation.
-
-*Deferred to v2:* worktree-per-task for true parallelism. The `Executor` and `RunManager`
-interfaces are designed to accept a working-directory parameter so this is additive.
-
-**Validation joining the working columns (§5) doesn't reopen this concern.** The exclusivity
-this section describes is about the *working tree* — only one run should be editing code at a
-time. Validate is read-only *by instruction, not by capability* (§6.6: `toolsInclude` is
-`undefined` for validate, same as develop — nothing technically stops it from editing; its
-prompt explicitly says *"do not fix anything yourself"* and that's the entire mechanism), so it
-doesn't compete for the same kind of safety develop needs, in practice rather than by construction.
-
-**What's actually enforced today, plainly stated:** the injection *mutex* (§6.9) serializes only
-the brief open-and-inject step, not an entire run — it exists to stop two card actions from
-racing for chat focus, not to stop two tasks' turns from being in flight at once. Nothing in
-`RunManager` currently blocks starting a refine (or, today, a develop or validate) run on task B
-while task A's is still awaiting `blockOnResponse`. "One task at a time" is accurate as a
-**checkpoint/working-tree safety story once M4 builds it** and as a **UI expectation** the
-Approved ready-queue nudges toward; it is not yet a coded constraint. True single-slot
-*enforcement* for develop specifically remains M4 exit criteria, not something this section
-should be read as already guaranteeing.
-
-**One narrow exception, added by M5 (§6.15):** `RunManager.applyGatePolicies()` — the code path
-behind `gates.approvedToInProgress`'s `auto` mode specifically — does check for an in-flight
-develop before starting another, and won't start a second one within the same sweep either. That
-is real, but it is *not* the general constraint this section describes: it only guards the
-auto-gate's own decision, not a human clicking Develop by hand on a second Approved task, which
-still works exactly as it always has. M4 is still what would close that gap for good.
+The Executor's mutex (§6.9) remains intentionally narrower: it serializes only the brief
+open-and-inject step so chat focus cannot race. It is not the full-run coordinator. Worktree-per-
+task isolation for safer true parallel code-writing remains future work; the `Executor` and
+`RunManager` interfaces are designed to accept a working-directory parameter so that can remain
+additive.
 
 ---
 

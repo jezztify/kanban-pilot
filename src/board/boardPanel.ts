@@ -153,6 +153,23 @@ const ACTION_LABELS: Record<TaskAction, string> = {
 	reopen: 'Reopen',
 };
 
+/** Actions whose board buttons explicitly open the task chat beside the board. */
+export function shouldDockTaskChat(action: TaskAction): boolean {
+  return action === 'refine' || action === 'develop' || action === 'validate';
+}
+
+/** Runs a board action after its requested task-chat docking has completed. */
+export async function invokeBoardAction(
+  runManager: Pick<RunManager, 'dockTaskChat' | 'handleAction'>,
+  taskId: string,
+  action: TaskAction,
+): Promise<void> {
+  if (shouldDockTaskChat(action)) {
+    await runManager.dockTaskChat(taskId, { onSelect: false });
+  }
+  await runManager.handleAction(taskId, action);
+}
+
 interface InMessage {
 	type?: string;
 	taskId?: string;
@@ -239,7 +256,12 @@ export class BoardPanel {
 		);
 	}
 
-	static show(store: TaskStore, runManager: RunManager, column = vscode.ViewColumn.One): BoardPanel {
+	static show(
+		store: TaskStore,
+		runManager: RunManager,
+		extensionUri: vscode.Uri,
+		column = vscode.ViewColumn.One,
+	): BoardPanel {
 		if (BoardPanel.current) {
 			BoardPanel.current.panel.reveal(column);
 			void BoardPanel.current.pushAll();
@@ -250,6 +272,7 @@ export class BoardPanel {
 			enableScripts: true,
 			retainContextWhenHidden: true,
 		});
+		panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'activity-icon.svg');
 
 		BoardPanel.current = new BoardPanel(panel, store, runManager);
 		return BoardPanel.current;
@@ -334,7 +357,7 @@ export class BoardPanel {
 				if (!message.taskId || !isTaskAction(message.action)) {
 					return;
 				}
-				await this.runManager.handleAction(message.taskId, message.action);
+        await invokeBoardAction(this.runManager, message.taskId, message.action);
 				return;
 			}
 

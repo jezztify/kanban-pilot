@@ -17,6 +17,11 @@ export interface BoardSnapshot {
 
 const TASK_FILE = /^(TASK-\d+)\.md$/;
 
+function taskIdFromUri(uri: vscode.Uri): string | undefined {
+	const name = uri.path.split('/').pop() ?? '';
+	return TASK_FILE.exec(name)?.[1];
+}
+
 export class TaskStore {
 	constructor(private readonly tasksDir: vscode.Uri) {}
 
@@ -151,14 +156,15 @@ export class TaskStore {
 	}
 
 	/** Fires on any change under the task folder. Disk is the source of truth. */
-	watch(onChange: () => void): vscode.Disposable {
+	watch(onChange: (taskId?: string) => void): vscode.Disposable {
 		const watcher = vscode.workspace.createFileSystemWatcher(
 			new vscode.RelativePattern(this.tasksDir, '*.md'),
 		);
+		const notify = (uri: vscode.Uri): void => onChange(taskIdFromUri(uri));
 
-		watcher.onDidCreate(onChange);
-		watcher.onDidChange(onChange);
-		watcher.onDidDelete(onChange);
+		watcher.onDidCreate(notify);
+		watcher.onDidChange(notify);
+		watcher.onDidDelete(notify);
 
 		return watcher;
 	}

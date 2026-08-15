@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 
 import { COLUMNS, Column, STATUSES, Status, newTaskFile, parseSections, taskFromRaw, updateFrontmatter } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { primaryAction } from '../board/boardPanel';
+import { invokeBoardAction, primaryAction, shouldDockTaskChat } from '../board/boardPanel';
 import { TaskAction } from '../board/stateMachine';
 
 /** M1 — task schema and store (PRD §6.3, §8.1). */
@@ -305,6 +305,50 @@ suite('M1 card action matrix (§5.2)', () => {
 					`${state} + ${status} produced no action`,
 				);
 			}
+		}
+	});
+});
+
+suite('card action chat docking', () => {
+	test('docks the task chat before invoking a requested stage action', async () => {
+		const events: string[] = [];
+		const runManager = {
+			dockTaskChat: async () => {
+				events.push('dock');
+			},
+			handleAction: async () => {
+				events.push('action');
+			},
+		};
+
+		await invokeBoardAction(runManager, 'TASK-001', 'develop');
+
+		assert.deepStrictEqual(events, ['dock', 'action']);
+	});
+
+	test('does not dock when invoking an out-of-scope card action', async () => {
+		const events: string[] = [];
+		const runManager = {
+			dockTaskChat: async () => {
+				events.push('dock');
+			},
+			handleAction: async () => {
+				events.push('action');
+			},
+		};
+
+		await invokeBoardAction(runManager, 'TASK-001', 'continue');
+
+		assert.deepStrictEqual(events, ['action']);
+	});
+
+	test('only Refine, Develop, and Validate request action-triggered docking', () => {
+		assert.strictEqual(shouldDockTaskChat('refine'), true);
+		assert.strictEqual(shouldDockTaskChat('develop'), true);
+		assert.strictEqual(shouldDockTaskChat('validate'), true);
+
+		for (const action of ['accept', 'split', 'approve', 'continue', 'stop', 'reopen'] as TaskAction[]) {
+			assert.strictEqual(shouldDockTaskChat(action), false, `${action} must not dock the task chat`);
 		}
 	});
 });

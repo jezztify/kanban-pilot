@@ -16,6 +16,8 @@ export interface RunOptions {
 	sessionPrefix: string;
 	toolsIncludeForRefine: string[];
 	toolsExclude: string[];
+	/** Open the task session beside the board before injecting this action's prompt. */
+	openBeside?: boolean;
 	modelSelector?: { id?: string; vendor?: string };
 }
 
@@ -74,6 +76,14 @@ export function resolveToolsInclude(stage: Stage, toolsIncludeForRefine: string[
 	return toolsIncludeForRefine;
 }
 
+/** Options for the immediate session open that precedes prompt injection. */
+export function taskChatOpenOptions(openBeside: boolean): vscode.TextDocumentShowOptions {
+	return {
+		...(openBeside ? { viewColumn: vscode.ViewColumn.Beside, preview: true } : {}),
+		preserveFocus: false,
+	};
+}
+
 /**
  * The mode-scoped open action id is built at runtime by VS Code from the
  * mode's own name (`getOpenChatActionIdForMode`) — M0 confirmed it comes out
@@ -119,7 +129,7 @@ export class ChatSessionExecutor implements Executor {
 				await vscode.commands.executeCommand(
 					'vscode.open',
 					sessionUriForTask(task.id, options.sessionPrefix),
-					{ preserveFocus: false },
+					taskChatOpenOptions(options.openBeside === true),
 				);
 
 				const result = await vscode.commands.executeCommand(openCommand, {
@@ -148,7 +158,7 @@ export class ChatSessionExecutor implements Executor {
 			await vscode.commands.executeCommand(
 				'vscode.open',
 				sessionUriForTask(task.id, options.sessionPrefix),
-				{ preserveFocus: false },
+				taskChatOpenOptions(options.openBeside === true),
 			);
 			await vscode.env.clipboard.writeText(prompt);
 			void vscode.window.showWarningMessage(

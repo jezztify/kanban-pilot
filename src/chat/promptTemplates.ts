@@ -6,7 +6,7 @@ import { Stage } from './receipt';
  * and are user-editable — the main tuning surface for output quality. The
  * extension seeds defaults on first use; after that, the file on disk wins.
  *
- * Structure is fixed across all three templates:
+ * Structure is fixed across all four stage templates:
  *
  *   @{{agentName}}
  *   ## [{{projectName}} {{id}}]
@@ -83,8 +83,12 @@ After completing the scoping work, append this line to the \`## Log\` section
 of \`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:refine result:ok note:"<one line summary>"
 ### Non-completion
-If you could not proceed, append this line instead, with the reason in the
-note:
+If you cannot complete the scoping work because the request lacks required
+information, a decision is unresolved, or another concrete blocker prevents
+progress, do not append the completion receipt. Append exactly one
+non-completion receipt instead. Put a concise, actionable explanation of the
+concrete blocker, missing decision, required human input, or unresolved
+question in the note so a human knows what to resolve:
 - run:{{runId}} task:{{id}} stage:refine result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`.
@@ -118,8 +122,12 @@ After completing the implementation work, append this line to the \`## Log\`
 section of \`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
 ### Non-completion
-If you could not proceed, append this line instead, with the reason in the
-note:
+If you cannot complete the implementation because a dependency, decision,
+permission, or other concrete blocker prevents progress, do not append the
+completion receipt. Append exactly one non-completion receipt instead. Put a
+concise, actionable explanation of the blocker, missing decision, required
+human input, or unresolved question in the note so a human knows what to
+resolve:
 - run:{{runId}} task:{{id}} stage:develop result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`,
@@ -152,15 +160,20 @@ you're checking. Do not fix anything yourself; only report whether it passes.
 
 ## On Completion
 ### Completion
-When validation reaches a pass/fail verdict, append exactly one of these lines
-to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
+When validation reaches a pass/fail verdict, append exactly one of these
+completion lines to the \`## Log\` section of
+\`.kanban-pilot/tasks/{{id}}.md\`:
 - run:{{runId}} task:{{id}} stage:validate result:ok note:"<what you checked>"
   — the criteria are met.
 - run:{{runId}} task:{{id}} stage:validate result:failed note:"<what's missing>"
-  — the criteria are not met; the ticket goes back to In Progress for another pass.
+  — the validation completed, but the criteria are not met; the ticket goes
+  back to In Progress for another pass. This is a verdict, not a run error.
 ### Non-completion
-If you could not determine a pass or fail, append this line instead, with the
-reason in the note:
+If you cannot determine pass or fail because evidence is missing, the criteria
+are ambiguous, or another concrete blocker prevents a verdict, do not use
+result:failed. Append exactly one non-completion receipt instead. Put a
+concise, actionable explanation of the missing evidence, blocker, required
+human input, or unresolved question in the note:
 - run:{{runId}} task:{{id}} stage:validate result:blocked note:"<one line reason>"
 Do not edit anything else in this file — not the \`---\`-delimited frontmatter
 block at the top (its \`state\`/\`status\` fields included), and not \`## Request\`,
@@ -217,7 +230,10 @@ This task becomes tracking-only once split — do not also give it an
 implementation Scope, and do not implement anything yourself here.
 
 ### Non-completion
-If it does not need splitting, append this instead, and nothing else:
+If this ticket does not need splitting because it is already small enough or
+does not contain independent pieces, do not file proposal lines or append the
+completion receipt. Append exactly one non-completion receipt instead. Put a
+concise, actionable explanation of why one ticket is sufficient in the note:
 - run:{{runId}} task:{{id}} stage:split result:blocked note:"<why one ticket is fine>"
 This leaves it exactly where a normal Refine can pick it up next.
 

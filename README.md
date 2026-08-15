@@ -50,6 +50,22 @@ Copilot Chat is asked to change code:
   beside the board. Stage runs open the same task-specific session automatically when chat
   docking is enabled.
 
+## Install the Agent Skill
+
+The repository includes the canonical Kanban Pilot skill at
+`.claude/skills/kanban-pilot/SKILL.md`. From the repository root, install it into the personal
+skill directory for the tool you use:
+
+```sh
+npm run install:skill:claude
+npm run install:skill:copilot
+```
+
+The Claude command writes to `<user-home>/.claude/skills/kanban-pilot/SKILL.md`, and the Copilot
+command writes to `<user-home>/.copilot/skills/kanban-pilot/SKILL.md`. The commands create missing
+parent directories and overwrite an existing copy. Re-run the relevant command after updating the
+repository skill to refresh the installed version.
+
 ## Visual Walkthrough
 
 The board is the control plane for the task-specific Copilot Chat runs:
@@ -108,10 +124,18 @@ This extension contributes the following settings (all under `kanbanPilot.*`):
 | `kanbanPilot.chat.modelSelector` | `{}` | Optional `{id, vendor}` to pin a model per run. |
 | `kanbanPilot.chat.agentNames` | `{}` | Per-stage persona overrides (`refine`/`develop`/`validate`; `split` reuses `refine`). Editable from the board via each column's Agent edit icon. |
 | `kanbanPilot.run.timeoutMinutes` | `20` | Minutes before a run is marked failed. |
+| `kanbanPilot.run.maxParallelTasks` | `1` | Maximum active Refine, Split, Develop/Continue, and Validate runs. Values above one opt into concurrent agent edits in the same workspace; no worktree isolation is provided. |
 | `kanbanPilot.board.openOnStartup` | `false` | Open the board automatically on workspace load. |
 | `kanbanPilot.layout.dockChat` | `true` | Open the selected task's chat beside the board. |
 | `kanbanPilot.layout.dockChatOnSelect` | `false` | Dock the chat as soon as a card is selected. |
 | `kanbanPilot.chat.allowTaskProposals` | `true` | Let develop/validate runs file follow-up work as new backlog tasks. |
+
+Run capacity is global across all active agent stages and counts persisted `status: running`
+tasks after a reload. The default of one preserves the safest working-tree behavior. When the
+capacity is full, new manual and automatic starts are left untouched rather than assigned a new
+queue status; Approved remains the visible ready queue. Increasing the limit explicitly opts into
+same-workspace concurrent edits, so use a worktree or another isolation strategy separately if
+parallel code-writing runs need filesystem safety.
 
 ## Known Issues
 

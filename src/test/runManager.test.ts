@@ -5,8 +5,8 @@ import * as vscode from 'vscode';
 
 import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { Executor, ExecutorResult } from '../chat/executor';
-import { RunManager } from '../chat/runManager';
+import { Executor, ExecutorResult, RunOptions } from '../chat/executor';
+import { normalizeMaxParallelTasks, RunManager } from '../chat/runManager';
 import { formatReceipt } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 
@@ -49,15 +49,21 @@ async function waitUntilSettled(store: TaskStore, taskId: string): Promise<Task>
 type Next = (task: Task, prompt: string) => Promise<ExecutorResult> | 'hang';
 
 class StubExecutor implements Executor {
-	calls: { task: Task; prompt: string }[] = [];
+	calls: { task: Task; prompt: string; options: RunOptions }[] = [];
 	constructor(private next: Next) {}
 
 	async isAvailable(): Promise<boolean> {
 		return true;
 	}
 
-	async run(task: Task, _taskFileUri: vscode.Uri, prompt: string): Promise<ExecutorResult> {
-		this.calls.push({ task, prompt });
+	async run(
+		task: Task,
+		_taskFileUri: vscode.Uri,
+		prompt: string,
+		_stage: 'refine' | 'develop' | 'validate' | 'split',
+		options: RunOptions,
+	): Promise<ExecutorResult> {
+		this.calls.push({ task, prompt, options });
 		const outcome = this.next(task, prompt);
 		if (outcome === 'hang') {
 			return new Promise<ExecutorResult>(() => {
@@ -166,6 +172,7 @@ suite('M3 RunManager', () => {
 
 			await waitUntil(() => executor.calls.length > 0); // phase 2 is fire-and-forget
 			assert.strictEqual(executor.calls.length, 1);
+			assert.strictEqual(executor.calls[0].options.openBeside, true);
 		});
 
 		test('approve moves Scoped → Approved and does not reset the session by default', async () => {
@@ -197,6 +204,7 @@ suite('M3 RunManager', () => {
 			await waitUntil(() => executor.calls.length > 0);
 			assert.strictEqual(executor.calls.length, 1);
 			assert.strictEqual(executor.calls[0].prompt.includes('@Bro Coder'), true);
+			assert.strictEqual(executor.calls[0].options.openBeside, true);
 		});
 
 		test('validate is a single click that launches a run in place', async () => {
@@ -213,6 +221,37 @@ suite('M3 RunManager', () => {
 
 			await waitUntil(() => executor.calls.length > 0);
 			assert.strictEqual(executor.calls[0].prompt.includes('@Bro QA'), true);
+			assert.strictEqual(executor.calls[0].options.openBeside, true);
+		});
+
+		test('Continue keeps its existing non-docking behavior', async () => {
+			const task = await store.create('Resume implementation');
+			await store.patch(task.id, { state: 'in-progress', status: 'idle' });
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'continue');
+
+			await waitUntil(() => executor.calls.length > 0);
+			assert.strictEqual(executor.calls[0].options.openBeside, false);
+		});
+
+		test('disabling layout docking does not block a requested stage run', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('layout.dockChat', false, vscode.ConfigurationTarget.Global);
+			try {
+				const task = await store.create('Develop without docking');
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+				const executor = new StubExecutor(() => 'hang');
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'develop');
+
+				await waitUntil(() => executor.calls.length > 0);
+				assert.strictEqual(executor.calls[0].options.openBeside, false);
+			} finally {
+				await cfg.update('layout.dockChat', undefined, vscode.ConfigurationTarget.Global);
+			}
 		});
 	});
 
@@ -243,6 +282,120 @@ suite('M3 RunManager', () => {
 
 			assert.strictEqual(after.state, 'refine');
 			assert.strictEqual(after.status, 'blocked');
+			assert.ok(after.sections['Log'].includes('awaiting late receipt'));
+		});
+
+		test('a receipt appended after executor completion is picked up during the reconciliation grace period', async () => {
+			const task = await store.create('Set up billing webhook');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				setTimeout(() => {
+					void store.appendLog(
+						t.id,
+						formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'written after executor return' }),
+					);
+				}, 25);
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'scoped');
+			assert.strictEqual(after.status, 'idle');
+		});
+
+		test('a receipt appended after the no-receipt fallback is reconciled by a later file-change pass', async () => {
+			const task = await store.create('Set up billing webhook');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			let runId = '';
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(async (_t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					return { ok: true, sessionId: 's1' };
+				}),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'refine');
+			const blocked = await waitUntilSettled(store, task.id);
+			assert.strictEqual(blocked.status, 'blocked');
+			assert.strictEqual(blocked.run, undefined);
+
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'refine', result: 'ok', note: 'late completion' }),
+			);
+			const watcherManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await watcherManager.reconcileTaskChange(task.id);
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'scoped');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+		});
+
+		test('late receipt reconciliation does not duplicate proposed tasks when file changes repeat', async () => {
+			const task = await store.create('Set up billing webhook');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			let runId = '';
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(async (_t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					return { ok: true, sessionId: 's1' };
+				}),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			const blocked = await waitUntilSettled(store, task.id);
+			assert.strictEqual(blocked.status, 'blocked');
+
+			await store.appendLog(task.id, `- propose-task run:${runId} title:"Add retry backoff" note:"found late"`);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'late completion' }),
+			);
+			const watcherManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await watcherManager.reconcileTaskChange(task.id);
+			await watcherManager.reconcileTaskChange(task.id);
+
+			const { tasks } = await store.readAll();
+			assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Add retry backoff').length, 1);
+			assert.strictEqual(tasks.find((candidate) => candidate.id === task.id)?.state, 'validation');
+		});
+
+		test('a late receipt cannot reclaim a card that was manually moved after fallback', async () => {
+			const task = await store.create('Move after a missing receipt');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			let runId = '';
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(async (_t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					return { ok: true };
+				}),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntilSettled(store, task.id);
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'done'), { kind: 'applied' });
+
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'refine', result: 'ok', note: 'superseded late completion' }),
+			);
+			const watcherManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await watcherManager.reconcileTaskChange(task.id);
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(after.status, 'idle');
 		});
 
 		test('a receipt with result:blocked surfaces as a blocked card', async () => {
@@ -784,6 +937,234 @@ suite('M3 RunManager', () => {
 		assert.ok(after.sections['Log'].includes('finished by hand'));
 	});
 
+	suite('configurable run capacity', () => {
+		async function withMaxParallelTasks(value: unknown, fn: () => Promise<void>): Promise<void> {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			try {
+				await cfg.update('run.maxParallelTasks', value, vscode.ConfigurationTarget.Global);
+				await fn();
+			} finally {
+				await cfg.update('run.maxParallelTasks', undefined, vscode.ConfigurationTarget.Global);
+			}
+		}
+
+		test('invalid values normalize to the safe single-run default', () => {
+		for (const value of [undefined, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			assert.strictEqual(normalizeMaxParallelTasks(value), 1);
+		}
+		assert.strictEqual(normalizeMaxParallelTasks(2), 2);
+	});
+
+		test('the default capacity is one and a full-capacity manual start is untouched', async () => {
+		const first = await store.create('First run');
+		const second = await store.create('Second run');
+		await store.patch(first.id, { state: 'approved', status: 'idle' });
+		await store.patch(second.id, { state: 'approved', status: 'idle' });
+		const firstExecutor = new StubExecutor(() => 'hang');
+		const secondExecutor = new StubExecutor(() => 'hang');
+		const firstManager = new RunManager(store, firstExecutor, folder);
+		const secondManager = new RunManager(store, secondExecutor, folder);
+
+		await firstManager.handleAction(first.id, 'develop');
+		await waitUntil(() => firstExecutor.calls.length === 1);
+		await secondManager.handleAction(second.id, 'develop');
+
+		const after = (await store.readAll()).tasks.find((task) => task.id === second.id)!;
+		assert.strictEqual(after.state, 'approved');
+		assert.strictEqual(after.status, 'idle');
+		assert.strictEqual(after.run, undefined);
+		assert.strictEqual(secondExecutor.calls.length, 0, 'capacity denial must not invoke the executor');
+	});
+
+	test('capacity is shared across independently-created managers and mixed stages', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const develop = await store.create('Develop one');
+			const validate = await store.create('Validate one');
+			const refine = await store.create('Refine one');
+			await store.patch(develop.id, { state: 'approved', status: 'idle' });
+			await store.patch(validate.id, { state: 'validation', status: 'idle' });
+			await store.patch(refine.id, { state: 'refine', status: 'idle' });
+			const developExecutor = new StubExecutor(() => 'hang');
+			const validateExecutor = new StubExecutor(() => 'hang');
+			const refineExecutor = new StubExecutor(() => 'hang');
+			const developManager = new RunManager(store, developExecutor, folder);
+			const validateManager = new RunManager(store, validateExecutor, folder);
+			const refineManager = new RunManager(store, refineExecutor, folder);
+
+			await Promise.all([
+				developManager.handleAction(develop.id, 'develop'),
+				validateManager.handleAction(validate.id, 'validate'),
+			]);
+			await waitUntil(() => developExecutor.calls.length === 1 && validateExecutor.calls.length === 1);
+			await refineManager.handleAction(refine.id, 'refine');
+
+			const after = await store.readAll();
+			assert.strictEqual(after.tasks.filter((task) => task.status === 'running').length, 2);
+			const waiting = after.tasks.find((task) => task.id === refine.id)!;
+			assert.strictEqual(waiting.state, 'refine');
+			assert.strictEqual(waiting.status, 'idle');
+			assert.strictEqual(refineExecutor.calls.length, 0);
+			assert.strictEqual(developExecutor.calls.length, 1);
+			assert.strictEqual(validateExecutor.calls.length, 1);
+		});
+	});
+
+	test('persisted running tasks consume capacity after a reload', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const persisted = await store.create('Persisted run');
+			const allowed = await store.create('Allowed run');
+			const waiting = await store.create('Waiting run');
+			await store.patch(persisted.id, { state: 'in-progress', status: 'running', run: 'r-persisted' });
+			await store.patch(allowed.id, { state: 'approved', status: 'idle' });
+			await store.patch(waiting.id, { state: 'approved', status: 'idle' });
+			const allowedExecutor = new StubExecutor(() => 'hang');
+			const waitingExecutor = new StubExecutor(() => 'hang');
+			const reloadedManager = new RunManager(store, allowedExecutor, folder);
+			const independentManager = new RunManager(store, waitingExecutor, folder);
+
+			await reloadedManager.handleAction(allowed.id, 'develop');
+			await independentManager.handleAction(waiting.id, 'develop');
+
+			const after = await store.readAll();
+			assert.strictEqual(after.tasks.find((task) => task.id === allowed.id)?.status, 'running');
+			assert.strictEqual(after.tasks.find((task) => task.id === waiting.id)?.state, 'approved');
+			assert.strictEqual(after.tasks.find((task) => task.id === waiting.id)?.status, 'idle');
+			assert.strictEqual(waitingExecutor.calls.length, 0);
+		});
+	});
+
+	test('increasing capacity admits a later run and decreasing it does not interrupt active runs', async () => {
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		try {
+			await cfg.update('run.maxParallelTasks', 1, vscode.ConfigurationTarget.Global);
+			const first = await store.create('Existing run');
+			const second = await store.create('Use increased capacity');
+			const third = await store.create('Wait after decrease');
+			await store.patch(first.id, { state: 'approved', status: 'idle' });
+			await store.patch(second.id, { state: 'approved', status: 'idle' });
+			await store.patch(third.id, { state: 'approved', status: 'idle' });
+			const firstExecutor = new StubExecutor(() => 'hang');
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const thirdExecutor = new StubExecutor(() => 'hang');
+			const firstManager = new RunManager(store, firstExecutor, folder);
+			const secondManager = new RunManager(store, secondExecutor, folder);
+			const thirdManager = new RunManager(store, thirdExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'develop');
+			await waitUntil(() => firstExecutor.calls.length === 1);
+			await secondManager.handleAction(second.id, 'develop');
+			assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === second.id)?.state, 'approved');
+
+			await cfg.update('run.maxParallelTasks', 2, vscode.ConfigurationTarget.Global);
+			await secondManager.handleAction(second.id, 'develop');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+
+			await cfg.update('run.maxParallelTasks', 1, vscode.ConfigurationTarget.Global);
+			await thirdManager.handleAction(third.id, 'develop');
+			const after = await store.readAll();
+			assert.strictEqual(after.tasks.find((task) => task.id === first.id)?.status, 'running');
+			assert.strictEqual(after.tasks.find((task) => task.id === second.id)?.status, 'running');
+			assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.state, 'approved');
+			assert.strictEqual(thirdExecutor.calls.length, 0);
+		} finally {
+			await cfg.update('run.maxParallelTasks', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+
+	test('stopping a run releases capacity for the next task', async () => {
+		await withMaxParallelTasks(1, async () => {
+			const first = await store.create('Stop this run');
+			const second = await store.create('Run after stop');
+			await store.patch(first.id, { state: 'approved', status: 'idle' });
+			await store.patch(second.id, { state: 'approved', status: 'idle' });
+			const firstExecutor = new StubExecutor(() => 'hang');
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const firstManager = new RunManager(store, firstExecutor, folder);
+			const secondManager = new RunManager(store, secondExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'develop');
+			await waitUntil(() => firstExecutor.calls.length === 1);
+			await secondManager.handleAction(second.id, 'develop');
+			assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === second.id)?.state, 'approved');
+
+			await firstManager.handleAction(first.id, 'stop');
+			await secondManager.handleAction(second.id, 'develop');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+			assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === second.id)?.status, 'running');
+		});
+	});
+
+	test('automatic backlog gating leaves a task untouched when capacity is full', async () => {
+		await withMaxParallelTasks(1, async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('gates.backlogToRefine', 'auto', vscode.ConfigurationTarget.Global);
+			try {
+				const running = await store.create('Already running');
+				const backlog = await store.create('Wait for capacity');
+				await store.patch(running.id, { state: 'refine', status: 'running', run: 'r-existing' });
+				const executor = new StubExecutor(() => 'hang');
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.applyGatePolicies();
+
+				const after = (await store.readAll()).tasks.find((task) => task.id === backlog.id)!;
+				assert.strictEqual(after.state, 'backlog');
+				assert.strictEqual(after.status, 'idle');
+				assert.strictEqual(after.run, undefined);
+				assert.strictEqual(executor.calls.length, 0);
+			} finally {
+				await cfg.update('gates.backlogToRefine', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+	});
+
+	test('automatic gates fill the configured capacity and leave excess Approved work queued', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('gates.approvedToInProgress', 'auto', vscode.ConfigurationTarget.Global);
+			try {
+				const first = await store.create('Automatic run one');
+				const second = await store.create('Automatic run two');
+				const third = await store.create('Automatic run three');
+				for (const task of [first, second, third]) {
+					await store.patch(task.id, { state: 'approved', status: 'idle' });
+				}
+				const executor = new StubExecutor(() => 'hang');
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.applyGatePolicies();
+				await waitUntil(() => executor.calls.length === 2);
+
+				const after = await store.readAll();
+				assert.strictEqual(after.tasks.filter((task) => task.status === 'running').length, 2);
+				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.state, 'approved');
+				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.status, 'idle');
+			} finally {
+				await cfg.update('gates.approvedToInProgress', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+	});
+
+	test('a terminal receipt releases capacity for a later run', async () => {
+		await withMaxParallelTasks(1, async () => {
+			const first = await store.create('Finish this run');
+			const second = await store.create('Run next');
+			await store.patch(first.id, { state: 'refine', status: 'idle' });
+			await store.patch(second.id, { state: 'refine', status: 'idle' });
+			const firstManager = new RunManager(store, new StubExecutor(okReceipt(store, 'refine')), folder);
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const secondManager = new RunManager(store, secondExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'refine');
+			await waitUntilSettled(store, first.id);
+			await secondManager.handleAction(second.id, 'refine');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+			assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === second.id)?.status, 'running');
+		});
+	});
+
+	});
+
 	suite('reconcileOnActivation', () => {
 		test('advances a task whose receipt landed before a reload', async () => {
 			const task = await store.create('Set up billing webhook');
@@ -820,6 +1201,35 @@ suite('M3 RunManager', () => {
 
 			const after = (await store.readAll()).tasks[0];
 			assert.strictEqual(after.state, 'validation');
+		});
+
+		test('reconciles a late receipt after a fallback when the extension activates', async () => {
+			const task = await store.create('Set up billing webhook');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			let runId = '';
+			const firstManager = new RunManager(
+				store,
+				new StubExecutor(async (_t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					return { ok: true };
+				}),
+				folder,
+			);
+
+			await firstManager.handleAction(task.id, 'refine');
+			const blocked = await waitUntilSettled(store, task.id);
+			assert.strictEqual(blocked.status, 'blocked');
+
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'refine', result: 'ok', note: 'written before activation' }),
+			);
+			const activatedManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await activatedManager.reconcileOnActivation();
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'scoped');
+			assert.strictEqual(after.status, 'idle');
 		});
 	});
 

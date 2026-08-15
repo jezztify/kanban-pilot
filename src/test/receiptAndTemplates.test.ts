@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { findReceipt, formatReceipt, parseReceipts } from '../chat/receipt';
+import { findLatestReceipt, findReceipt, formatReceipt, parseReceipts } from '../chat/receipt';
 import { loadPromptTemplate, renderTemplate, TemplateVars } from '../chat/promptTemplates';
 import { hashScope } from '../chat/scopeHash';
 import { STAGE_AGENT_NAME } from '../chat/agentNames';
@@ -85,6 +85,16 @@ suite('M3 receipt grammar', () => {
 	test('findReceipt returns undefined when the run id is not present at all', () => {
 		const log = '- run:r1 task:TASK-142 stage:refine result:ok note:"unrelated"';
 		assert.strictEqual(findReceipt(log, 'r7', 'TASK-142'), undefined);
+	});
+
+	test('findReceipt returns the latest matching receipt when a run has multiple outcomes', () => {
+		const log = [
+			'- run:r7 task:TASK-142 stage:refine result:blocked note:"no receipt found; awaiting late receipt"',
+			'- run:r7 task:TASK-142 stage:refine result:ok note:"late completion"',
+		].join('\n');
+
+		assert.strictEqual(findLatestReceipt(log, 'r7', 'TASK-142')?.result, 'ok');
+		assert.strictEqual(findReceipt(log, 'r7', 'TASK-142')?.note, 'late completion');
 	});
 
 	test('formatReceipt round-trips through parseReceipts', () => {
@@ -170,14 +180,37 @@ suite('M3 prompt templates', () => {
 					template,
 					baseVars({ agentName: STAGE_AGENT_NAME[stage], projectName: folder.name, runId: 'r7' }),
 				);
+				const onCompletionStart = rendered.indexOf('## On Completion');
 				const completionStart = rendered.indexOf('### Completion');
 				const nonCompletionStart = rendered.indexOf('### Non-completion');
 
+				assert.ok(onCompletionStart >= 0 && onCompletionStart < completionStart, `${stage}: labels must be under On Completion`);
 				assert.ok(completionStart >= 0, `${stage}: missing the Completion label`);
 				assert.ok(nonCompletionStart > completionStart, `${stage}: missing the Non-completion label`);
 
 				const completion = rendered.slice(completionStart, nonCompletionStart);
 				const nonCompletion = rendered.slice(nonCompletionStart);
+				assert.ok(!completion.includes(`stage:${stage} result:blocked`), `${stage}: completion must not use result:blocked`);
+				assert.ok(nonCompletion.toLowerCase().includes('append exactly one'), `${stage}: non-completion must require one receipt`);
+				assert.ok(
+					nonCompletion.includes('concise, actionable explanation'),
+					`${stage}: non-completion must require an actionable explanation`,
+				);
+				assert.ok(nonCompletion.includes('note'), `${stage}: non-completion must explain the blocker in note`);
+
+				const completionReceipts = parseReceipts(completion);
+				const nonCompletionReceipts = parseReceipts(nonCompletion);
+				assert.deepStrictEqual(
+					completionReceipts.map((receipt) => `${receipt.runId}:${receipt.taskId}:${receipt.stage}:${receipt.result}`),
+					expectedResults[stage].completion.map((result) => `r7:TASK-142:${stage}:${result}`),
+					`${stage}: completion receipt examples must be stage-specific`,
+				);
+				assert.deepStrictEqual(
+					nonCompletionReceipts.map((receipt) => `${receipt.runId}:${receipt.taskId}:${receipt.stage}:${receipt.result}`),
+					[`r7:TASK-142:${stage}:blocked`],
+					`${stage}: non-completion must contain one blocked receipt`,
+				);
+
 				for (const result of expectedResults[stage].completion) {
 					assert.ok(
 						completion.includes(`run:r7 task:TASK-142 stage:${stage} result:${result}`),
@@ -216,12 +249,15 @@ suite('M3 prompt templates', () => {
 		}
 	});
 
-	test('the validate template explains both pass and fail receipt lines', async () => {
+	test('the validate template explains pass, fail, and blocked receipt lines', async () => {
 		const { folder, dispose } = await tempFolder();
 		try {
 			const template = await loadPromptTemplate(folder, 'validate');
 			assert.ok(template.includes('stage:validate result:ok'));
 			assert.ok(template.includes('stage:validate result:failed'));
+			assert.ok(template.includes('stage:validate result:blocked'));
+			assert.ok(template.includes('cannot determine pass or fail'));
+			assert.ok(template.includes('This is a verdict, not a run error'));
 		} finally {
 			await dispose();
 		}

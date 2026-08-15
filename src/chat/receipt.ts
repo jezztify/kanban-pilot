@@ -52,13 +52,25 @@ export function parseReceipts(logSection: string): Receipt[] {
 }
 
 /**
- * Finds the receipt for a specific run, requiring the task id to match too.
+ * Finds the latest receipt for a specific run, requiring the task id to match too.
  * A `run:` match with a different `task:` is treated as absent (§6.9) —
  * exactly the shape a misrouted prompt would produce, so it must not be
  * accepted as this run's completion.
  */
 export function findReceipt(logSection: string, runId: string, taskId: string): Receipt | undefined {
-	return parseReceipts(logSection).find((r) => r.runId === runId && r.taskId === taskId);
+	return findLatestReceipt(logSection, runId, taskId);
+}
+
+/** Finds the last receipt for a run/task pair, so a late outcome can supersede an extension fallback receipt. */
+export function findLatestReceipt(logSection: string, runId: string, taskId: string): Receipt | undefined {
+	const receipts = parseReceipts(logSection);
+	for (let i = receipts.length - 1; i >= 0; i--) {
+		const receipt = receipts[i];
+		if (receipt.runId === runId && receipt.taskId === taskId) {
+			return receipt;
+		}
+	}
+	return undefined;
 }
 
 /** Renders the extension's own receipt line, for reconciliation notes (§6.4). */

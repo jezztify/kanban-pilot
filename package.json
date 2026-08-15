@@ -15,6 +15,7 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "icon": "media/activity-icon.png",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -150,7 +151,7 @@
             "auto"
           ],
           "default": "manual",
-          "description": "auto starts development on the next Approved task automatically, once no other task is currently in-progress/running. manual (default) waits for Develop to be clicked."
+          "description": "auto starts development on the next Approved task automatically when the shared run-capacity limit has room. manual (default) waits for Develop to be clicked."
         },
         "kanbanPilot.gates.validationAutoStart": {
           "type": "string",
@@ -219,6 +220,12 @@
           "default": 20,
           "description": "Run marked failed after this many minutes."
         },
+        "kanbanPilot.run.maxParallelTasks": {
+          "type": "number",
+          "minimum": 1,
+          "default": 1,
+          "description": "Maximum number of Refine, Split, Develop/Continue, and Validate runs active at once. Values above 1 opt into concurrent agent work in the same workspace without worktree isolation."
+        },
         "kanbanPilot.board.openOnStartup": {
           "type": "boolean",
           "default": false,
@@ -249,6 +256,9 @@
     "package": "webpack --mode production --devtool hidden-source-map",
     "compile-tests": "tsc -p . --outDir dist",
     "watch-tests": "tsc -p . -w --outDir dist",
+    "install:skill:claude": "node scripts/install-skill.mjs claude",
+    "install:skill:copilot": "node scripts/install-skill.mjs copilot",
+    "test:install-skill": "node --test scripts/install-skill.test.mjs",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",

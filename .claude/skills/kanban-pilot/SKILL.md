@@ -58,7 +58,7 @@ origin_task: TASK-003
 <written by refine, may be edited by a human: implementation checklist>
 
 ## Log
-<append-only receipt lines>
+- run:r4f9k2 task:TASK-007 stage:refine result:ok note:"2026-08-13T11:22:40Z — refine completed: documented the retry-backoff scope"
 ```
 
 **Frontmatter fields** (`key: value`, one per line, no YAML nesting):
@@ -84,7 +84,10 @@ order shown above (skip absent ones), then leave everything from the first
 
 **Body sections**, in this fixed order: `## Request`, `## Refined`,
 `## Scope`, `## Log`. Only touch the ones your current stage owns (below);
-`## Log` is append-only — add lines, never edit or remove existing ones.
+`## Log` is append-only — add new lines at the end, never edit, remove, or
+reorder existing entries. Each stage attempt adds exactly one timestamped
+receipt; proposal lines described below are separate structural companion
+lines and do not replace that receipt.
 
 ## The state machine
 
@@ -130,7 +133,7 @@ Whatever the outcome, always clear `run` (omit the line) and bump `updated`.
    doing it means the board shows accurate state if you're interrupted or if
    someone looks mid-run.
 3. **Do the stage's actual work** (specifics below).
-4. **Append your receipt** to `## Log` (grammar below).
+4. **Append exactly one timestamped receipt** to `## Log` (grammar below).
 5. **Optionally file follow-ups** (develop/validate only — grammar below).
 6. **Apply the outcome**: patch frontmatter to the `state`/`status` the
    receipt's result implies (table above), clear `run`, bump `updated`.
@@ -150,6 +153,11 @@ Then write:
 
 **Do not write or edit any code.** This stage is scoping only.
 
+Append exactly one `stage:refine` receipt when the scoping work is complete:
+use `result:ok` for a completed scope, `result:blocked` when the request
+cannot be refined, or `result:failed` only when the run itself failed. The
+receipt must follow the timestamped, human-readable note format below.
+
 On success, compute `scope_hash`: take the `## Scope` section's text
 (exactly what's between the `## Scope` and `## Log` headings), trim leading
 and trailing whitespace, SHA-256 it, keep the first 7 hex characters —
@@ -164,6 +172,11 @@ Read `## Refined` and `## Scope`. Implement **exactly** the checklist under
 Scope and nothing else. If something outside it blocks you, stop and record
 that as `result:blocked` rather than improvising beyond scope.
 
+Append exactly one `stage:develop` receipt after the implementation attempt:
+the note must say what was implemented, or identify the concrete blocker or
+run failure. Do not use a placeholder such as `done` when a short plain-
+language explanation is available.
+
 ### Stage: validate
 
 Read `## Refined` and `## Scope`. Review the implementation against the
@@ -172,19 +185,70 @@ area you're checking. **Do not fix anything yourself** — only report whether
 it passes. A `failed` result is a legitimate outcome, not something to avoid;
 see the state table above for what happens to the card either way.
 
+Append exactly one `stage:validate` receipt after reaching a verdict. Use
+`result:ok` when the criteria are met, `result:failed` when the criteria are
+not met, or `result:blocked` when a pass/fail decision cannot be determined.
+The note must identify the checks performed or the specific missing evidence.
+
 ## Receipt grammar
 
-Append exactly one line per stage attempt to `## Log`:
+Append exactly one line per stage attempt to `## Log`, at the time the attempt
+ends. The canonical format is:
 
 ```
-- run:<runId> task:<taskId> stage:<refine|develop|validate> result:<ok|blocked|failed> note:"<one line>"
+- run:<runId> task:<taskId> stage:<refine|develop|validate|split> result:<ok|blocked|failed> note:"<UTC timestamp> — <one-line human-readable summary>"
 ```
+
+Generate `<UTC timestamp>` immediately before appending the line; do not reuse
+the run start time, the task's `updated` value, or a timestamp copied from an
+older entry. It must be UTC ISO 8601 with second precision and a trailing `Z`:
+`YYYY-MM-DDTHH:mm:ssZ`, with no milliseconds. For example, use
+`date -u +"%Y-%m-%dT%H:%M:%SZ"` on POSIX shells or
+`[DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")` in PowerShell, or an
+equivalent UTC API in the language being used.
+
+The note begins with that timestamp, followed by ` — ` and a concise
+plain-language explanation of what happened. Keep it on one physical line,
+state what was completed or checked, or identify the concrete blocker, and do
+not leave placeholder or opaque text such as `done`. Do not put a double quote
+inside the summary: the existing receipt parser treats the closing quote as
+the end of `note`.
+
+Examples of the same format for each supported stage are:
+
+```text
+- run:r7 task:TASK-142 stage:refine result:ok note:"2026-08-15T07:28:08Z — refine completed: documented the three-file implementation scope"
+- run:r8 task:TASK-142 stage:develop result:blocked note:"2026-08-15T07:40:12Z — develop blocked: waiting for the required API decision"
+- run:r9 task:TASK-142 stage:validate result:failed note:"2026-08-15T08:05:31Z — validation failed: the idempotency criterion is not met"
+- run:r10 task:TASK-142 stage:split result:ok note:"2026-08-15T08:20:04Z — split completed: created three independent child tasks"
+```
+
+`result:blocked` means you could not proceed or determine an outcome because
+of missing information or an unresolved question. For refine, develop, and
+split, `result:failed` means the run itself failed; for validate it also means
+the check completed and the acceptance criteria were not met, as described in
+the state table above. The same timestamp and note rules apply to every
+`result` value that is used.
 
 `taskId` must match the file you're writing it into — this is how the board
-rejects a receipt that landed in the wrong file. `result:blocked` means you
-couldn't proceed (missing information, an unresolved question); `result:failed`
-means something went wrong (for validate, it doubles as "checked and it
-doesn't pass" — see the state table).
+rejects a receipt that landed in the wrong file. Keep the structural prefix,
+field order, and `note:"..."` wrapper unchanged. Put the timestamp and
+human-readable explanation inside `note`; do **not** add a separate
+`timestamp:` field or otherwise invent a new receipt grammar. This is
+deliberate compatibility with `src/chat/receipt.ts`, whose parser accepts the
+timestamp as note text, and with `RunManager`, which finds receipts by
+`runId`/`taskId` and uses the existing `stage`/`result` fields for reconciliation.
+
+Appending is strict: add the receipt after existing log entries, never rewrite,
+remove, or reorder them, and never add more than one receipt for the same
+stage attempt. `propose-task` lines remain their own parser-compatible
+companion lines when follow-ups are needed; they do not replace or merge with
+the timestamped stage receipt.
+
+The supported `split` stage follows the same rule: append any
+`propose-task` companion lines first, then append exactly one timestamped
+`stage:split` receipt describing the child tasks created, or the concrete
+reason the split could not proceed.
 
 ## Filing follow-up tasks (develop and validate only)
 
