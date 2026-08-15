@@ -75,6 +75,19 @@ test('uses the repository canonical skill source by default', async () => {
 	});
 });
 
+test('canonical skill distinguishes extension-supervised and direct runs', async () => {
+	const skill = await readFile(SKILL_SOURCE_PATH, 'utf8');
+
+	assert.match(skill, /## Execution contexts and instruction precedence/);
+	assert.match(skill, /`kanban-pilot: extension-supervised`/);
+	assert.match(skill, /generated `## On Completion` contract/);
+	assert.match(skill, /that generated completion contract is authoritative/);
+	assert.match(skill, /\*\*Direct skill run:\*\*/);
+	assert.match(skill, /including the frontmatter transition, `scope_hash`, `run` cleanup/);
+	assert.match(skill, /\*\*Ambiguous context:\*\*/);
+	assert.match(skill, /stop and report the\s+concrete blocker rather than guessing/);
+});
+
 test('overwrites an existing destination and is repeatable', async () => {
 	await withFixture(async ({ homeDirectory, sourcePath }) => {
 		const originalContents = Buffer.from('original\n');

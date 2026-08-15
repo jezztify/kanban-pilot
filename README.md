@@ -65,8 +65,16 @@ npm run install:skill:copilot
 
 The Claude command writes to `<user-home>/.claude/skills/kanban-pilot/SKILL.md`, and the Copilot
 command writes to `<user-home>/.copilot/skills/kanban-pilot/SKILL.md`. The commands create missing
-parent directories and overwrite an existing copy. Re-run the relevant command after updating the
-repository skill to refresh the installed version.
+parent directories and overwrite an existing copy. The canonical skill distinguishes direct
+skill runs from extension-supervised prompts: the generated completion contract owns the
+frontmatter boundary for an extension run, while a direct skill run performs its own legal state
+transition. Installed skill copies are snapshots, so re-run the relevant command after every
+repository skill update to refresh the installed version.
+
+Stage prompt files under `.kanban-pilot/prompts` are user-owned and are never silently migrated.
+If an existing copy predates the `kanban-pilot: extension-supervised` marker, update it manually
+or remove it to let the extension seed the current built-in default; keep its footer's explicit
+extension-frontmatter ownership rule if retaining the older copy.
 
 ## Visual Walkthrough
 

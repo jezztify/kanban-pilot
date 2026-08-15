@@ -7,7 +7,7 @@ import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { Executor, ExecutorResult, RunOptions } from '../chat/executor';
 import { normalizeMaxParallelTasks, RunManager } from '../chat/runManager';
-import { formatReceipt } from '../chat/receipt';
+import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 
 /**
@@ -307,7 +307,7 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.status, 'idle');
 		});
 
-		test('a receipt appended after the no-receipt fallback is reconciled by a later file-change pass', async () => {
+		test('RunManager reconciles a late extension receipt once and applies the stage outcome', async () => {
 			const task = await store.create('Set up billing webhook');
 			await store.patch(task.id, { state: 'refine', status: 'idle' });
 			let runId = '';
@@ -331,11 +331,17 @@ suite('M3 RunManager', () => {
 			);
 			const watcherManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
 			await watcherManager.reconcileTaskChange(task.id);
+			await watcherManager.reconcileTaskChange(task.id);
 
 			const after = (await store.readAll()).tasks[0];
 			assert.strictEqual(after.state, 'scoped');
 			assert.strictEqual(after.status, 'idle');
 			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(
+				parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === runId).length,
+				2,
+				'a repeated file-change pass must not append or apply the late receipt again',
+			);
 		});
 
 		test('late receipt reconciliation does not duplicate proposed tasks when file changes repeat', async () => {

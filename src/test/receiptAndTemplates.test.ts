@@ -155,6 +155,18 @@ suite('M3 prompt templates', () => {
 				assert.ok(rendered.includes('# Set up billing webhook'), `${stage}: missing the title heading`);
 				assert.ok(rendered.includes('## Request'), `${stage}: missing the Request section`);
 				assert.ok(rendered.includes('## On Completion'), `${stage}: missing the On Completion section`);
+				assert.ok(
+					rendered.includes('kanban-pilot: extension-supervised'),
+					`${stage}: missing the extension-supervised context marker`,
+				);
+				assert.ok(
+					rendered.includes('RunManager applies the state transition'),
+					`${stage}: must assign extension state transitions to RunManager`,
+				);
+				assert.ok(
+					rendered.includes('Do not edit YAML frontmatter (state, status, run, updated, or'),
+					`${stage}: must prohibit agent frontmatter edits`,
+				);
 				assert.ok(rendered.includes('run:r7'), `${stage}: receipt instruction must carry this run's id`);
 				assert.ok(rendered.includes('task:TASK-142'), `${stage}: receipt instruction must carry this task's id`);
 				assert.ok(rendered.includes(`stage:${stage}`), `${stage}: receipt instruction must carry its own stage`);
@@ -275,6 +287,29 @@ suite('M3 prompt templates', () => {
 
 			const second = await loadPromptTemplate(folder, 'refine');
 			assert.strictEqual(second, edited, 'loading again must not clobber a user edit');
+		} finally {
+			await dispose();
+		}
+	});
+
+	test('preserves an older user-owned template without silently migrating it', async () => {
+		const { folder, dispose } = await tempFolder();
+		const file = vscode.Uri.joinPath(folder.uri, '.kanban-pilot', 'prompts', 'refine.md');
+		const legacy = [
+			'# User-owned legacy refine prompt',
+			'',
+			'## On Completion',
+			'The extension owns that block and moves the card on its own once it sees your `## Log` line.',
+			'',
+		].join('\n');
+
+		try {
+			await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.kanban-pilot', 'prompts'));
+			await vscode.workspace.fs.writeFile(file, Buffer.from(legacy, 'utf8'));
+
+			const loaded = await loadPromptTemplate(folder, 'refine');
+			assert.strictEqual(loaded, legacy, 'existing user-owned templates must remain byte-for-byte unchanged');
+			assert.ok(!loaded.includes('kanban-pilot: extension-supervised'), 'legacy copies must not be silently rewritten');
 		} finally {
 			await dispose();
 		}

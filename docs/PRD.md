@@ -310,6 +310,16 @@ The receipt is deliberately the *only* structural thing the agent is asked to wr
 Everything else it produces is free-form prose in body sections, where malformed output is
 harmless. **The extension — never the agent — owns YAML frontmatter.**
 
+**Execution context is explicit when the standalone skill is also available.** An
+extension-supervised prompt carries the stable `kanban-pilot: extension-supervised` marker and
+a generated `## On Completion` contract containing the current `run:` and `task:` values. That
+contract is authoritative: the agent writes only the stage-owned body sections and appends its
+receipt, while `RunManager` owns the frontmatter transition. Older user-owned prompt copies may
+not carry the marker, so an explicit footer that says the extension owns frontmatter has the same
+meaning. A direct run of `.claude/skills/kanban-pilot/SKILL.md` has no supervising extension and
+therefore follows the skill's legal frontmatter transition rules. If the context cannot be
+identified or the instructions conflict, the worker reports a blocker instead of guessing.
+
 ### 6.3 Task file format
 
 One file per task at `.kanban-pilot/tasks/TASK-142.md`.
@@ -358,7 +368,7 @@ Add a signed webhook endpoint for Stripe billing events.
 
 | Section | Written by | Notes |
 | --- | --- | --- |
-| Frontmatter | Extension only | Agent is explicitly told not to touch it (§6.5's `## On Completion`). Includes `origin_task` (§6.12) — set only on a task an agent filed via `propose-task`, never by the agent itself |
+| Frontmatter | Extension only for extension-supervised runs | The generated prompt explicitly assigns ownership to `RunManager` (§6.5). A direct skill run has no extension supervisor and follows the skill's own legal transition rules. Includes `origin_task` (§6.12) — set only on a task an agent filed via `propose-task`, never by the agent itself |
 | `## Request` | Human | Verbatim original ask; immutable |
 | `## Refined` | Refine stage | Free-form |
 | `## Scope` | Refine stage, then human | The contract the develop stage is held to |
@@ -373,14 +383,15 @@ falls back to `backlog`) then did exactly what it's supposed to, silently — wh
 board's side looked like the finished task reset itself to Backlog for no reason. Same failure
 family as the refine tools-allowlist bug (§6.6): a boundary the design assumed but never
 actually told the agent about, discovered by watching a real run rather than by reasoning about
-the code. Fixed by adding an explicit "do not touch anything but `## Log`" line to all three
-templates' `## On Completion` sections — prompt-level trust, not a technical boundary (the agent
+the code. Fixed by adding an explicit "do not touch frontmatter or anything outside the
+stage-owned sections and `## Log`" line to all four templates' `## On Completion` sections —
+prompt-level trust, not a technical boundary (the agent
 still has unrestricted file-edit access), the same posture already accepted for G4 (§6.6).
 
 **Receipt grammar** — the one structural thing the agent must emit:
 
 ```
-- run:<runId> task:<taskId> stage:<refine|develop|validate> result:<ok|blocked|failed> note:"<free text>"
+- run:<runId> task:<taskId> stage:<refine|develop|validate|split> result:<ok|blocked|failed> note:"<free text>"
 ```
 
 `result` means something stage-dependent for `validate`. Everywhere else, `failed` means the
@@ -415,6 +426,12 @@ sequenceDiagram
     B->>F: state=validation, status=idle, run=null
     B->>U: card moves to Validation, awaiting Validate
 ```
+
+    This lifecycle describes an extension-supervised run: the agent supplies the
+    stage-owned body changes and receipt, while `RunManager` remains the only
+    component that reconciles the receipt and patches frontmatter. A direct skill
+    run does not use this executor/ watcher boundary and instead follows the
+    standalone skill's direct-run transition rules.
 
 **Failure and escape hatches** — all of which are required, because the receipt is a
 cooperative protocol with a non-deterministic party:
@@ -453,14 +470,26 @@ default, including when the built-in default text later changes.
 Templates are rendered with the task's fields and a mandatory receipt footer the extension
 appends (users can edit the body but not remove the receipt contract). Structure is fixed
 across all four stage templates — `@{{agentName}}`, then a `## [{{projectName}} {{id}}]` banner,
-then `# {{title}}`, then the stage's own instructions, then `## Request` with the material
-this stage needs, then `## On Completion` with separately labelled `### Completion` and
-`### Non-completion` receipt instructions. The **develop** template:
+then `# {{title}}`, then the stable `kanban-pilot: extension-supervised` execution-context
+marker and ownership instructions, then the stage's own instructions, then `## Request` with
+the material this stage needs, then `## On Completion` with separately labelled `### Completion`
+and `### Non-completion` receipt instructions. The **develop** template:
 
 ```
 @{{agentName}}
 ## [{{projectName}} {{id}}]
 # {{title}}
+
+## Execution Context
+kanban-pilot: extension-supervised
+
+This prompt was generated by the Kanban Pilot extension and is supervised by
+RunManager. The generated ## On Completion contract below is authoritative for
+this run, even if a standalone Kanban Pilot skill is also loaded. Only edit the
+stage-owned sections described by this prompt and append the stage receipt to
+## Log. Do not edit YAML frontmatter (state, status, run, updated, or
+scope_hash) or immutable task sections; RunManager applies the state transition
+after it reconciles the receipt.
 
 Implement this task.
 {{#scopeEdited}}
@@ -508,7 +537,19 @@ Four details are load-bearing rather than cosmetic:
   edit over the agent's own earlier reasoning (§6.8) — this matters more than it used to, now
   that develop and validate reuse the *same* session refine started (`resetOnApprove` defaults
   to `false`; §6.8 explains why that's safe).
+- **`kanban-pilot: extension-supervised`** makes the frontmatter ownership boundary explicit.
+  When this marker and the generated completion contract are present, that contract takes
+  precedence over a standalone skill's direct-run transition instructions. The agent writes
+  only the stage-owned sections and receipt; `RunManager` applies the transition.
 - **`task:{{id}}`** in the `## On Completion` receipt instruction is the misroute detector (§6.9).
+
+Because prompt files are user-owned, an existing `.kanban-pilot/prompts/*.md` copy always wins
+over a later built-in default and is never silently migrated. A copy created before the marker
+was added remains compatible when its footer explicitly assigns frontmatter ownership to the
+extension; users who want the newer marker or wording must edit that copy or remove it and let
+the extension seed a fresh default. Re-run the relevant skill installer after changing the
+canonical `.claude/skills/kanban-pilot/SKILL.md`; installed personal skill copies are snapshots,
+not live links.
 
 **Validate's footer is the one structurally different piece**, because its result has three
 live outcomes instead of two:
