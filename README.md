@@ -21,7 +21,7 @@ Copilot Chat is asked to change code:
 | Stage | What happens |
 | --- | --- |
 | Backlog | Create or select a task, then click **Accept**. |
-| Refine | Click **Refine** to ask Copilot Chat to write the problem statement, acceptance criteria, and Scope. |
+| Refine | Click **Refine** to ask Copilot Chat to write the problem statement, acceptance criteria, and Scope. Click **Split** instead when the task is too big for one ticket. |
 | Scoped | Review the generated Scope and use the gate before approving it. |
 | Approved | Click **Approve** when the scope is ready for implementation. |
 | In Progress | Click **Develop** to ask Copilot Chat to implement the approved Scope. |
@@ -41,7 +41,9 @@ Copilot Chat is asked to change code:
   **Refined** and **Scope** sections and returns a receipt. Refine is a documentation step;
   it must not write implementation code.
 5. Read the **Scope** in the task detail dialog. When it is ready, click **Approve**. This is
-  the review gate between planning and implementation.
+  the review gate between planning and implementation. If the task turns out to be too large,
+  click **Split** instead — the run files the smaller pieces as new backlog tasks and leaves this
+  one as tracking-only.
 6. In **Approved**, click **Develop**. Copilot Chat receives the approved task and implements
   the checklist. A task may show **Continue** when a run needs to resume.
 7. When the task reaches **Validation**, click **Validate**. The QA stage checks the actual
@@ -96,8 +98,11 @@ control-plane-to-Copilot-Chat handoff is visible before running a stage.
 - **Gated by default** — every stage transition requires an explicit click unless you opt into
   auto-advance per gate (`kanbanPilot.gates.*`).
 - **One private chat session per task** — no context bleed between unrelated tasks.
-- **Docked chat** — the active task's Copilot Chat session opens beside the board.
+- **Docked chat** — the active task's Copilot Chat session opens beside the board, and Refine,
+  Develop, and Validate dock it before the prompt is injected.
+- **Split** — fan an oversized ticket out into smaller ones instead of scoping it in place.
 - **Task proposals** — running agents can file follow-up work as new backlog tasks.
+- **Run capacity** — one run at a time by default, raised via `kanbanPilot.run.maxParallelTasks`.
 
 ## Requirements
 
@@ -113,7 +118,7 @@ This extension contributes the following settings (all under `kanbanPilot.*`):
 | `kanbanPilot.tasksDir` | `.kanban-pilot/tasks` | Workspace-relative folder holding task markdown files. |
 | `kanbanPilot.gates.backlogToRefine` | `manual` | `auto` accepts a new task and launches Refine automatically. |
 | `kanbanPilot.gates.scopedToApproved` | `manual` | `auto` approves a freshly-scoped task into the ready queue. |
-| `kanbanPilot.gates.approvedToInProgress` | `manual` | `auto` starts development on the next Approved task. |
+| `kanbanPilot.gates.approvedToInProgress` | `manual` | `auto` starts development on the next Approved task when run capacity has room. |
 | `kanbanPilot.gates.validationAutoStart` | `manual` | `auto` launches Validate as soon as a task lands in Validation. |
 | `kanbanPilot.chat.mode` | `agent` | Chat mode requested at injection (`agent` or `ask`). |
 | `kanbanPilot.chat.sessionPrefix` | `kanban-pilot-` | Prefix used to build each task's private session id. |
