@@ -111,6 +111,7 @@ control-plane-to-Copilot-Chat handoff is visible before running a stage.
 - **Split** — fan an oversized ticket out into smaller ones instead of scoping it in place.
 - **Task proposals** — running agents can file follow-up work as new backlog tasks.
 - **Run capacity** — one run at a time by default, raised via `kanbanPilot.run.maxParallelTasks`.
+- **Receipt recovery** — late completion receipts are reconciled even when a missing-receipt fallback races with the agent's task-file write, so successful runs do not remain blocked.
 
 ## Requirements
 
@@ -153,6 +154,18 @@ parallel code-writing runs need filesystem safety.
 ## Known Issues
 
 None tracked yet.
+
+## Release a Versioned Package
+
+The release workflow runs when a `v<major>.<minor>.<patch>` tag is pushed. To release a version:
+
+1. Update the `version` in `package.json` and the matching root versions in `package-lock.json`,
+  then commit the change.
+2. Push a tag that exactly matches the manifest version, such as `v0.1.0`.
+3. GitHub Actions installs dependencies with `npm ci`, runs the existing tests, build, and lint
+  checks, packages the extension with `npm run vsix`, and verifies the VSIX metadata.
+4. After all checks pass, the workflow creates a GitHub Release for the tag and attaches the
+  generated `kanban-pilot-<version>.vsix` asset.
 
 ## Release Notes
 

@@ -370,6 +370,28 @@ suite('M3 RunManager', () => {
 			);
 		});
 
+		test('a receipt written just before the missing-receipt marker still wins the race', async () => {
+			const task = await store.create('Recover a receipt-marker race');
+			const runId = 'r-marker-race';
+			await store.patch(task.id, { state: 'in-progress', status: 'blocked' });
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'late completion' }),
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'blocked', note: 'no receipt found; awaiting late receipt' }),
+			);
+
+			const runManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await runManager.reconcileTaskChange(task.id);
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+		});
+
 		test('late receipt reconciliation does not duplicate proposed tasks when file changes repeat', async () => {
 			const task = await store.create('Set up billing webhook');
 			await store.patch(task.id, { state: 'approved', status: 'idle' });

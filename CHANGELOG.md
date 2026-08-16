@@ -6,6 +6,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+### Fixed
+
+- Late completion receipts now recover runs when an agent write races with the extension's missing-receipt fallback, preventing successful work from remaining blocked.
+
 ## [0.1.0]
 
 - Initial release

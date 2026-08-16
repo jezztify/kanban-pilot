@@ -615,25 +615,25 @@ export class RunManager {
 
 	private findLateReceipt(task: Task): LateReceiptPair | undefined {
 		const matching = parseReceipts(task.sections['Log'] ?? '').filter((receipt) => receipt.taskId === task.id);
-		let markerIndex = -1;
+		const marker = [...matching].reverse().find(isLateReceiptMarker);
+		if (!marker) {
+			return undefined;
+		}
+
+		// The agent and fallback writes can cross, so the marker may be newer than
+		// the valid receipt it is meant to supersede.
 		for (let i = matching.length - 1; i >= 0; i--) {
-			if (isLateReceiptMarker(matching[i])) {
-				markerIndex = i;
-				break;
+			const receipt = matching[i];
+			if (
+				!isLateReceiptMarker(receipt) &&
+				receipt.runId === marker.runId &&
+				receipt.stage === marker.stage
+			) {
+				return { marker, receipt };
 			}
 		}
 
-		if (markerIndex === -1 || markerIndex === matching.length - 1) {
-			return undefined;
-		}
-
-		const marker = matching[markerIndex];
-		const receipt = matching[matching.length - 1];
-		if (receipt.runId !== marker.runId || receipt.stage !== marker.stage) {
-			return undefined;
-		}
-
-		return { marker, receipt };
+		return undefined;
 	}
 
 	private isLateReceiptCandidate(task: Task, marker: Receipt, receipt: Receipt): boolean {
