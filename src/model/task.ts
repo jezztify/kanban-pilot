@@ -48,6 +48,8 @@ export const STATUSES = ['idle', 'running', 'paused', 'blocked', 'failed'] as co
 export type Status = (typeof STATUSES)[number];
 
 export interface Task {
+	/** Stable workspace-local task-set identity; legacy files resolve to Default. */
+	setId: string;
 	id: string;
 	title: string;
 	state: Column;
@@ -143,7 +145,7 @@ function isStatus(value: string): value is Status {
  * than dropping the card (R4: a bad file should show a repair affordance, never
  * vanish).
  */
-export function taskFromRaw(raw: string, fallbackId?: string): Task | undefined {
+export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default'): Task | undefined {
 	const { frontmatter, body, malformed } = parseFile(raw);
 	if (malformed) {
 		return undefined;
@@ -158,6 +160,7 @@ export function taskFromRaw(raw: string, fallbackId?: string): Task | undefined 
 	const status = frontmatter.status;
 
 	return {
+		setId,
 		id,
 		title: frontmatter.title || id,
 		state: state && isColumn(state) ? state : 'backlog',

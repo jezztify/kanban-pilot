@@ -10,12 +10,14 @@ import { loadPromptTemplate, renderTemplate } from './promptTemplates';
 import { proposalsForRun } from './proposals';
 import { findReceipt, formatReceipt, parseReceipts, Receipt, ReceiptResult, Stage } from './receipt';
 import { hashScope } from './scopeHash';
-import { sessionUriForTask } from './sessionUri';
+import { DEFAULT_TASK_SET_ID, sessionIdForTask, sessionUriForTask } from './sessionUri';
 
 /** §6.12: a run can propose at most this many follow-up tasks — a cap, not a target. */
 const MAX_PROPOSALS_PER_RUN = 5;
 const RECEIPT_GRACE_MS = 250;
 const RECEIPT_POLL_MS = 10;
+const LATE_RECEIPT_INITIAL_DELAY_MS = 500;
+const LATE_RECEIPT_GRACE_MS = 5_000;
 const LATE_RECEIPT_MARKER = 'awaiting late receipt';
 const appliedReceiptKeys = new Set<string>();
 const inFlightReceiptKeys = new Set<string>();
@@ -54,19 +56,18 @@ class RunConcurrencyCoordinator {
 	constructor(private readonly store: TaskStore) {}
 
 	private key(taskId: string, runId: string): string {
-		return `${taskId}:${runId}`;
+		return `${this.store.setId}:${taskId}:${runId}`;
 	}
 
 	private hasReservationForTask(taskId: string): boolean {
-		return [...this.pending, ...this.active].some((key) => key.slice(0, key.indexOf(':')) === taskId);
+		const prefix = `${this.store.setId}:${taskId}:`;
+		return [...this.pending, ...this.active].some((key) => key.startsWith(prefix));
 	}
 
 	private syncActive(tasks: Task[]): void {
 		for (const key of this.active) {
-			const separator = key.indexOf(':');
-			const taskId = separator === -1 ? key : key.slice(0, separator);
-			const runId = separator === -1 ? '' : key.slice(separator + 1);
-			if (!tasks.some((task) => task.id === taskId && task.status === 'running' && task.run === runId)) {
+			const [, taskId, runId] = key.split(':');
+			if (!tasks.some((task) => task.setId === this.store.setId && task.id === taskId && task.status === 'running' && task.run === runId)) {
 				this.active.delete(key);
 			}
 		}
@@ -126,7 +127,7 @@ class RunConcurrencyCoordinator {
 const coordinators = new Map<string, RunConcurrencyCoordinator>();
 
 function coordinatorFor(workspaceFolder: vscode.WorkspaceFolder, store: TaskStore): RunConcurrencyCoordinator {
-	const key = workspaceFolder.uri.toString();
+	const key = `${workspaceFolder.uri.toString()}::${store.setId}`;
 	let coordinator = coordinators.get(key);
 	if (!coordinator) {
 		coordinator = new RunConcurrencyCoordinator(store);
@@ -372,7 +373,7 @@ export class RunManager {
 			return;
 		}
 		try {
-			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix), {
+			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix, this.store.setId), {
 				viewColumn: vscode.ViewColumn.Beside,
 				preserveFocus: true,
 				preview: true,
@@ -505,10 +506,13 @@ export class RunManager {
 				return false;
 			}
 
+			const sessionId = this.store.setId === DEFAULT_TASK_SET_ID
+				? task.chat ?? sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId)
+				: sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId);
 			await this.store.patch(taskId, {
 				status: 'running',
 				run: runId,
-				chat: task.chat ?? `${cfg.sessionPrefix}${taskId}`,
+				chat: sessionId,
 			});
 			return true;
 		});
@@ -642,7 +646,7 @@ export class RunManager {
 	}
 
 	private receiptKey(taskId: string, runId: string, stage: Stage, receipt: Receipt): string {
-		return [this.store.directory.toString(), taskId, runId, stage, receipt.result, receipt.note].join('|');
+		return [this.store.setId, this.store.directory.toString(), taskId, runId, stage, receipt.result, receipt.note].join('|');
 	}
 
 	private async applyReceipt(
@@ -701,6 +705,42 @@ export class RunManager {
 		}
 	}
 
+	/**
+	 * The task watcher normally observes a receipt written after the initial
+	 * response grace period. Keep a bounded local backstop too: filesystem
+	 * events can be coalesced with the fallback write, so relying on the
+	 * watcher alone leaves a valid agent completion stuck as blocked.
+	 */
+	private async reconcileLateReceiptUntilDeadline(taskId: string, runId: string, stage: Stage): Promise<void> {
+		// Let the ordinary file-change reconciliation handle the common case
+		// first. This backstop is specifically for a missed or coalesced event.
+		await wait(LATE_RECEIPT_INITIAL_DELAY_MS);
+		const deadline = Date.now() + LATE_RECEIPT_GRACE_MS;
+		for (;;) {
+			const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+			if (!task || task.status !== 'blocked' || task.run || task.state !== columnForStage(stage)) {
+				return;
+			}
+
+			const late = this.findLateReceipt(task);
+			if (late && late.marker.runId === runId && late.marker.stage === stage && late.receipt.stage === stage) {
+				await this.applyReceipt(
+					taskId,
+					runId,
+					stage,
+					late.receipt,
+					(candidate) => this.isLateReceiptCandidate(candidate, late.marker, late.receipt),
+				);
+				return;
+			}
+
+			if (Date.now() >= deadline) {
+				return;
+			}
+			await wait(Math.min(RECEIPT_POLL_MS, deadline - Date.now()));
+		}
+	}
+
 	private async markMissingReceipt(taskId: string, runId: string, stage: Stage, note: string): Promise<void> {
 		let current = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 		if (!current || current.run !== runId) {
@@ -736,6 +776,7 @@ export class RunManager {
 		}
 
 		await this.store.patch(taskId, { status: 'blocked', run: undefined });
+		void this.reconcileLateReceiptUntilDeadline(taskId, runId, stage);
 	}
 
 	private async reconcile(
@@ -852,7 +893,7 @@ export class RunManager {
 	private async resetSession(taskId: string): Promise<void> {
 		const cfg = readConfig();
 		try {
-			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix), {
+			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix, this.store.setId), {
 				preserveFocus: false,
 			});
 			await vscode.commands.executeCommand('workbench.action.chat.newChat');

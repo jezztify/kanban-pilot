@@ -23,10 +23,17 @@ function taskIdFromUri(uri: vscode.Uri): string | undefined {
 }
 
 export class TaskStore {
-	constructor(private readonly tasksDir: vscode.Uri) {}
+	constructor(
+		private readonly tasksDir: vscode.Uri,
+		public readonly setId = 'default',
+	) {}
 
-	static forWorkspace(folder: vscode.WorkspaceFolder, subPath = '.kanban-pilot/tasks'): TaskStore {
-		return new TaskStore(vscode.Uri.joinPath(folder.uri, ...subPath.split('/')));
+	static forWorkspace(
+		folder: vscode.WorkspaceFolder,
+		subPath = '.kanban-pilot/tasks',
+		setId = 'default',
+	): TaskStore {
+		return new TaskStore(vscode.Uri.joinPath(folder.uri, ...subPath.replace(/\\/g, '/').split('/')), setId);
 	}
 
 	get directory(): vscode.Uri {
@@ -67,7 +74,7 @@ export class TaskStore {
 				continue;
 			}
 
-			const task = taskFromRaw(raw, TASK_FILE.exec(name)?.[1]);
+			const task = taskFromRaw(raw, TASK_FILE.exec(name)?.[1], this.setId);
 			if (task) {
 				tasks.push(task);
 			} else {
@@ -121,7 +128,7 @@ export class TaskStore {
 		const content = newTaskFile(id, title, { request: options?.request, origin: options?.origin });
 		await this.writeAtomic(this.fileFor(id), content);
 
-		const task = taskFromRaw(content, id);
+		const task = taskFromRaw(content, id, this.setId);
 		if (!task) {
 			throw new Error(`Generated an unparseable task file for ${id}`);
 		}

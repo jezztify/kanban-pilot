@@ -152,10 +152,10 @@ parallel code-writing runs need filesystem safety.
 
 ## Known Issues
 
-None tracked yet — this is a pre-release build.
+None tracked yet.
 
 ## Release Notes
 
-### 0.0.1
+### 0.1.0
 
 Initial build.

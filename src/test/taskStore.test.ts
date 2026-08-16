@@ -4,6 +4,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import { COLUMNS, Column, STATUSES, Status, newTaskFile, parseSections, taskFromRaw, updateFrontmatter } from '../model/task';
+import { sessionIdForTask } from '../chat/sessionUri';
+import { DEFAULT_TASK_SET_ID, TaskSetError, TaskSetRegistry } from '../model/taskSets';
 import { TaskStore } from '../model/taskStore';
 import { invokeBoardAction, primaryAction, shouldDockTaskChat } from '../board/boardPanel';
 import { TaskAction } from '../board/stateMachine';
@@ -249,6 +251,108 @@ suite('M1 task store', () => {
 		const snapshot = await store.snapshot();
 		assert.deepStrictEqual(snapshot.malformed, []);
 		assert.ok(snapshot.columns.every((c) => c.tasks.length === 0));
+	});
+});
+
+suite('task sets', () => {
+	let root: vscode.Uri;
+	let folder: vscode.WorkspaceFolder;
+
+	setup(() => {
+		root = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-sets-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		folder = { uri: root, name: 'task-set-test', index: 0 };
+	});
+
+	teardown(async () => {
+		try {
+			await vscode.workspace.fs.delete(root, { recursive: true });
+		} catch {
+			/* already gone */
+		}
+	});
+
+	test('legacy tasksDir is the durable immutable Default set', async () => {
+		const legacy = new TaskStore(vscode.Uri.joinPath(root, 'legacy', 'tasks'));
+		await legacy.ensureDirectory();
+		const task = await legacy.create('Existing task');
+
+		const registry = new TaskSetRegistry(folder, 'legacy/tasks');
+		const active = await registry.active();
+
+		assert.strictEqual(registry.registryFile.fsPath, path.join(root.fsPath, '.kanban-pilot', 'task-sets.json'));
+		assert.strictEqual(active.id, DEFAULT_TASK_SET_ID);
+		assert.strictEqual(active.name, 'Default');
+		assert.strictEqual(active.directory.toString(), legacy.directory.toString());
+		assert.strictEqual((await legacy.readAll()).tasks[0].id, task.id);
+		await assert.rejects(() => registry.rename(DEFAULT_TASK_SET_ID, 'Renamed'), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'default-set',
+		);
+	});
+
+	test('create, select, rename, and reload preserve independent sets', async () => {
+		const registry = new TaskSetRegistry(folder, 'legacy/tasks');
+		const created = await registry.create('Mobile release');
+		assert.strictEqual((await registry.active()).id, created.id);
+
+		const setStore = new TaskStore(created.directory, created.id);
+		await setStore.ensureDirectory();
+		const task = await setStore.create('Only in mobile release');
+		assert.strictEqual(task.id, 'TASK-001');
+		assert.strictEqual(task.setId, created.id);
+
+		await assert.rejects(() => registry.create(' mobile   release '), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'duplicate-name',
+		);
+		await assert.rejects(() => registry.create('   '), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'invalid-name',
+		);
+
+		await registry.rename(created.id, 'Mobile v2');
+		await registry.select(DEFAULT_TASK_SET_ID);
+		const reloaded = new TaskSetRegistry(folder, 'legacy/tasks');
+		assert.strictEqual((await reloaded.active()).id, DEFAULT_TASK_SET_ID);
+		assert.strictEqual((await reloaded.get(created.id)).name, 'Mobile v2');
+		assert.strictEqual((await new TaskStore(created.directory, created.id).readAll()).tasks[0].id, task.id);
+	});
+
+	test('deletion refuses non-empty and Default sets, then removes an empty set safely', async () => {
+		const registry = new TaskSetRegistry(folder, 'legacy/tasks');
+		const created = await registry.create('Temporary');
+		const setStore = new TaskStore(created.directory, created.id);
+		await setStore.ensureDirectory();
+		const task = await setStore.create('Keep me');
+
+		await assert.rejects(() => registry.delete(created.id), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'not-empty',
+		);
+		assert.strictEqual((await setStore.readAll()).tasks[0].id, task.id);
+		await assert.rejects(() => registry.delete(DEFAULT_TASK_SET_ID), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'default-set',
+		);
+
+		await vscode.workspace.fs.delete(setStore.fileFor(task.id));
+		await registry.delete(created.id);
+		await assert.rejects(() => registry.get(created.id), (error: unknown) =>
+			error instanceof TaskSetError && error.code === 'not-found',
+		);
+		assert.strictEqual((await registry.active()).id, DEFAULT_TASK_SET_ID);
+	});
+
+	test('same task ids remain isolated by store identity and chat session identity', async () => {
+		const first = new TaskStore(vscode.Uri.joinPath(root, 'one'), 'set-one');
+		const second = new TaskStore(vscode.Uri.joinPath(root, 'two'), 'set-two');
+		await first.ensureDirectory();
+		await second.ensureDirectory();
+		const firstTask = await first.create('First');
+		const secondTask = await second.create('Second');
+
+		assert.strictEqual(firstTask.id, secondTask.id);
+		assert.strictEqual(firstTask.setId, 'set-one');
+		assert.strictEqual(secondTask.setId, 'set-two');
+		assert.notStrictEqual(sessionIdForTask(firstTask.id, 'kanban-pilot-', first.setId), sessionIdForTask(secondTask.id, 'kanban-pilot-', second.setId));
+		assert.strictEqual(sessionIdForTask('TASK-001'), 'kanban-pilot-TASK-001', 'Default sessions stay backward compatible');
 	});
 });
 

@@ -48,6 +48,21 @@
         "category": "Kanban Pilot"
       },
       {
+        "command": "kanban-pilot.createTaskSet",
+        "title": "Create Task Set",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.renameTaskSet",
+        "title": "Rename Task Set",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.deleteTaskSet",
+        "title": "Delete Task Set",
+        "category": "Kanban Pilot"
+      },
+      {
         "command": "kanban-pilot.acceptTask",
         "title": "Accept Task",
         "category": "Kanban Pilot"
@@ -124,7 +139,7 @@
         "kanbanPilot.tasksDir": {
           "type": "string",
           "default": ".kanban-pilot/tasks",
-          "description": "Workspace-relative folder holding task markdown files."
+          "description": "Workspace-relative folder used by the immutable Default task set; additional named sets are stored under .kanban-pilot/task-sets/."
         },
         "kanbanPilot.gates.backlogToRefine": {
           "type": "string",
@@ -174,7 +189,7 @@
         "kanbanPilot.chat.sessionPrefix": {
           "type": "string",
           "default": "kanban-pilot-",
-          "description": "Session-id prefix; <prefix><taskId> is the per-task session (§6.7)."
+          "description": "Session-id prefix; Default uses <prefix><taskId>, while named sets include the stable set id before <taskId>."
         },
         "kanbanPilot.chat.closeTabOnDone": {
           "type": "boolean",

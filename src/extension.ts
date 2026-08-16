@@ -4,9 +4,142 @@ import { BoardPanel } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
 import { ChatSessionExecutor } from './chat/executor';
 import { normalizeMaxParallelTasks, RunManager } from './chat/runManager';
+import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore } from './model/taskStore';
 
 const executor = new ChatSessionExecutor();
+
+/**
+ * The board and all commands share one active-set context per workspace. A
+ * context swaps the store and RunManager together, so a task id is never
+ * resolved against a different set halfway through an operation.
+ */
+export class WorkspaceTaskSetContext {
+	readonly registry: TaskSetRegistry;
+	private currentSet: TaskSet;
+	private currentStore: TaskStore;
+	private currentRunManager: RunManager;
+	private watcher: vscode.Disposable | undefined;
+	private watcherQueue: Promise<void> = Promise.resolve();
+	private readonly changed = new vscode.EventEmitter<void>();
+	readonly ready: Promise<void>;
+
+	constructor(
+		private readonly folder: vscode.WorkspaceFolder,
+		tasksDir: string,
+	) {
+		this.registry = new TaskSetRegistry(folder, tasksDir);
+		this.currentSet = this.registry.defaultSet;
+		this.currentStore = new TaskStore(this.currentSet.directory, this.currentSet.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder);
+		this.ready = this.initialize();
+	}
+
+	get activeSet(): TaskSet {
+		return this.currentSet;
+	}
+
+	get store(): TaskStore {
+		return this.currentStore;
+	}
+
+	get runManager(): RunManager {
+		return this.currentRunManager;
+	}
+
+	onDidChange(listener: () => void): vscode.Disposable {
+		return this.changed.event(listener);
+	}
+
+	private async initialize(): Promise<void> {
+		const active = await this.registry.active();
+		this.activateSet(active);
+		await this.currentRunManager.reconcileOnActivation();
+		await this.currentRunManager.applyGatePolicies();
+	}
+
+	private activateSet(set: TaskSet): void {
+		this.watcher?.dispose();
+		this.currentSet = set;
+		this.currentStore = new TaskStore(set.directory, set.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder);
+		const manager = this.currentRunManager;
+		this.watcher = this.currentStore.watch((taskId) => {
+			this.watcherQueue = this.watcherQueue
+				.then(() => manager.reconcileTaskChange(taskId))
+				.then(() => manager.applyGatePolicies())
+				.catch(() => undefined);
+		});
+	}
+
+	private async ensureReady(): Promise<void> {
+		await this.ready;
+	}
+
+	async listTaskSets(): Promise<TaskSet[]> {
+		await this.ensureReady();
+		return this.registry.list();
+	}
+
+	async switchTaskSet(id: string): Promise<void> {
+		await this.ensureReady();
+		if (id === this.currentSet.id) {
+			return;
+		}
+
+		await this.ensureNoActiveRun();
+
+		const next = await this.registry.select(id);
+		this.activateSet(next);
+		await this.currentRunManager.reconcileOnActivation();
+		await this.currentRunManager.applyGatePolicies();
+		this.changed.fire();
+	}
+
+	async createTaskSet(name: string): Promise<void> {
+		await this.ensureReady();
+		await this.ensureNoActiveRun();
+		const next = await this.registry.create(name);
+		this.activateSet(next);
+		await this.currentRunManager.reconcileOnActivation();
+		await this.currentRunManager.applyGatePolicies();
+		this.changed.fire();
+	}
+
+	async renameTaskSet(name: string): Promise<void> {
+		await this.ensureReady();
+		const renamed = await this.registry.rename(this.currentSet.id, name);
+		this.currentSet = renamed;
+		this.changed.fire();
+	}
+
+	async deleteTaskSet(): Promise<void> {
+		await this.ensureReady();
+		const deletedId = this.currentSet.id;
+		await this.registry.delete(deletedId);
+		if (deletedId !== DEFAULT_TASK_SET_ID) {
+			this.activateSet(await this.registry.active());
+			await this.currentRunManager.reconcileOnActivation();
+			await this.currentRunManager.applyGatePolicies();
+		}
+		this.changed.fire();
+	}
+
+	private async ensureNoActiveRun(): Promise<void> {
+		const { tasks } = await this.currentStore.readAll();
+		if (tasks.some((task) => task.status === 'running')) {
+			throw new TaskSetError('active-run', 'Task-set changes are unavailable while a task run is active.');
+		}
+	}
+
+	dispose(): void {
+		this.watcher?.dispose();
+		this.watcher = undefined;
+		this.changed.dispose();
+	}
+}
+
+const workspaceContexts = new Map<string, WorkspaceTaskSetContext>();
 
 function activeWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
 	// v1 binds the board to the first workspace folder (R7).
@@ -17,21 +150,22 @@ function activeWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
 	return folder;
 }
 
-function storeFor(folder: vscode.WorkspaceFolder): TaskStore {
-	const subPath = vscode.workspace
-		.getConfiguration('kanbanPilot')
-		.get<string>('tasksDir', '.kanban-pilot/tasks');
-	return TaskStore.forWorkspace(folder, subPath);
-}
-
 /** Bundles the store + RunManager for the active workspace, or undefined if there isn't one. */
-function context(): { store: TaskStore; runManager: RunManager } | undefined {
+function context(): WorkspaceTaskSetContext | undefined {
 	const folder = activeWorkspaceFolder();
 	if (!folder) {
 		return undefined;
 	}
-	const store = storeFor(folder);
-	return { store, runManager: new RunManager(store, executor, folder) };
+	const key = folder.uri.toString();
+	let workspaceContext = workspaceContexts.get(key);
+	if (!workspaceContext) {
+		const tasksDir = vscode.workspace
+			.getConfiguration('kanbanPilot')
+			.get<string>('tasksDir', '.kanban-pilot/tasks');
+		workspaceContext = new WorkspaceTaskSetContext(folder, tasksDir);
+		workspaceContexts.set(key, workspaceContext);
+	}
+	return workspaceContext;
 }
 
 /**
@@ -64,7 +198,7 @@ class BoardViewProvider implements vscode.WebviewViewProvider {
 	private openBoard(): void {
 		const ctx = context();
 		if (ctx) {
-			BoardPanel.show(ctx.store, ctx.runManager, this.extensionUri);
+			BoardPanel.show(ctx, this.extensionUri);
 		}
 	}
 }
@@ -88,6 +222,7 @@ function registerActionCommand(
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			const id = await pickTaskFor(ctx.store, action, taskId);
 			if (id) {
 				await ctx.runManager.handleAction(id, action);
@@ -101,25 +236,10 @@ export function activate(context_: vscode.ExtensionContext) {
 	// against whatever the file shows before the user touches anything.
 	const startupFolder = vscode.workspace.workspaceFolders?.[0];
 	if (startupFolder) {
-		const store = storeFor(startupFolder);
-		const gateRunManager = new RunManager(store, executor, startupFolder);
+		const workspaceContext = context();
 		const runConfig = vscode.workspace.getConfiguration('kanbanPilot.run');
+		void workspaceContext?.ready;
 		let previousMaxParallelTasks = normalizeMaxParallelTasks(runConfig.get<number>('maxParallelTasks', 1));
-		let watcherQueue: Promise<void> = Promise.resolve();
-		watcherQueue = watcherQueue
-			.then(() => gateRunManager.reconcileOnActivation())
-			.then(() => gateRunManager.applyGatePolicies())
-			.catch(() => undefined);
-		const enqueueWatcherChange = (taskId?: string): void => {
-			watcherQueue = watcherQueue
-				.then(() => gateRunManager.reconcileTaskChange(taskId))
-				.then(() => gateRunManager.applyGatePolicies())
-				.catch(() => undefined);
-		};
-		// §6.15: re-sweep on every change, not just at startup — disk is
-		// authoritative (G5), so a gate firing (or a human hand-editing a task
-		// file directly) both need to be picked up the same way.
-		context_.subscriptions.push(store.watch(enqueueWatcherChange));
 		context_.subscriptions.push(
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (!event.affectsConfiguration('kanbanPilot.run.maxParallelTasks')) {
@@ -131,7 +251,7 @@ export function activate(context_: vscode.ExtensionContext) {
 				const increased = currentMaxParallelTasks > previousMaxParallelTasks;
 				previousMaxParallelTasks = currentMaxParallelTasks;
 				if (increased) {
-					enqueueWatcherChange();
+					void workspaceContext?.runManager.reconcileTaskChange().then(() => workspaceContext.runManager.applyGatePolicies());
 				}
 			}),
 		);
@@ -145,7 +265,7 @@ export function activate(context_: vscode.ExtensionContext) {
 		vscode.commands.registerCommand('kanban-pilot.openBoard', () => {
 			const ctx = context();
 			if (ctx) {
-				BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
+				BoardPanel.show(ctx, context_.extensionUri);
 			}
 		}),
 
@@ -154,6 +274,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			const title = await vscode.window.showInputBox({
 				prompt: 'Task title',
 				placeHolder: 'e.g. Prepare launch notes',
@@ -170,11 +291,75 @@ export function activate(context_: vscode.ExtensionContext) {
 			await ctx.store.create(title.trim(), { request: description?.trim() });
 		}),
 
+		vscode.commands.registerCommand('kanban-pilot.createTaskSet', async () => {
+			const ctx = context();
+			if (!ctx) {
+				return;
+			}
+			await ctx.ready;
+			const name = await vscode.window.showInputBox({
+				prompt: 'Task-set name',
+				placeHolder: 'e.g. Mobile app release',
+				validateInput: (value) => (value.trim() ? undefined : 'Task-set name cannot be blank.'),
+			});
+			if (!name) {
+				return;
+			}
+			try {
+				await ctx.createTaskSet(name);
+			} catch (error) {
+				void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+			}
+		}),
+
+		vscode.commands.registerCommand('kanban-pilot.renameTaskSet', async () => {
+			const ctx = context();
+			if (!ctx) {
+				return;
+			}
+			await ctx.ready;
+			const name = await vscode.window.showInputBox({
+				prompt: 'Rename task set',
+				value: ctx.activeSet.name,
+				validateInput: (value) => (value.trim() ? undefined : 'Task-set name cannot be blank.'),
+			});
+			if (!name) {
+				return;
+			}
+			try {
+				await ctx.renameTaskSet(name);
+			} catch (error) {
+				void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+			}
+		}),
+
+		vscode.commands.registerCommand('kanban-pilot.deleteTaskSet', async () => {
+			const ctx = context();
+			if (!ctx) {
+				return;
+			}
+			await ctx.ready;
+			const confirmed = await vscode.window.showWarningMessage(
+				`Delete task set '${ctx.activeSet.name}'? Only an empty set can be deleted.`,
+				{ modal: true },
+				'Delete',
+			);
+			if (confirmed !== 'Delete') {
+				return;
+			}
+			try {
+				await ctx.deleteTaskSet();
+			} catch (error) {
+				void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+			}
+		}),
+
 		vscode.commands.registerCommand('kanban-pilot.openTaskFile', async (taskId?: string) => {
 			const ctx = context();
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			let id = taskId;
 			if (!id) {
 				const { tasks } = await ctx.store.readAll();
@@ -194,6 +379,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			let id = taskId;
 			if (!id) {
 				const { tasks } = await ctx.store.readAll();
@@ -215,6 +401,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			const { tasks } = await ctx.store.readAll();
 			const running = tasks.filter((t) => t.status === 'running');
 			let id = taskId;
@@ -253,6 +440,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 			let id = taskId;
 			if (!id) {
 				const { tasks } = await ctx.store.readAll();
@@ -277,6 +465,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (!ctx) {
 				return;
 			}
+			await ctx.ready;
 
 			const samples: [string, string][] = [
 				['Set up billing webhook', 'backlog'],
@@ -294,7 +483,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			}
 
 			void vscode.window.showInformationMessage(`Seeded ${samples.length} tasks.`);
-			BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
+			BoardPanel.show(ctx, context_.extensionUri);
 		}),
 	);
 
@@ -311,9 +500,14 @@ export function activate(context_: vscode.ExtensionContext) {
 	if (startupFolder && vscode.workspace.getConfiguration('kanbanPilot').get<boolean>('board.openOnStartup', false)) {
 		const ctx = context();
 		if (ctx) {
-			BoardPanel.show(ctx.store, ctx.runManager, context_.extensionUri);
+			BoardPanel.show(ctx, context_.extensionUri);
 		}
 	}
 }
 
-export function deactivate() {}
+export function deactivate() {
+	for (const workspaceContext of workspaceContexts.values()) {
+		workspaceContext.dispose();
+	}
+	workspaceContexts.clear();
+}

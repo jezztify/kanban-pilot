@@ -128,7 +128,7 @@ export class ChatSessionExecutor implements Executor {
 				// focus to move.
 				await vscode.commands.executeCommand(
 					'vscode.open',
-					sessionUriForTask(task.id, options.sessionPrefix),
+					sessionUriForTask(task.id, options.sessionPrefix, task.setId),
 					taskChatOpenOptions(options.openBeside === true),
 				);
 
@@ -157,7 +157,7 @@ export class ChatSessionExecutor implements Executor {
 		try {
 			await vscode.commands.executeCommand(
 				'vscode.open',
-				sessionUriForTask(task.id, options.sessionPrefix),
+				sessionUriForTask(task.id, options.sessionPrefix, task.setId),
 				taskChatOpenOptions(options.openBeside === true),
 			);
 			await vscode.env.clipboard.writeText(prompt);

@@ -10,6 +10,7 @@
 	"js/ts.tsc.autoDetect": "off",
 	"kanbanPilot.chat.agentNames": {
 		"develop": "Bro Rapid Coder",
-		"validate": "Bro Rapid QA"
+		"validate": "Bro Rapid QA",
+		"refine": "Bro Rapid Architect"
 	}
 }

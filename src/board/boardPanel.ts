@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AgentNameOverrides, NameableStage, resolveAgentName } from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
 import { COLUMNS, COLUMN_LABELS, Column, Status, Task } from '../model/task';
+import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
 import { TASK_ACTIONS, TaskAction } from './stateMachine';
@@ -173,6 +174,7 @@ export async function invokeBoardAction(
 interface InMessage {
 	type?: string;
 	taskId?: string;
+  taskSetId?: string;
   destination?: unknown;
 	action?: string;
 	title?: string;
@@ -180,6 +182,20 @@ interface InMessage {
 	key?: string;
 	value?: string;
 	stage?: string;
+}
+
+/** Operations the webview needs from the workspace's active-set controller. */
+export interface BoardTaskSetHost {
+  readonly ready: Promise<void>;
+  readonly store: TaskStore;
+  readonly runManager: RunManager;
+  readonly activeSet: TaskSet;
+  listTaskSets(): Promise<TaskSet[]>;
+  switchTaskSet(id: string): Promise<void>;
+  createTaskSet(name: string): Promise<void>;
+  renameTaskSet(name: string): Promise<void>;
+  deleteTaskSet(): Promise<void>;
+  onDidChange(listener: () => void): vscode.Disposable;
 }
 
 /**
@@ -230,19 +246,23 @@ export class BoardPanel {
 
 	private readonly disposables: vscode.Disposable[] = [];
 	private selectedTaskId: string | undefined;
+  private taskWatcher: vscode.Disposable | undefined;
 
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
-		private readonly store: TaskStore,
-		private readonly runManager: RunManager,
+    private readonly host: BoardTaskSetHost,
 	) {
 		this.panel.webview.options = { enableScripts: true };
 		this.panel.webview.html = this.html();
+    this.bindTaskWatcher();
 
 		this.disposables.push(
 			this.panel.webview.onDidReceiveMessage((message: InMessage) => this.onMessage(message)),
-			// Disk is authoritative — any change re-reads and re-pushes (G5, R5).
-			this.store.watch(() => void this.pushAll()),
+      this.host.onDidChange(() => {
+        this.selectedTaskId = undefined;
+        this.bindTaskWatcher();
+        void this.pushAll();
+      }),
 			// Picks up a hand-edited settings.json too, not just the board's own toggle.
 			vscode.workspace.onDidChangeConfiguration((e) => {
 				if (e.affectsConfiguration('kanbanPilot.gates')) {
@@ -254,11 +274,29 @@ export class BoardPanel {
 			}),
 			this.panel.onDidDispose(() => this.dispose()),
 		);
+    void this.host.ready
+      .then(() => {
+        this.bindTaskWatcher();
+        return this.pushAll();
+      })
+      .catch(() => undefined);
 	}
 
+  private get store(): TaskStore {
+    return this.host.store;
+  }
+
+  private get runManager(): RunManager {
+    return this.host.runManager;
+  }
+
+  private bindTaskWatcher(): void {
+    this.taskWatcher?.dispose();
+    this.taskWatcher = this.store.watch(() => void this.pushAll());
+  }
+
 	static show(
-		store: TaskStore,
-		runManager: RunManager,
+    host: BoardTaskSetHost,
 		extensionUri: vscode.Uri,
 		column = vscode.ViewColumn.One,
 	): BoardPanel {
@@ -274,16 +312,79 @@ export class BoardPanel {
 		});
 		panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'activity-icon.svg');
 
-		BoardPanel.current = new BoardPanel(panel, store, runManager);
+    BoardPanel.current = new BoardPanel(panel, host);
 		return BoardPanel.current;
 	}
 
 	private async onMessage(message: InMessage): Promise<void> {
 		switch (message.type) {
 			case 'board/ready':
+        await this.host.ready;
 				await this.pushAll();
 				await this.pushGates();
 				return;
+
+      case 'taskSet/select':
+        if (message.taskSetId) {
+          try {
+            await this.host.switchTaskSet(message.taskSetId);
+          } catch (error) {
+            void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+            await this.pushAll();
+          }
+        }
+        return;
+
+      case 'taskSet/create': {
+        const name = await vscode.window.showInputBox({
+          prompt: 'Task-set name',
+          placeHolder: 'e.g. Mobile app release',
+          validateInput: (value) => (value.trim() ? undefined : 'Task-set name cannot be blank.'),
+        });
+        if (!name) {
+          return;
+        }
+        try {
+          await this.host.createTaskSet(name);
+        } catch (error) {
+          void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+        }
+        return;
+    }
+
+      case 'taskSet/rename': {
+        const name = await vscode.window.showInputBox({
+          prompt: 'Rename task set',
+          value: this.host.activeSet.name,
+          validateInput: (value) => (value.trim() ? undefined : 'Task-set name cannot be blank.'),
+        });
+        if (!name) {
+          return;
+        }
+        try {
+          await this.host.renameTaskSet(name);
+        } catch (error) {
+          void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
+
+      case 'taskSet/delete': {
+        const confirmed = await vscode.window.showWarningMessage(
+          `Delete task set '${this.host.activeSet.name}'? Only an empty set can be deleted.`,
+          { modal: true },
+          'Delete',
+        );
+        if (confirmed !== 'Delete') {
+          return;
+        }
+        try {
+          await this.host.deleteTaskSet();
+        } catch (error) {
+          void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
 
 			case 'task/open':
 				if (message.taskId) {
@@ -402,12 +503,13 @@ export class BoardPanel {
 
 	private async pushBoard(): Promise<void> {
 		const snapshot = await this.store.snapshot();
+    const taskSets = await this.host.listTaskSets();
 		const agentNames = vscode.workspace
 			.getConfiguration('kanbanPilot')
 			.get<AgentNameOverrides>('chat.agentNames', {});
 		await this.panel.webview.postMessage({
 			type: 'board/state',
-			snapshot: this.toView(snapshot, agentNames),
+      snapshot: this.toView(snapshot, agentNames, taskSets),
 			selectedTaskId: this.selectedTaskId,
 		});
 	}
@@ -455,9 +557,12 @@ export class BoardPanel {
 		await this.panel.webview.postMessage({ type: 'gates/state', gates });
 	}
 
-	private toView(snapshot: BoardSnapshot, agentNames: AgentNameOverrides) {
+  private toView(snapshot: BoardSnapshot, agentNames: AgentNameOverrides, taskSets: TaskSet[]) {
 		return {
 			malformed: snapshot.malformed,
+      taskSets: taskSets.map((set) => ({ id: set.id, name: set.name, isDefault: set.isDefault })),
+      activeTaskSetId: this.host.activeSet.id,
+      activeTaskSetName: this.host.activeSet.name,
 			columns: snapshot.columns.map((column) => ({
 				id: column.id,
 				label: COLUMN_LABELS[column.id],
@@ -479,6 +584,8 @@ export class BoardPanel {
 
 	dispose(): void {
 		BoardPanel.current = undefined;
+    this.taskWatcher?.dispose();
+    this.taskWatcher = undefined;
 		this.panel.dispose();
 		for (const d of this.disposables) {
 			d.dispose();
@@ -564,6 +671,21 @@ export class BoardPanel {
   }
   h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
   .header-actions { display: flex; align-items: center; gap: 8px; }
+  .task-set-controls { display: inline-flex; align-items: center; gap: 6px; }
+  .task-set-label { font-size: 12px; color: var(--vscode-descriptionForeground); }
+  .task-set-select {
+    min-width: 150px; max-width: 220px; font-family: inherit; font-size: 12px;
+    color: var(--vscode-foreground); background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: var(--kp-radius-button); padding: 7px 8px;
+  }
+  .task-set-btn {
+    font-family: inherit; font-size: 11px; color: var(--vscode-foreground);
+    background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-panel-border);
+    border-radius: var(--kp-radius-button); padding: 7px 8px; cursor: pointer;
+  }
+  .task-set-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15)); }
+  .task-set-btn:disabled, .task-set-select:disabled { opacity: .55; cursor: not-allowed; }
 
   .new-task-btn {
     display: inline-flex; align-items: center; gap: 6px;
@@ -884,6 +1006,13 @@ export class BoardPanel {
 <header>
   <h1>Kanban Pilot</h1>
   <div class="header-actions">
+    <div class="task-set-controls" aria-label="Task-set management">
+      <label class="task-set-label" for="taskSetSelect">Task set</label>
+      <select class="task-set-select" id="taskSetSelect" aria-label="Active task set"></select>
+      <button class="task-set-btn" id="taskSetCreate" aria-label="Create task set">New</button>
+      <button class="task-set-btn" id="taskSetRename" aria-label="Rename active task set">Rename</button>
+      <button class="task-set-btn" id="taskSetDelete" aria-label="Delete active task set">Delete</button>
+    </div>
     <button class="gates-btn" id="gatesToggle">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       Gates
@@ -1348,6 +1477,22 @@ export class BoardPanel {
     }
   }
 
+  function renderTaskSets(snapshot) {
+    const select = document.getElementById('taskSetSelect');
+    select.textContent = '';
+    for (const taskSet of snapshot.taskSets || []) {
+      const option = document.createElement('option');
+      option.value = taskSet.id;
+      option.textContent = taskSet.name + (taskSet.isDefault ? ' (Default)' : '');
+      select.appendChild(option);
+    }
+    select.value = snapshot.activeTaskSetId;
+    const active = (snapshot.taskSets || []).find((taskSet) => taskSet.id === snapshot.activeTaskSetId);
+    document.getElementById('taskSetRename').disabled = !active || active.isDefault;
+    document.getElementById('taskSetDelete').disabled = !active || active.isDefault;
+    select.title = 'Active task set: ' + (snapshot.activeTaskSetName || 'Default');
+  }
+
   function closeDetail() {
     document.getElementById('detailBackdrop').classList.remove('open');
     vscode.postMessage({ type: 'task/deselect' });
@@ -1455,6 +1600,7 @@ export class BoardPanel {
     if (!msg) { return; }
     if (msg.type === 'board/state') {
       lastSelectedId = msg.selectedTaskId;
+      renderTaskSets(msg.snapshot);
       renderBoard(msg.snapshot, lastSelectedId);
     } else if (msg.type === 'task/detail') {
       renderDetail(msg.task);
@@ -1496,6 +1642,19 @@ export class BoardPanel {
   });
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && newTaskBackdrop.classList.contains('open')) { closeNewTaskModal(); }
+  });
+
+  document.getElementById('taskSetSelect').addEventListener('change', (e) => {
+    vscode.postMessage({ type: 'taskSet/select', taskSetId: e.target.value });
+  });
+  document.getElementById('taskSetCreate').addEventListener('click', () => {
+    vscode.postMessage({ type: 'taskSet/create' });
+  });
+  document.getElementById('taskSetRename').addEventListener('click', () => {
+    vscode.postMessage({ type: 'taskSet/rename' });
+  });
+  document.getElementById('taskSetDelete').addEventListener('click', () => {
+    vscode.postMessage({ type: 'taskSet/delete' });
   });
 
   const gatesBackdrop = document.getElementById('gatesBackdrop');

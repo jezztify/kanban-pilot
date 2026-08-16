@@ -24,6 +24,7 @@ import * as vscode from 'vscode';
 export const CHAT_SESSION_SCHEME = 'vscode-chat-session';
 export const LOCAL_SESSION_TYPE = 'local';
 export const DEFAULT_SESSION_PREFIX = 'kanban-pilot-';
+export const DEFAULT_TASK_SET_ID = 'default';
 
 export function encodeSessionId(sessionId: string): string {
 	return Buffer.from(sessionId, 'utf8').toString('base64url');
@@ -33,8 +34,12 @@ export function decodeSessionId(encoded: string): string {
 	return Buffer.from(encoded, 'base64url').toString('utf8');
 }
 
-export function sessionIdForTask(taskId: string, prefix = DEFAULT_SESSION_PREFIX): string {
-	return `${prefix}${taskId}`;
+export function sessionIdForTask(
+	taskId: string,
+	prefix = DEFAULT_SESSION_PREFIX,
+	setId = DEFAULT_TASK_SET_ID,
+): string {
+	return `${prefix}${setId === DEFAULT_TASK_SET_ID ? taskId : `${setId}-${taskId}`}`;
 }
 
 export function sessionUriForId(sessionId: string): vscode.Uri {
@@ -45,8 +50,12 @@ export function sessionUriForId(sessionId: string): vscode.Uri {
 	});
 }
 
-export function sessionUriForTask(taskId: string, prefix = DEFAULT_SESSION_PREFIX): vscode.Uri {
-	return sessionUriForId(sessionIdForTask(taskId, prefix));
+export function sessionUriForTask(
+	taskId: string,
+	prefix = DEFAULT_SESSION_PREFIX,
+	setId = DEFAULT_TASK_SET_ID,
+): vscode.Uri {
+	return sessionUriForId(sessionIdForTask(taskId, prefix, setId));
 }
 
 /** Inverse of {@link sessionUriForId}; undefined when the uri is not a local chat session. */

@@ -307,6 +307,32 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.status, 'idle');
 		});
 
+		test('a receipt written after the reconciliation grace period is recovered without a file watcher', async () => {
+			const task = await store.create('Set up billing webhook');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				setTimeout(() => {
+					void store.appendLog(
+						t.id,
+						formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'written after fallback' }),
+					);
+				}, 300);
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(async () => {
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+				return after?.state === 'scoped' && after.status === 'idle';
+			});
+
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === runIdFromPrompt(executor.calls[0].prompt)).length, 2);
+		});
+
 		test('RunManager reconciles a late extension receipt once and applies the stage outcome', async () => {
 			const task = await store.create('Set up billing webhook');
 			await store.patch(task.id, { state: 'refine', status: 'idle' });
@@ -980,6 +1006,40 @@ suite('M3 RunManager', () => {
 		assert.strictEqual(after.status, 'idle');
 		assert.strictEqual(after.run, undefined);
 		assert.strictEqual(secondExecutor.calls.length, 0, 'capacity denial must not invoke the executor');
+	});
+
+	test('identical task ids in different sets use independent reservations and chats', async () => {
+		await withMaxParallelTasks(1, async () => {
+			const firstStore = new TaskStore(vscode.Uri.joinPath(dir, 'first'), 'set-first');
+			const secondStore = new TaskStore(vscode.Uri.joinPath(dir, 'second'), 'set-second');
+			await firstStore.ensureDirectory();
+			await secondStore.ensureDirectory();
+			const first = await firstStore.create('First set task');
+			const second = await secondStore.create('Second set task');
+			await firstStore.patch(first.id, { state: 'refine', status: 'idle' });
+			await secondStore.patch(second.id, {
+				state: 'refine',
+				status: 'idle',
+				chat: 'kanban-pilot-TASK-001',
+			});
+			const firstExecutor = new StubExecutor(() => 'hang');
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const firstManager = new RunManager(firstStore, firstExecutor, folder);
+			const secondManager = new RunManager(secondStore, secondExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'refine');
+			await waitUntil(() => firstExecutor.calls.length === 1);
+			await secondManager.handleAction(second.id, 'refine');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+
+			const firstAfter = (await firstStore.readAll()).tasks[0];
+			const secondAfter = (await secondStore.readAll()).tasks[0];
+			assert.strictEqual(firstAfter.id, secondAfter.id);
+			assert.strictEqual(firstAfter.status, 'running');
+			assert.strictEqual(secondAfter.status, 'running');
+			assert.strictEqual(secondAfter.chat, 'kanban-pilot-set-second-TASK-001');
+			assert.notStrictEqual(firstAfter.chat, secondAfter.chat);
+		});
 	});
 
 	test('capacity is shared across independently-created managers and mixed stages', async () => {

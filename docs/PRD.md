@@ -1365,9 +1365,9 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.gates.scopedToApproved` | `manual \| auto` | `manual` | Auto-approve a freshly-scoped task into the Approved ready-queue. Does **not** also auto-develop — that's a separate gate below, deliberately, since Approved is §8.4's queue |
 | `kanbanPilot.gates.approvedToInProgress` | `manual \| auto` | `manual` | Auto-start development on the next Approved task when the shared run-capacity limit has room (§6.15) |
 | `kanbanPilot.gates.validationAutoStart` | `manual \| auto` | `manual` | Auto-launch Validate the moment a task lands in Validation. Replaces an earlier `inProgressToDone` entry that stopped corresponding to anything once the Validation column was added — validate's own `result:ok` already lands on Done automatically, same as refine → scoped |
-| `kanbanPilot.tasksDir` | `string` | `.kanban-pilot/tasks` | Task folder, workspace-relative |
+| `kanbanPilot.tasksDir` | `string` | `.kanban-pilot/tasks` | Workspace-relative folder used by the immutable Default task set; additional named sets use `.kanban-pilot/task-sets/<stable-id>/tasks` |
 | `kanbanPilot.chat.mode` | `agent \| ask` | `agent` | Chat mode requested at injection |
-| `kanbanPilot.chat.sessionPrefix` | `string` | `kanban-pilot-` | Session-id prefix; `<prefix><taskId>` is the per-task session (§6.7) |
+| `kanbanPilot.chat.sessionPrefix` | `string` | `kanban-pilot-` | Session-id prefix; Default uses `<prefix><taskId>`, while named sets include the stable set id before `<taskId>` (§6.7) |
 | `kanbanPilot.chat.closeTabOnDone` | `boolean` | `true` | Close the task's chat tab when it reaches Done (session is retained) |
 | `kanbanPilot.chat.resetOnApprove` | `boolean` | **`false`** | Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default — Develop and Validate deliberately continue the *same* conversation Refine started; every prompt inlines the current task content regardless, which is the actual mitigation (§6.8) |
 | `kanbanPilot.refine.toolsInclude` | `string[]` | `[]` | Optional allowlist for refine's tools. Empty means no restriction — verify real tool ids via the Configure Tools picker before setting this, since an allowlist missing a file-edit tool blocks refine from writing its own output |
@@ -1382,6 +1382,22 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.layout.dockChatOnSelect` | `boolean` | `false` | Dock on card selection; when `false`, docking happens only via the detail pane's Open Chat button or a stage run's own open+inject |
 | `kanbanPilot.chat.allowTaskProposals` | `boolean` | `true` | Let develop/validate runs file follow-up work as new backlog tasks via `propose-task` log lines (§6.12), capped at 5 per run |
 
+### 7.1 Task sets
+
+The board supports multiple named task sets within one workspace. The configured
+`kanbanPilot.tasksDir` remains the immutable **Default** set, so existing task files are
+visible without migration or rewriting. The extension stores the registry and active-set
+selection in `.kanban-pilot/task-sets.json`; new sets use independent directories under
+`.kanban-pilot/task-sets/<stable-id>/tasks` and keep the same markdown task schema.
+
+The board header shows the active set and provides controls to create, select, and rename
+sets. A set can be deleted only when it is non-default and empty, and deletion is confirmed
+by the user. Names are non-blank and unique case-insensitively. Switching sets, including
+creating a set because the new set becomes active, is refused while the active set has a
+running task; this keeps file watchers, automatic gate processing,
+receipts, and chat actions bound to one store at a time. Task ids remain local to a set, while
+chat session ids, run reservations, and receipt de-duplication keys include the stable set id.
+
 > `refine → scoped` is intentionally not configurable: it is not a gate but the landing of a
 > run's output, and Scoped is itself the review column.
 
@@ -1394,7 +1410,7 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 
 ### Commands
 
-`openBoard` · `newTask` · `acceptTask` · `refineTask` · `splitTask` · `approveTask` ·
+`openBoard` · `newTask` · `createTaskSet` · `renameTaskSet` · `deleteTaskSet` · `acceptTask` · `refineTask` · `splitTask` · `approveTask` ·
 `developTask` · `continueRun` · `stopRun` · `validateTask` · `reopenTask` · `openTaskFile` ·
 `openTaskChat` · `deleteTask` · `markRunComplete` · `seedSampleTasks`
 
