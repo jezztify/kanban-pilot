@@ -1,6 +1,11 @@
 import * as vscode from 'vscode';
 import {
+  CopilotAgentOption,
+  discoverCopilotAgents,
+} from '../chat/copilotAgents';
+import {
   AgentNameOverrides,
+  COLUMN_AGENT_DEFAULT,
   resolveAgentNameForColumn,
   stageForColumn,
 } from '../chat/agentNames';
@@ -15,6 +20,7 @@ import {
   TASK_TYPE_LABELS,
   normalizeEditableTaskContent,
 } from '../model/task';
+import { gateForId, GATE_CATALOG } from '../model/gates';
 import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
@@ -173,6 +179,29 @@ function secondaryAction(state: Column): TaskAction | undefined {
 	return undefined;
 }
 
+function pendingView(task: Pick<Task, 'pendingOutcome'>): {
+  gate: string;
+  label: string;
+  description: string;
+  stage: string;
+  result: string;
+  runId: string;
+} | undefined {
+  const pending = task.pendingOutcome;
+  const gate = pending ? gateForId(pending.gate) : undefined;
+  if (!pending || !gate || gate.kind !== 'receipt-completion') {
+    return undefined;
+  }
+  return {
+    gate: gate.id,
+    label: gate.label,
+    description: gate.description,
+    stage: pending.stage,
+    result: pending.result,
+    runId: pending.runId,
+  };
+}
+
 const ACTION_LABELS: Record<TaskAction, string> = {
 	accept: 'Accept',
 	refine: 'Refine',
@@ -214,7 +243,8 @@ interface InMessage {
 	description?: string;
   taskType?: unknown;
 	key?: string;
-	value?: string;
+  value?: unknown;
+  values?: unknown;
   column?: unknown;
   content?: unknown;
 }
@@ -234,38 +264,369 @@ export interface BoardTaskSetHost {
 }
 
 /**
- * §6.15's four gate settings, surfaced with all seven column assignments in
+ * §6.15's nine gate settings, surfaced with all seven column assignments in
  * the board's Settings editor. `key` is the short id used over the wire and
  * in the UI; `setting` is the actual `kanbanPilot.*` id `RunManager.readConfig`
  * reads. Labels/descriptions are trimmed restatements of the package.json
  * descriptions — kept in sync by hand since there's no shared source.
  */
-export const GATES: { key: string; setting: string; label: string; description: string }[] = [
-	{
-		key: 'backlogToRefine',
-		setting: 'gates.backlogToRefine',
-		label: 'Backlog → Refine',
-		description: 'Accept a new task and launch its refine run automatically.',
-	},
-	{
-		key: 'scopedToApproved',
-		setting: 'gates.scopedToApproved',
-		label: 'Scoped → Approved',
-		description: 'Approve a freshly-scoped task into the ready queue automatically.',
-	},
-	{
-		key: 'approvedToInProgress',
-		setting: 'gates.approvedToInProgress',
-		label: 'Approved → In Progress',
-		description: 'Start development on the next Approved task once nothing else is running.',
-	},
-	{
-		key: 'validationAutoStart',
-		setting: 'gates.validationAutoStart',
-		label: 'Validation auto-start',
-		description: 'Launch Validate the moment a task lands in Validation.',
-	},
+export const GATES = GATE_CATALOG.map((gate) => ({
+  key: gate.id,
+  setting: gate.settingKey,
+  label: gate.label,
+  description: gate.description,
+}));
+
+export type SettingKind = 'string' | 'enum' | 'boolean' | 'number' | 'array' | 'modelSelector' | 'agentNames';
+export type SettingCategory = 'workspace' | 'gates' | 'chat' | 'tools' | 'run' | 'layout' | 'agents';
+
+export interface SettingDefinition {
+  key: string;
+  category: SettingCategory;
+  kind: SettingKind;
+  label: string;
+  description: string;
+  defaultValue: unknown;
+  options?: readonly string[];
+  minimum?: number;
+  integer?: boolean;
+  maxLength?: number;
+  requiresReload?: boolean;
+}
+
+/**
+ * The board-side catalog mirrors package.json's contributed settings. The
+ * agent assignment object is intentionally represented by the seven-column
+ * editor below rather than by a raw object control.
+ */
+export const SETTING_DEFINITIONS: readonly SettingDefinition[] = [
+  {
+    key: 'tasksDir',
+    category: 'workspace',
+    kind: 'string',
+    label: 'Task folder',
+    description: 'Workspace-relative folder used by the immutable Default task set. Requires a window reload to apply.',
+    defaultValue: '.kanban-pilot/tasks',
+    maxLength: 240,
+    requiresReload: true,
+  },
+  ...GATES.map((gate): SettingDefinition => ({
+    key: gate.setting,
+    category: 'gates',
+    kind: 'enum',
+    label: gate.label,
+    description: gate.description,
+    defaultValue: 'manual',
+    options: ['manual', 'auto'],
+  })),
+  {
+    key: 'chat.mode',
+    category: 'chat',
+    kind: 'enum',
+    label: 'Chat mode',
+    description: 'Chat mode requested when a task prompt is injected.',
+    defaultValue: 'agent',
+    options: ['agent', 'ask'],
+  },
+  {
+    key: 'chat.sessionPrefix',
+    category: 'chat',
+    kind: 'string',
+    label: 'Session ID prefix',
+    description: 'Prefix used when deriving each task chat session ID. Applies to new sessions.',
+    defaultValue: 'kanban-pilot-',
+    maxLength: 120,
+  },
+  {
+    key: 'chat.closeTabOnDone',
+    category: 'chat',
+    kind: 'boolean',
+    label: 'Close chat tab on Done',
+    description: "Close the task's chat tab when it reaches Done; the session remains available.",
+    defaultValue: true,
+  },
+  {
+    key: 'chat.resetOnApprove',
+    category: 'chat',
+    kind: 'boolean',
+    label: 'Reset chat on Approve',
+    description: "Clear the task's conversation at the Approve gate before development continues.",
+    defaultValue: false,
+  },
+  {
+    key: 'refine.toolsInclude',
+    category: 'tools',
+    kind: 'array',
+    label: 'Refine tools allowlist',
+    description: 'Optional newline-separated tool IDs allowed during Refine. Empty means unrestricted.',
+    defaultValue: [],
+  },
+  {
+    key: 'chat.toolsExclude',
+    category: 'tools',
+    kind: 'array',
+    label: 'Tools excluded from chat',
+    description: 'Newline-separated tool IDs denied on every prompt injection.',
+    defaultValue: ['memory', 'resolveMemoryFileUri'],
+  },
+  {
+    key: 'chat.modelSelector',
+    category: 'tools',
+    kind: 'modelSelector',
+    label: 'Chat model selector',
+    description: 'Optional model id and vendor used to pin a model for each run.',
+    defaultValue: {},
+  },
+  {
+    key: 'chat.agentNames',
+    category: 'agents',
+    kind: 'agentNames',
+    label: 'Agent assignments',
+    description: 'Per-column agent labels. Use the workflow-column editor below; legacy refine/develop/validate keys remain supported.',
+    defaultValue: {},
+  },
+  {
+    key: 'run.timeoutMinutes',
+    category: 'run',
+    kind: 'number',
+    label: 'Run timeout (minutes)',
+    description: 'Mark a run failed after this many minutes.',
+    defaultValue: 20,
+    minimum: 0,
+  },
+  {
+    key: 'run.maxParallelTasks',
+    category: 'run',
+    kind: 'number',
+    label: 'Maximum parallel runs',
+    description: 'Maximum Refine, Split, Develop, Continue, and Validate runs active at once.',
+    defaultValue: 1,
+    minimum: 1,
+    integer: true,
+  },
+  {
+    key: 'board.openOnStartup',
+    category: 'workspace',
+    kind: 'boolean',
+    label: 'Open board on startup',
+    description: 'Open the board when the workspace loads. Requires a window reload to apply.',
+    defaultValue: false,
+    requiresReload: true,
+  },
+  {
+    key: 'layout.dockChat',
+    category: 'layout',
+    kind: 'boolean',
+    label: 'Dock task chat',
+    description: "Open the selected task's chat beside the board when docking is requested.",
+    defaultValue: true,
+  },
+  {
+    key: 'layout.dockChatOnSelect',
+    category: 'layout',
+    kind: 'boolean',
+    label: 'Dock chat when selecting a card',
+    description: 'Automatically dock a task chat as soon as its card is selected.',
+    defaultValue: false,
+  },
+  {
+    key: 'chat.allowTaskProposals',
+    category: 'chat',
+    kind: 'boolean',
+    label: 'Allow task proposals',
+    description: 'Let Develop and Validate runs file follow-up work as new backlog tasks.',
+    defaultValue: true,
+  },
 ];
+
+/** Complete current package.json inventory, including the structured agent setting. */
+export const ALL_KANBAN_SETTING_KEYS: readonly string[] = [
+  'tasksDir',
+  ...GATES.map((gate) => gate.setting),
+  'chat.mode',
+  'chat.sessionPrefix',
+  'chat.closeTabOnDone',
+  'chat.resetOnApprove',
+  'refine.toolsInclude',
+  'chat.toolsExclude',
+  'chat.modelSelector',
+  'chat.agentNames',
+  'run.timeoutMinutes',
+  'run.maxParallelTasks',
+  'board.openOnStartup',
+  'layout.dockChat',
+  'layout.dockChatOnSelect',
+  'chat.allowTaskProposals',
+];
+
+export interface SettingValidationSuccess {
+  ok: true;
+  value: unknown;
+}
+
+export interface SettingValidationFailure {
+  ok: false;
+  error: string;
+}
+
+export type SettingValidationResult = SettingValidationSuccess | SettingValidationFailure;
+
+function settingDefinitionFor(key: unknown): SettingDefinition | undefined {
+  return typeof key === 'string' ? SETTING_DEFINITIONS.find((definition) => definition.key === key) : undefined;
+}
+
+export function isEditableSettingKey(value: unknown): value is string {
+  return !!settingDefinitionFor(value);
+}
+
+export function isGateSettingKey(value: unknown): boolean {
+  return settingDefinitionFor(value)?.category === 'gates';
+}
+
+export function settingRequiresReload(value: unknown): boolean {
+  return settingDefinitionFor(value)?.requiresReload === true;
+}
+
+function validText(value: unknown, label: string, maxLength: number): SettingValidationResult {
+  if (typeof value !== 'string') {
+    return { ok: false, error: `${label} must be text.` };
+  }
+  if (/[\r\n]/.test(value)) {
+    return { ok: false, error: `${label} cannot contain line breaks.` };
+  }
+  if (value.length > maxLength) {
+    return { ok: false, error: `${label} must be ${maxLength} characters or fewer.` };
+  }
+  return { ok: true, value: value.trim() };
+}
+
+export function validateSettingValue(key: unknown, rawValue: unknown): SettingValidationResult {
+  const definition = settingDefinitionFor(key);
+  if (!definition) {
+    return { ok: false, error: 'Unknown Kanban Pilot setting.' };
+  }
+
+  switch (definition.kind) {
+    case 'string': {
+      const value = validText(rawValue, definition.label, definition.maxLength ?? 240);
+      if (!value.ok) {
+        return value;
+      }
+      if (definition.key === 'tasksDir') {
+        if (typeof value.value !== 'string' || !value.value) {
+          return { ok: false, error: 'Task folder cannot be blank.' };
+        }
+        if (/^(?:[A-Za-z]:[\\/]|[\\/]{1,2})/.test(value.value) || value.value.split(/[\\/]/).includes('..')) {
+          return { ok: false, error: 'Task folder must be a workspace-relative path.' };
+        }
+      }
+      if (definition.key === 'chat.sessionPrefix' && !value.value) {
+        return { ok: false, error: 'Session ID prefix cannot be blank.' };
+      }
+      return value;
+    }
+    case 'enum':
+      return typeof rawValue === 'string' && definition.options?.includes(rawValue)
+        ? { ok: true, value: rawValue }
+        : { ok: false, error: `${definition.label} has an invalid choice.` };
+    case 'boolean':
+      return typeof rawValue === 'boolean'
+        ? { ok: true, value: rawValue }
+        : { ok: false, error: `${definition.label} must be enabled or disabled.` };
+    case 'number':
+      if (typeof rawValue !== 'number' || !Number.isFinite(rawValue)) {
+        return { ok: false, error: `${definition.label} must be a finite number.` };
+      }
+      if (definition.integer && !Number.isInteger(rawValue)) {
+        return { ok: false, error: `${definition.label} must be a whole number.` };
+      }
+      if (definition.minimum !== undefined && rawValue <= definition.minimum) {
+        return { ok: false, error: `${definition.label} must be greater than ${definition.minimum}.` };
+      }
+      return { ok: true, value: rawValue };
+    case 'array':
+      if (!Array.isArray(rawValue) || rawValue.some((value) => typeof value !== 'string')) {
+        return { ok: false, error: `${definition.label} must be a list of text values.` };
+      }
+      if (rawValue.some((value) => /[\r\n]/.test(value) || value.length > 200)) {
+        return { ok: false, error: `${definition.label} contains an invalid tool ID.` };
+      }
+      return { ok: true, value: rawValue.map((value) => value.trim()).filter(Boolean) };
+    case 'modelSelector': {
+      if (!rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) {
+        return { ok: false, error: `${definition.label} must contain optional id and vendor text fields.` };
+      }
+      const candidate = rawValue as Record<string, unknown>;
+      const unknownKeys = Object.keys(candidate).filter((candidateKey) => candidateKey !== 'id' && candidateKey !== 'vendor');
+      if (unknownKeys.length || ['id', 'vendor'].some((field) => candidate[field] !== undefined && typeof candidate[field] !== 'string')) {
+        return { ok: false, error: `${definition.label} only accepts optional id and vendor text fields.` };
+      }
+      const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
+      const vendor = typeof candidate.vendor === 'string' ? candidate.vendor.trim() : '';
+      if (/[\r\n]/.test(id) || /[\r\n]/.test(vendor) || id.length > 200 || vendor.length > 200) {
+        return { ok: false, error: `${definition.label} fields must be 200 characters or fewer without line breaks.` };
+      }
+      return { ok: true, value: { ...(id ? { id } : {}), ...(vendor ? { vendor } : {}) } };
+    }
+    case 'agentNames': {
+      if (!rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) {
+        return { ok: false, error: `${definition.label} must be an object.` };
+      }
+      const candidate = rawValue as Record<string, unknown>;
+      for (const [agentKey, agentValue] of Object.entries(candidate)) {
+        if (!['backlog', 'refine', 'scoped', 'approved', 'in-progress', 'validation', 'done', 'develop', 'validate'].includes(agentKey)) {
+          return { ok: false, error: `${definition.label} contains an unknown column.` };
+        }
+        if (!isAgentNameValue(agentValue)) {
+          return { ok: false, error: `${definition.label} contains an invalid agent name.` };
+        }
+      }
+      return { ok: true, value: Object.fromEntries(
+        Object.entries(candidate)
+          .map(([agentKey, agentValue]) => [agentKey, (agentValue as string).trim()])
+          .filter(([, agentValue]) => agentValue),
+      ) };
+    }
+  }
+}
+
+function defaultSettingValue(value: unknown): unknown {
+  return Array.isArray(value) ? [...value] : value && typeof value === 'object' ? { ...(value as Record<string, unknown>) } : value;
+}
+
+export function settingsValuesFor(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'get'>,
+): Record<string, unknown> {
+  return Object.fromEntries(SETTING_DEFINITIONS.map((definition) => {
+    const configured = configuration.get<unknown>(definition.key, defaultSettingValue(definition.defaultValue));
+    const validated = validateSettingValue(definition.key, configured);
+    return [definition.key, validated.ok ? validated.value : defaultSettingValue(definition.defaultValue)];
+  }));
+}
+
+export async function persistSetting(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
+  key: string,
+  rawValue: unknown,
+): Promise<SettingValidationResult> {
+  const validated = validateSettingValue(key, rawValue);
+  if (!validated.ok) {
+    return validated;
+  }
+  await configuration.update(key, validated.value, vscode.ConfigurationTarget.Workspace);
+  return validated;
+}
+
+export async function resetSetting(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
+  key: string,
+): Promise<boolean> {
+  if (!isEditableSettingKey(key)) {
+    return false;
+  }
+  await configuration.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+  return true;
+}
 
 export const SETTINGS_COLUMNS: readonly { id: Column; label: string }[] = COLUMNS.map((id) => ({
   id,
@@ -275,6 +636,8 @@ export const SETTINGS_COLUMNS: readonly { id: Column; label: string }[] = COLUMN
 export interface SettingsState {
   gates: Record<string, string>;
   agents: Record<Column, string>;
+  availableAgents: CopilotAgentOption[];
+  values: Record<string, unknown>;
 }
 
 export function isGateKey(value: unknown): value is string {
@@ -326,6 +689,31 @@ export async function persistAgentNameOverride(
   );
 }
 
+export function updateAgentNameOverridesBatch(
+  configured: unknown,
+  assignments: Partial<Record<Column, string>>,
+): AgentNameOverrides {
+  let overrides = configured;
+  for (const column of COLUMNS) {
+    if (Object.prototype.hasOwnProperty.call(assignments, column)) {
+      overrides = updateAgentNameOverrides(overrides, column, assignments[column] ?? '');
+    }
+  }
+  return overrides as AgentNameOverrides;
+}
+
+export async function persistAgentNameOverrides(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
+  configured: unknown,
+  assignments: Partial<Record<Column, string>>,
+): Promise<void> {
+  await configuration.update(
+    'chat.agentNames',
+    updateAgentNameOverridesBatch(configured, assignments),
+    vscode.ConfigurationTarget.Workspace,
+  );
+}
+
 export async function persistGateSetting(
   configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
   key: string,
@@ -342,12 +730,16 @@ export async function persistGateSetting(
 export function settingsStateFor(
   gates: Record<string, string>,
   agentNames: AgentNameOverrides,
+  availableAgents: readonly CopilotAgentOption[] = [],
+  values: Record<string, unknown> = {},
 ): SettingsState {
   return {
     gates: { ...gates },
     agents: Object.fromEntries(
       COLUMNS.map((column) => [column, agentLabelFor(column, agentNames)]),
     ) as Record<Column, string>,
+    availableAgents: availableAgents.map((agent) => ({ ...agent })),
+    values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, defaultSettingValue(value)])),
   };
 }
 
@@ -376,9 +768,11 @@ export class BoardPanel {
       }),
 			// Picks up a hand-edited settings.json too, not just the board's own toggle.
 			vscode.workspace.onDidChangeConfiguration((e) => {
+        const settingsChanged = e.affectsConfiguration('kanbanPilot');
         const gatesChanged = e.affectsConfiguration('kanbanPilot.gates');
         const agentsChanged = e.affectsConfiguration('kanbanPilot.chat.agentNames');
-        if (gatesChanged || agentsChanged) {
+        const agentLocationsChanged = e.affectsConfiguration('chat.agentFilesLocations');
+        if (settingsChanged || agentsChanged || agentLocationsChanged) {
           void this.pushAll();
           if (gatesChanged) {
             void this.runManager.applyGatePolicies();
@@ -619,6 +1013,12 @@ export class BoardPanel {
 				return;
 			}
 
+      case 'pending/apply':
+        if (typeof message.taskId === 'string') {
+          await this.runManager.applyPendingOutcome(message.taskId);
+        }
+        return;
+
 			case 'gates/set': {
 				if (!isGateKey(message.key) || (message.value !== 'manual' && message.value !== 'auto')) {
 					return;
@@ -634,6 +1034,98 @@ export class BoardPanel {
 				await this.runManager.applyGatePolicies();
 				return;
 			}
+
+      case 'settings/refresh':
+        await this.pushSettings();
+        return;
+
+      case 'settings/set': {
+        if (typeof message.key !== 'string') {
+          return;
+        }
+        const result = await persistSetting(
+          vscode.workspace.getConfiguration('kanbanPilot'),
+          message.key,
+          message.value,
+        );
+        if (!result.ok) {
+          await this.reportSettingsError(message.key, result.error);
+          return;
+        }
+        if (isGateSettingKey(message.key)) {
+          await this.runManager.applyGatePolicies();
+        }
+        return;
+      }
+
+      case 'settings/save': {
+        if (!message.values || typeof message.values !== 'object' || Array.isArray(message.values)) {
+          await this.reportSettingsError(undefined, 'Settings payload must be an object.');
+          return;
+        }
+        const values = message.values as Record<string, unknown>;
+        const validated = Object.entries(values).map(([key, value]) => ({
+          key,
+          result: validateSettingValue(key, value),
+        }));
+        const invalid = validated.find((entry) => !entry.result.ok);
+        if (invalid && !invalid.result.ok) {
+          await this.reportSettingsError(invalid.key, invalid.result.error);
+          return;
+        }
+        const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+        for (const entry of validated) {
+          if (entry.result.ok) {
+            await cfg.update(entry.key, entry.result.value, vscode.ConfigurationTarget.Workspace);
+          }
+        }
+        if (validated.some((entry) => isGateSettingKey(entry.key))) {
+          await this.runManager.applyGatePolicies();
+        }
+        return;
+      }
+
+      case 'settings/reset': {
+        if (typeof message.key !== 'string' || !(await resetSetting(vscode.workspace.getConfiguration('kanbanPilot'), message.key))) {
+          return;
+        }
+        if (isGateSettingKey(message.key)) {
+          await this.runManager.applyGatePolicies();
+        }
+        return;
+      }
+
+      case 'agents/save': {
+        if (!message.values || typeof message.values !== 'object' || Array.isArray(message.values)) {
+          await this.reportSettingsError('chat.agentNames', 'Agent assignments payload must be an object.');
+          return;
+        }
+        const values = message.values as Record<string, unknown>;
+        const missing = COLUMNS.find((column) => !Object.prototype.hasOwnProperty.call(values, column));
+        if (missing) {
+          await this.reportSettingsError('chat.agentNames', `Agent assignments payload is missing ${missing}.`);
+          return;
+        }
+        const invalid = Object.entries(values).find(([column, value]) => (
+          !isAgentColumn(column) || !isAgentNameValue(value)
+        ));
+        if (invalid) {
+          await this.reportSettingsError(
+            'chat.agentNames',
+            `Invalid agent assignment for ${invalid[0]}.`,
+          );
+          return;
+        }
+        const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+        await persistAgentNameOverrides(
+          cfg,
+          cfg.get<unknown>('chat.agentNames', {}),
+          values as Partial<Record<Column, string>>,
+        );
+        // One configuration update lets onDidChangeConfiguration refresh the
+        // board and Settings together without exposing partial assignments.
+        return;
+      }
 
 			case 'agentName/set': {
         if (!isAgentColumn(message.column) || !isAgentNameValue(message.value)) {
@@ -706,6 +1198,7 @@ export class BoardPanel {
 				scope: task.sections['Scope'] ?? '',
 				lastLog: logLines.at(-1) ?? '',
 				originTask: task.originTask,
+        pending: pendingView(task),
         moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
 				// The card face shows one button (primary); this is where the
 				// prototype's un-rendered secondary action (§5.2) lives instead.
@@ -719,11 +1212,23 @@ export class BoardPanel {
     await this.panel.webview.postMessage({ type: 'task/editError', taskId, error });
   }
 
+  private async reportSettingsError(key: string | undefined, error: string): Promise<void> {
+    await this.panel.webview.postMessage({ type: 'settings/error', key, error });
+  }
+
   private async pushSettings(): Promise<void> {
 		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 		const gates = Object.fromEntries(GATES.map((g) => [g.key, cfg.get<string>(g.setting, 'manual')]));
+    const values = settingsValuesFor(cfg);
     const agentNames = this.configuredAgentNames();
-    await this.panel.webview.postMessage({ type: 'settings/state', ...settingsStateFor(gates, agentNames) });
+    const availableAgents = await discoverCopilotAgents({
+      workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => folder.uri),
+      additionalLocations: vscode.workspace.getConfiguration('chat').get<unknown>('agentFilesLocations', {}),
+    });
+    await this.panel.webview.postMessage({
+      type: 'settings/state',
+      ...settingsStateFor(gates, agentNames, availableAgents, values),
+    });
 	}
 
   private toView(snapshot: BoardSnapshot, agentNames: AgentNameOverrides, taskSets: TaskSet[]) {
@@ -746,6 +1251,7 @@ export class BoardPanel {
 					status: task.status,
 					primary: primaryAction(task.state, task.status),
 					originTask: task.originTask,
+          pending: pendingView(task),
 					canSplit: canSplit(task.state, task.status),
 				})),
 			})),
@@ -778,6 +1284,8 @@ export class BoardPanel {
     const actionLabelsJson = JSON.stringify(ACTION_LABELS);
 		const gatesJson = JSON.stringify(GATES);
     const columnsJson = JSON.stringify(SETTINGS_COLUMNS);
+		const columnAgentDefaultsJson = JSON.stringify(COLUMN_AGENT_DEFAULT);
+    const settingDefinitionsJson = JSON.stringify(SETTING_DEFINITIONS);
 		// The detail modal is rendered from a task payload, not a column, so it
 		// needs its own state → hue lookup to stay color-consistent with the board.
 		const accentsJson = JSON.stringify(COLUMN_ACCENT);
@@ -991,7 +1499,7 @@ export class BoardPanel {
     border-color: color-mix(in srgb, #6366f1 60%, transparent);
   }
 
-  /* §6.15's four gate settings, toggled here instead of settings.json-only. */
+  /* §6.15's nine gate settings, toggled here instead of settings.json-only. */
   .gates-list { display: flex; flex-direction: column; }
   .gate-row {
     display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
@@ -1071,7 +1579,7 @@ export class BoardPanel {
   }
   .agent-setting-row:last-child { border-bottom: none; }
   .agent-setting-label { font-size: 13px; font-weight: 600; }
-  .agent-setting-input {
+  .agent-setting-select {
     min-width: 0; font-family: inherit; font-size: 13px; color: var(--vscode-foreground);
     background: var(--vscode-input-background);
     border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
@@ -1079,9 +1587,49 @@ export class BoardPanel {
   }
   .agent-setting-actions { display: inline-flex; gap: 6px; }
   .agent-setting-actions .btn-chip { padding: 7px 9px; }
-  .agent-setting-input:focus-visible, .agent-setting-actions button:focus-visible {
+  .agent-settings-actions { display: flex; justify-content: flex-end; gap: 7px; padding-top: 10px; }
+  .agent-settings-error { margin-top: 8px; }
+  .agent-setting-select:focus-visible, .agent-setting-actions button:focus-visible, .agent-settings-actions button:focus-visible {
     outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px;
   }
+  .settings-fields { display: flex; flex-direction: column; gap: 12px; }
+  .setting-row {
+    display: flex; flex-direction: column; gap: 7px; padding: 12px 0;
+    border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-label { font-size: 13px; font-weight: 600; }
+  .setting-description {
+    color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.4;
+  }
+  .setting-control { min-width: 0; }
+  .setting-input, .setting-select, .setting-textarea {
+    width: 100%; min-width: 0; font-family: inherit; font-size: 13px;
+    color: var(--vscode-foreground); background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: var(--kp-radius-button); padding: 8px;
+  }
+  .setting-number { max-width: 180px; }
+  .setting-textarea { min-height: 78px; resize: vertical; line-height: 1.4; }
+  .setting-model-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .setting-model-field { display: flex; flex-direction: column; gap: 4px; }
+  .setting-model-label { color: var(--vscode-descriptionForeground); font-size: 11px; }
+  .setting-input:focus-visible, .setting-select:focus-visible, .setting-textarea:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px;
+  }
+  .setting-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+  .setting-error {
+    color: var(--vscode-errorForeground);
+    background: color-mix(in srgb, var(--vscode-errorForeground) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--vscode-errorForeground) 45%, transparent);
+    border-radius: 7px; padding: 7px 8px; font-size: 12px; line-height: 1.35;
+  }
+  .setting-error[hidden] { display: none; }
+  .setting-note {
+    color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.35;
+    margin-top: 3px;
+  }
+  .gate-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
   @media (max-width: 620px) {
     .settings-body { grid-template-columns: 1fr; }
     .settings-sidebar {
@@ -1092,6 +1640,7 @@ export class BoardPanel {
     .settings-panel { padding: 14px; }
     .agent-setting-row { grid-template-columns: 1fr; gap: 6px; }
     .agent-setting-actions { justify-content: flex-end; }
+    .setting-model-fields { grid-template-columns: 1fr; }
   }
 
   /*
@@ -1404,6 +1953,7 @@ export class BoardPanel {
   .status-text.running::before { animation: kp-pulse 1.4s ease-in-out infinite; }
   .status-text.blocked, .status-text.failed { --st: #fb7185; --st-ink: #e11d48; }
   .status-text.paused { --st: #fbbf24; --st-ink: #d97706; }
+  .status-text.pending { --st: #f59e0b; --st-ink: #b45309; }
   /* Same light/dark split as --col-text, and a lighter fill so the darker
      surface doesn't close the gap between pill and label. */
   body.vscode-dark .status-text, body.vscode-high-contrast .status-text {
@@ -1631,7 +2181,7 @@ export class BoardPanel {
     <div class="new-task-head settings-head">
       <div class="new-task-head-text">
         <div class="modal-title" id="settingsTitle">Settings</div>
-        <div class="new-task-subtitle" id="settingsSubtitle">Configure automation gates and the agent label assigned to each workflow column.</div>
+        <div class="new-task-subtitle" id="settingsSubtitle">Configure every Kanban Pilot setting without leaving the board.</div>
       </div>
       <button class="modal-close" id="settingsClose" aria-label="Close Settings dialog">×</button>
     </div>
@@ -1641,6 +2191,11 @@ export class BoardPanel {
         <div class="settings-category-list" role="tablist" aria-label="Settings categories">
           <button class="settings-category" id="settingsCategoryGates" type="button" role="tab" data-category="gates" aria-selected="true" aria-controls="settingsPanelGates" tabindex="0">Automation gates</button>
           <button class="settings-category" id="settingsCategoryAgents" type="button" role="tab" data-category="agents" aria-selected="false" aria-controls="settingsPanelAgents" tabindex="-1">Agent assignments</button>
+          <button class="settings-category" id="settingsCategoryWorkspace" type="button" role="tab" data-category="workspace" aria-selected="false" aria-controls="settingsPanelWorkspace" tabindex="-1">Task storage & startup</button>
+          <button class="settings-category" id="settingsCategoryChat" type="button" role="tab" data-category="chat" aria-selected="false" aria-controls="settingsPanelChat" tabindex="-1">Chat</button>
+          <button class="settings-category" id="settingsCategoryTools" type="button" role="tab" data-category="tools" aria-selected="false" aria-controls="settingsPanelTools" tabindex="-1">Tools & model</button>
+          <button class="settings-category" id="settingsCategoryRun" type="button" role="tab" data-category="run" aria-selected="false" aria-controls="settingsPanelRun" tabindex="-1">Run behavior</button>
+          <button class="settings-category" id="settingsCategoryLayout" type="button" role="tab" data-category="layout" aria-selected="false" aria-controls="settingsPanelLayout" tabindex="-1">Board & layout</button>
         </div>
       </nav>
       <div class="settings-main" id="settingsMain" role="region" aria-label="Settings controls">
@@ -1649,10 +2204,39 @@ export class BoardPanel {
           <div class="settings-section-desc" id="settingsGatesDescription">Each gate defaults to manual. Switch one to Auto to skip its click.</div>
           <div class="gates-list" id="gatesList"></div>
         </section>
-        <section class="settings-panel settings-section" id="settingsPanelAgents" role="tabpanel" aria-labelledby="settingsCategoryAgents" aria-describedby="settingsAgentsDescription" hidden aria-hidden="true">
+        <section class="settings-panel settings-section" id="settingsPanelAgents" data-setting-key="chat.agentNames" role="tabpanel" aria-labelledby="settingsCategoryAgents" aria-describedby="settingsAgentsDescription" hidden aria-hidden="true">
           <div class="settings-section-title" id="settingsAgentsTitle">Agent assignments</div>
           <div class="settings-section-desc" id="settingsAgentsDescription">Assignments on resting columns are labels only; they never launch a chat run.</div>
           <div class="agent-settings-list" id="agentSettingsList"></div>
+          <div class="setting-error agent-settings-error" id="agentSettingsError" role="alert" aria-live="assertive" hidden></div>
+          <div class="agent-settings-actions">
+            <button class="btn-chip" id="agentSettingsSave" type="button">Save</button>
+          </div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelWorkspace" role="tabpanel" aria-labelledby="settingsCategoryWorkspace" aria-describedby="settingsWorkspaceDescription" hidden aria-hidden="true">
+          <div class="settings-section-title">Task storage & startup</div>
+          <div class="settings-section-desc" id="settingsWorkspaceDescription">These values are read at activation. Saving or resetting them requires a VS Code window reload.</div>
+          <div class="settings-fields" id="settingsFieldsWorkspace"></div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelChat" role="tabpanel" aria-labelledby="settingsCategoryChat" aria-describedby="settingsChatDescription" hidden aria-hidden="true">
+          <div class="settings-section-title">Chat</div>
+          <div class="settings-section-desc" id="settingsChatDescription">Chat mode and session options apply to the next relevant action unless stated otherwise.</div>
+          <div class="settings-fields" id="settingsFieldsChat"></div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelTools" role="tabpanel" aria-labelledby="settingsCategoryTools" aria-describedby="settingsToolsDescription" hidden aria-hidden="true">
+          <div class="settings-section-title">Tools & model</div>
+          <div class="settings-section-desc" id="settingsToolsDescription">Enter one tool ID per line. Model id and vendor are optional and can be supplied independently.</div>
+          <div class="settings-fields" id="settingsFieldsTools"></div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelRun" role="tabpanel" aria-labelledby="settingsCategoryRun" aria-describedby="settingsRunDescription" hidden aria-hidden="true">
+          <div class="settings-section-title">Run behavior</div>
+          <div class="settings-section-desc" id="settingsRunDescription">Run capacity changes affect future admission; currently running tasks are not interrupted.</div>
+          <div class="settings-fields" id="settingsFieldsRun"></div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelLayout" role="tabpanel" aria-labelledby="settingsCategoryLayout" aria-describedby="settingsLayoutDescription" hidden aria-hidden="true">
+          <div class="settings-section-title">Board & layout</div>
+          <div class="settings-section-desc" id="settingsLayoutDescription">Choose how task chats are opened from the board.</div>
+          <div class="settings-fields" id="settingsFieldsLayout"></div>
         </section>
       </div>
     </div>
@@ -1704,10 +2288,12 @@ export class BoardPanel {
   const ACTION_LABELS = ${actionLabelsJson};
   const GATES = ${gatesJson};
   const COLUMN_SETTINGS = ${columnsJson};
+  const COLUMN_AGENT_DEFAULTS = ${columnAgentDefaultsJson};
+  const SETTING_DEFINITIONS = ${settingDefinitionsJson};
   const COLUMN_ACCENT = ${accentsJson};
   // Header-opened Settings defaults to Automation gates; a column pencil opens Agent assignments.
   const DEFAULT_SETTINGS_CATEGORY = 'gates';
-  const SETTINGS_CATEGORIES = ['gates', 'agents'];
+  const SETTINGS_CATEGORIES = ['gates', 'agents', 'workspace', 'chat', 'tools', 'run', 'layout'];
 
   /** Paints a hue onto any element; children inherit and re-derive from it. */
   function applyAccent(node, column) {
@@ -1908,7 +2494,9 @@ export class BoardPanel {
     node.tabIndex = 0;
     node.dataset.taskId = card.id;
     node.setAttribute('role', 'button');
-    node.setAttribute('aria-label', card.id + ': ' + card.title + '. Type: ' + card.typeLabel + '. Use Arrow Up or Arrow Down to change position.');
+    node.setAttribute('aria-label', card.id + ': ' + card.title + '. Type: ' + card.typeLabel +
+      '.' + (card.pending ? ' Pending completion: ' + card.pending.label + '.' : '') +
+      ' Use Arrow Up or Arrow Down to change position.');
     let suppressClick = false;
 
     node.addEventListener('dragstart', (e) => {
@@ -1989,6 +2577,12 @@ export class BoardPanel {
     const actions = el('div', 'card-foot-actions');
     if (card.status !== 'idle') {
       foot.insertBefore(el('span', 'status-text ' + card.status, card.status), foot.firstChild);
+    }
+    if (card.pending) {
+      const pending = el('span', 'status-text pending', 'Pending: ' + card.pending.label);
+      pending.title = card.pending.description;
+      pending.setAttribute('aria-label', 'Pending completion: ' + card.pending.label);
+      foot.insertBefore(pending, foot.firstChild);
     }
     // Exactly one button per card, matching the prototype — see module doc.
     if (card.primary) { actions.appendChild(actionButton(card.id, card.primary)); }
@@ -2180,12 +2774,183 @@ export class BoardPanel {
     }
   }
 
+  function settingId(key, suffix = '') {
+    return 'setting-' + key.replace(/[^a-zA-Z0-9]+/g, '-') + suffix;
+  }
+
+  function settingDefaultText(definition) {
+    if (Array.isArray(definition.defaultValue)) {
+      return definition.defaultValue.length ? definition.defaultValue.join(', ') : 'empty list';
+    }
+    if (definition.defaultValue && typeof definition.defaultValue === 'object') {
+      return '{}';
+    }
+    return String(definition.defaultValue);
+  }
+
+  function settingErrorFor(row, message) {
+    const error = row.querySelector('.setting-error');
+    if (!error) { return; }
+    error.textContent = message || '';
+    error.hidden = !message;
+  }
+
+  function settingControlValue(definition, row) {
+    if (definition.kind === 'boolean') {
+      return row.querySelector('input[data-setting-value]').checked;
+    }
+    if (definition.kind === 'number') {
+      return Number(row.querySelector('input[data-setting-value]').value);
+    }
+    if (definition.kind === 'array') {
+      return row.querySelector('textarea[data-setting-value]').value
+        .split(/\\r?\\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+    if (definition.kind === 'modelSelector') {
+      const id = row.querySelector('[data-setting-field="id"]').value.trim();
+      const vendor = row.querySelector('[data-setting-field="vendor"]').value.trim();
+      return Object.assign({}, id ? { id } : {}, vendor ? { vendor } : {});
+    }
+    return row.querySelector('[data-setting-value]').value;
+  }
+
+  function settingControlFor(definition, value, row) {
+    if (definition.kind === 'boolean') {
+      const label = el('label', 'switch');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = value === true;
+      input.dataset.settingValue = 'true';
+      input.setAttribute('aria-label', definition.label);
+      label.appendChild(input);
+      const track = el('span', 'switch-track');
+      track.appendChild(el('span', 'switch-thumb'));
+      label.appendChild(track);
+      return label;
+    }
+    if (definition.kind === 'enum') {
+      const select = document.createElement('select');
+      select.className = 'setting-select';
+      select.dataset.settingValue = 'true';
+      select.id = settingId(definition.key);
+      select.setAttribute('aria-label', definition.label);
+      for (const optionValue of definition.options || []) {
+        const option = document.createElement('option');
+        option.value = optionValue;
+        option.textContent = optionValue;
+        select.appendChild(option);
+      }
+      select.value = typeof value === 'string' ? value : '';
+      return select;
+    }
+    if (definition.kind === 'array') {
+      const textarea = document.createElement('textarea');
+      textarea.className = 'setting-textarea';
+      textarea.dataset.settingValue = 'true';
+      textarea.id = settingId(definition.key);
+      textarea.rows = 4;
+      textarea.value = Array.isArray(value) ? value.join('\\n') : '';
+      textarea.setAttribute('aria-label', definition.label + ' — one value per line');
+      return textarea;
+    }
+    if (definition.kind === 'modelSelector') {
+      const fields = el('div', 'setting-model-fields');
+      for (const field of ['id', 'vendor']) {
+        const fieldLabel = el('label', 'setting-model-field');
+        fieldLabel.appendChild(el('span', 'setting-model-label', field));
+        const input = document.createElement('input');
+        input.className = 'setting-input';
+        input.type = 'text';
+        input.id = settingId(definition.key, '-' + field);
+        input.dataset.settingField = field;
+        input.value = value && typeof value === 'object' && typeof value[field] === 'string' ? value[field] : '';
+        input.placeholder = 'Optional';
+        input.setAttribute('aria-label', definition.label + ' ' + field);
+        fieldLabel.appendChild(input);
+        fields.appendChild(fieldLabel);
+      }
+      return fields;
+    }
+    const input = document.createElement('input');
+    input.className = 'setting-input' + (definition.kind === 'number' ? ' setting-number' : '');
+    input.dataset.settingValue = 'true';
+    input.id = settingId(definition.key);
+    input.type = definition.kind === 'number' ? 'number' : 'text';
+    if (definition.kind === 'number') {
+      input.step = definition.integer ? '1' : 'any';
+      if (definition.key === 'run.timeoutMinutes') { input.min = '0.01'; }
+      else if (typeof definition.minimum === 'number') { input.min = String(definition.minimum); }
+    }
+    input.value = value === undefined || value === null ? '' : String(value);
+    input.setAttribute('aria-label', definition.label);
+    return input;
+  }
+
+  function renderTypedSettings(state) {
+    const values = state.values || {};
+    for (const category of SETTINGS_CATEGORIES) {
+      if (category === 'gates' || category === 'agents') { continue; }
+      const list = document.getElementById('settingsFields' + category.charAt(0).toUpperCase() + category.slice(1));
+      if (!list) { continue; }
+      list.textContent = '';
+      for (const definition of SETTING_DEFINITIONS.filter((candidate) => candidate.category === category)) {
+        if (definition.kind === 'agentNames') { continue; }
+        const row = el('div', 'setting-row');
+        row.id = settingId(definition.key, '-row');
+        row.dataset.settingKey = definition.key;
+
+        const label = el('div', 'setting-label', definition.label);
+        label.id = settingId(definition.key, '-label');
+        row.appendChild(label);
+        const description = el('div', 'setting-description', definition.description);
+        description.id = settingId(definition.key, '-description');
+        row.appendChild(description);
+
+        const note = el('div', 'setting-note', 'Default: ' + settingDefaultText(definition));
+        if (definition.requiresReload) { note.textContent += ' Reload required after saving or resetting.'; }
+        row.appendChild(note);
+
+        const control = el('div', 'setting-control');
+        control.appendChild(settingControlFor(definition, values[definition.key], row));
+        row.appendChild(control);
+
+        const error = el('div', 'setting-error');
+        error.hidden = true;
+        error.id = settingId(definition.key, '-error');
+        error.setAttribute('role', 'alert');
+        error.setAttribute('aria-live', 'assertive');
+        row.appendChild(error);
+
+        const actions = el('div', 'setting-actions');
+        const save = el('button', 'btn-chip', 'Save');
+        save.type = 'button';
+        save.addEventListener('click', () => {
+          settingErrorFor(row, '');
+          vscode.postMessage({ type: 'settings/set', key: definition.key, value: settingControlValue(definition, row) });
+        });
+        actions.appendChild(save);
+        const reset = el('button', 'btn-chip', 'Reset');
+        reset.type = 'button';
+        reset.addEventListener('click', () => {
+          settingErrorFor(row, '');
+          vscode.postMessage({ type: 'settings/reset', key: definition.key });
+        });
+        actions.appendChild(reset);
+        row.appendChild(actions);
+        list.appendChild(row);
+      }
+    }
+  }
+
   function renderSettings(state) {
     const list = document.getElementById('gatesList');
     list.textContent = '';
     const gates = state.gates || {};
     for (const gate of GATES) {
       const row = el('div', 'gate-row');
+      row.dataset.settingKey = gate.setting;
 
       const text = el('div', 'gate-text');
       text.appendChild(el('div', 'gate-label', gate.label));
@@ -2204,55 +2969,74 @@ export class BoardPanel {
       const track = el('span', 'switch-track');
       track.appendChild(el('span', 'switch-thumb'));
       switchLabel.appendChild(track);
-      row.appendChild(switchLabel);
+      const actions = el('div', 'gate-actions');
+      actions.appendChild(switchLabel);
+      const reset = el('button', 'btn-chip', 'Reset');
+      reset.type = 'button';
+      reset.addEventListener('click', () => {
+        vscode.postMessage({ type: 'settings/reset', key: gate.setting });
+      });
+      actions.appendChild(reset);
+      row.appendChild(actions);
 
       list.appendChild(row);
     }
 
     const agents = document.getElementById('agentSettingsList');
     agents.textContent = '';
+    settingErrorFor(document.getElementById('settingsPanelAgents'), '');
     const assignments = state.agents || {};
+    const availableAgents = Array.isArray(state.availableAgents) ? state.availableAgents : [];
     for (const column of COLUMN_SETTINGS) {
       const row = el('div', 'agent-setting-row');
       row.id = 'agent-setting-' + column.id;
 
       const label = el('label', 'agent-setting-label', column.label);
-      label.htmlFor = 'agent-input-' + column.id;
+      label.htmlFor = 'agent-select-' + column.id;
       row.appendChild(label);
 
-      const input = document.createElement('input');
-      input.className = 'agent-setting-input';
-      input.id = 'agent-input-' + column.id;
-      input.type = 'text';
-      input.maxLength = 60;
-      input.value = assignments[column.id] || 'None';
-      input.setAttribute('aria-label', 'Agent assignment for ' + column.label);
-      row.appendChild(input);
+      const select = document.createElement('select');
+      select.className = 'agent-setting-select';
+      select.id = 'agent-select-' + column.id;
+      select.setAttribute('aria-label', 'Agent assignment for ' + column.label);
+      const reset = document.createElement('option');
+      reset.value = '';
+      const defaultValue = COLUMN_AGENT_DEFAULTS[column.id] || '';
+      reset.textContent = defaultValue || 'None';
+      select.appendChild(reset);
+      for (const agent of availableAgents) {
+        if (!agent || typeof agent.name !== 'string' || !agent.name) { continue; }
+        const option = document.createElement('option');
+        option.value = agent.name;
+        option.textContent = agent.name;
+        if (typeof agent.description === 'string' && agent.description) {
+          option.title = agent.description;
+        }
+        select.appendChild(option);
+      }
+      const effectiveValue = assignments[column.id] || defaultValue || 'None';
+      const selectedValue = effectiveValue === defaultValue || effectiveValue === 'None' ? '' : effectiveValue;
+      if (selectedValue && !Array.from(select.options).some((option) => option.value === selectedValue)) {
+        const current = document.createElement('option');
+        current.value = selectedValue;
+        current.textContent = selectedValue + ' (current)';
+        select.appendChild(current);
+      }
+      select.value = selectedValue;
+      row.appendChild(select);
 
       const actions = el('div', 'agent-setting-actions');
-      const save = el('button', 'btn-chip', 'Save');
-      save.type = 'button';
-      save.addEventListener('click', () => {
-        vscode.postMessage({ type: 'agentName/set', column: column.id, value: input.value });
+      const resetButton = el('button', 'btn-chip', 'Reset');
+      resetButton.type = 'button';
+      resetButton.addEventListener('click', () => {
+        select.value = '';
+        select.focus();
       });
-      actions.appendChild(save);
-
-      const reset = el('button', 'btn-chip', 'Reset');
-      reset.type = 'button';
-      reset.addEventListener('click', () => {
-        vscode.postMessage({ type: 'agentName/set', column: column.id, value: '' });
-      });
-      actions.appendChild(reset);
+      actions.appendChild(resetButton);
       row.appendChild(actions);
-
-      input.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') {
-          event.preventDefault();
-          vscode.postMessage({ type: 'agentName/set', column: column.id, value: input.value });
-        }
-      });
       agents.appendChild(row);
     }
+    renderTypedSettings(state);
     updateSettingsCategory();
   }
 
@@ -2358,6 +3142,14 @@ export class BoardPanel {
     const openChatLink = el('button', 'modal-link', 'Open Chat →');
     openChatLink.addEventListener('click', () => vscode.postMessage({ type: 'task/openChat', taskId: task.id }));
     links.appendChild(openChatLink);
+    if (task.pending) {
+      const pendingAction = el('button', 'btn-modal-primary', 'Apply ' + task.pending.label);
+      pendingAction.type = 'button';
+      pendingAction.setAttribute('aria-label', 'Apply pending completion: ' + task.pending.label);
+      pendingAction.title = task.pending.description;
+      pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
+      links.appendChild(pendingAction);
+    }
     if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
     body.appendChild(links);
 
@@ -2526,6 +3318,14 @@ export class BoardPanel {
     const openChatLink = el('button', 'modal-link', 'Open Chat →');
     openChatLink.addEventListener('click', () => vscode.postMessage({ type: 'task/openChat', taskId: task.id }));
     links.appendChild(openChatLink);
+    if (task.pending) {
+      const pendingAction = el('button', 'btn-modal-primary', 'Apply ' + task.pending.label);
+      pendingAction.type = 'button';
+      pendingAction.setAttribute('aria-label', 'Apply pending completion: ' + task.pending.label);
+      pendingAction.title = task.pending.description;
+      pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
+      links.appendChild(pendingAction);
+    }
     if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
     body.appendChild(links);
 
@@ -2586,6 +3386,13 @@ export class BoardPanel {
     } else if (msg.type === 'settings/state') {
       lastSettings = msg;
       renderSettings(lastSettings);
+    } else if (msg.type === 'settings/error') {
+      if (typeof msg.key === 'string') {
+        const row = document.querySelector('[data-setting-key="' + msg.key + '"]');
+        if (row) {
+          settingErrorFor(row, msg.error || 'The setting could not be saved.');
+        }
+      }
     }
   });
 
@@ -2641,6 +3448,15 @@ export class BoardPanel {
 
   const settingsBackdrop = document.getElementById('settingsBackdrop');
   const settingsModal = document.getElementById('settingsModal');
+  const agentSettingsSave = document.getElementById('agentSettingsSave');
+  agentSettingsSave.addEventListener('click', () => {
+    const values = Object.fromEntries(COLUMN_SETTINGS.map((column) => {
+      const select = document.getElementById('agent-select-' + column.id);
+      return [column.id, select ? select.value : ''];
+    }));
+    settingErrorFor(document.getElementById('settingsPanelAgents'), '');
+    vscode.postMessage({ type: 'agents/save', values });
+  });
   document.querySelectorAll('.settings-category').forEach((button) => {
     button.addEventListener('click', () => selectSettingsCategory(button.dataset.category));
     button.addEventListener('keydown', (event) => {
@@ -2664,12 +3480,12 @@ export class BoardPanel {
     newTaskBackdrop.classList.remove('open'); // and with New Task
     selectSettingsCategory(focusColumn ? 'agents' : DEFAULT_SETTINGS_CATEGORY, false);
     settingsBackdrop.classList.add('open');
-    renderSettings(lastSettings || { gates: {}, agents: {} });
+    renderSettings(lastSettings || { gates: {}, agents: {}, availableAgents: [], values: {} });
+    vscode.postMessage({ type: 'settings/refresh' });
     if (focusColumn) {
-      const input = document.getElementById('agent-input-' + focusColumn);
-      if (input) {
-        input.focus();
-        input.select();
+      const select = document.getElementById('agent-select-' + focusColumn);
+      if (select) {
+        select.focus();
         return;
       }
     }
@@ -2688,7 +3504,7 @@ export class BoardPanel {
     }
     if (e.key !== 'Tab') { return; }
     const activePanel = settingsModal.querySelector('.settings-panel:not([hidden])');
-    const focusable = Array.from(settingsModal.querySelectorAll('button, input')).filter((node) => {
+    const focusable = Array.from(settingsModal.querySelectorAll('button, input, select')).filter((node) => {
       if (node.disabled || node.tabIndex < 0) { return false; }
       const panel = node.closest('.settings-panel');
       return !panel || panel === activePanel;

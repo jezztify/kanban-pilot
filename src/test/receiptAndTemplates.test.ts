@@ -306,6 +306,23 @@ suite('M3 prompt templates', () => {
 		}
 	});
 
+	test('the split template orders proposals before the receipt and names the active task file', async () => {
+		const { folder, dispose } = await tempFolder();
+		try {
+			const template = await loadPromptTemplate(folder, 'split');
+			const proposalIndex = template.indexOf('propose-task run:{{runId}}');
+			const receiptIndex = template.indexOf('stage:split result:ok');
+
+			assert.ok(proposalIndex >= 0 && proposalIndex < receiptIndex, 'split proposals must be written before the receipt');
+			assert.ok(template.includes('attached active task file'));
+			assert.ok(template.includes('named task set'));
+			assert.ok(template.includes('hard-coded `.kanban-pilot/tasks`'));
+			assert.ok(!template.includes('.kanban-pilot/tasks/{{id}}.md'));
+		} finally {
+			await dispose();
+		}
+	});
+
 	test('a template is seeded once and never overwritten on later loads', async () => {
 		const { folder, dispose } = await tempFolder();
 		const file = vscode.Uri.joinPath(folder.uri, '.kanban-pilot', 'prompts', 'refine.md');

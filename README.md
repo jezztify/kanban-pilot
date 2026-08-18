@@ -1,301 +1,301 @@
 # Kanban Pilot
 
-A Kanban-first driver for Copilot Chat. The board is the control plane; chat is the execution
-surface — you interact with cards (accept, refine, approve, develop), and the extension
-composes and injects the right prompt into Copilot Chat at the right moment.
+**A Kanban board for VS Code that drives GitHub Copilot Chat for you.**
 
-Each task is a durable, git-diffable markdown file on disk. The board is a live projection of
-the active task set: editing a task file by hand moves the card, and moving the card rewrites the
-file. The immutable **Default** set uses `.kanban-pilot/tasks`; additional named sets use their
-own `.kanban-pilot/task-sets/<id>/tasks` folders, so tasks and their within-column ordering stay
-isolated from one another.
+You work the board — create a card, accept it, refine it, approve it, ship it. At each step
+Kanban Pilot writes the right prompt and hands it to Copilot Chat in that card's own private
+conversation, then records the result back on the card.
 
-## How It Works
+Every task is a plain Markdown file in your repo, so your work is readable, reviewable, and
+diffable in git. Edit a file by hand and the card moves. Move the card and the file updates.
 
-Kanban Pilot is a VS Code extension for driving GitHub Copilot Chat. It does not replace
-Copilot Chat or implement the work by itself. The Kanban board is the control plane: task cards,
-workflow columns, and gates decide what should happen next. GitHub Copilot Chat is the execution
-surface: Kanban Pilot opens a private session for the selected task, injects the stage prompt,
-and records the result back in the task file.
+> Kanban Pilot doesn't replace Copilot Chat or write the code itself. It decides *what* should
+> happen next; Copilot Chat does the work.
 
-Every task is also classified as a **Feature** or **Bug**. The board displays that type as a
-readable card marker, so the distinction does not depend on color alone.
+## Why you might want it
 
-The default workflow is deliberately staged so a task can be clarified and reviewed before
-Copilot Chat is asked to change code:
+- **Nothing gets built before you've read the plan.** There's a deliberate review stop between
+  "here's the plan" and "go write the code."
+- **One conversation per task.** No context bleeding between unrelated pieces of work.
+- **You stay in control.** Every step waits for a click by default. Turn on auto-advance only
+  where you want it.
+- **Your tasks are just files.** No database, no cloud, no lock-in — everything lives in
+  `.kanban-pilot/` in your repo.
 
-| Stage | What happens |
+## Requirements
+
+- VS Code 1.125.0 or later
+- GitHub Copilot Chat, installed and signed in
+
+## Get started
+
+1. **Open the board.** Click the Kanban Pilot icon in the activity bar, or run
+   **Kanban Pilot: Open Board** from the Command Palette. The board follows your first
+   workspace folder.
+2. **Create a task.** Click **New Task**, give it a title, an optional description, and pick
+   whether it's a **Feature** or a **Bug**.
+3. **Accept it.** Select the card and click **Accept** to move it out of Backlog.
+4. **Refine it.** Click **Refine**. Copilot Chat writes the problem statement, acceptance
+   criteria, and a scope checklist onto the card. It won't touch code at this stage.
+5. **Read the scope, then approve.** Open the card and read the **Scope** section. Happy? Click
+   **Approve**. Too big? Click **Split** instead and it becomes several smaller tasks.
+6. **Develop.** Click **Develop** and Copilot Chat implements the approved checklist. If a run
+   needs to pick up where it left off, the card offers **Continue**.
+7. **Validate.** When the card reaches Validation, click **Validate**. The QA stage checks the
+   real implementation against the acceptance criteria, and passing work lands in **Done**.
+
+At any point, **Open Chat** on a card opens that task's own Copilot Chat session beside the board.
+
+## The workflow
+
+| Column | What you do here |
 | --- | --- |
-| Backlog | Create or select a task, then click **Accept**. |
-| Refine | Click **Refine** to ask Copilot Chat to write the problem statement, acceptance criteria, and Scope. Click **Split** instead when the task is too big for one ticket. |
-| Scoped | Review the generated Scope and use the gate before approving it. |
-| Approved | Click **Approve** when the scope is ready for implementation. |
-| In Progress | Click **Develop** to ask Copilot Chat to implement the approved Scope. |
-| Validation | Click **Validate** to ask the QA stage to check the implementation against the criteria. |
-| Done | The task is complete after a successful validation receipt. |
+| **Backlog** | New tasks land here. Click **Accept** when you're ready to work on one. |
+| **Refine** | Click **Refine** to have the problem, criteria, and scope written up — or **Split** if it's too big for one ticket. |
+| **Scoped** | Read what came back. This is your review stop. |
+| **Approved** | You've signed off on the plan. Click **Develop** to start building. |
+| **In Progress** | Copilot Chat is implementing the checklist. |
+| **Validation** | Click **Validate** to check the work against the acceptance criteria. |
+| **Done** | Validation passed. |
 
-## Quick Start
+Each column can show an agent label — **Bro Refiner**, **Bro Coder**, and **Bro QA** by default —
+so it's clear who's on the hook at each stage. You can rename these in Settings.
 
-1. Install or enable GitHub Copilot Chat in VS Code, then install Kanban Pilot. GitHub Copilot
-  Chat is required because Kanban Pilot drives that chat surface.
-2. Open a workspace and run **Kanban Pilot: Open Board** from the Command Palette, or select the
-  Kanban Pilot activity-bar icon. The board is bound to the first workspace folder.
-3. Use the **Task set** selector in the board header to choose the immutable **Default** set or
-  a named set. **New** creates and selects a named set; **Rename** works on the active named set;
-  **Delete** works only for an empty named set. The Default set cannot be renamed or deleted, and
-  switching or creating a set is unavailable while a task run is active.
-4. Click **New Task** to enter a title, optional description, and required **Feature** or **Bug**
-  type, or select an existing card. The Command Palette's **Kanban Pilot: New Task** flow asks
-  for the same type. Selecting a card opens its task detail dialog; the task is stored as a
-  Markdown file in the active set. Use **Edit task** in the detail dialog to revise the title,
-  Request, Refined, or Scope without leaving the board.
-5. From **Backlog**, click **Accept**, then click **Refine**. Copilot Chat fills the task's
-  **Refined** and **Scope** sections and returns a receipt. Refine is a documentation step;
-  it must not write implementation code.
-6. Read the **Scope** in the task detail dialog. When it is ready, click **Approve**. This is
-  the review gate between planning and implementation. If the task turns out to be too large,
-  click **Split** instead — the run files the smaller pieces as new backlog tasks and leaves this
-  one as tracking-only.
-7. In **Approved**, click **Develop**. Copilot Chat receives the approved task and implements
-  the checklist. A task may show **Continue** when a run needs to resume.
-8. When the task reaches **Validation**, click **Validate**. The QA stage checks the actual
-  implementation against the acceptance criteria and moves successful work to **Done**.
-9. Use **Open Chat** in the task detail dialog to open that task's private Copilot Chat session
-  beside the board. Stage runs open the same task-specific session automatically when chat
-  docking is enabled.
+## A look at the board
 
-Manual gates are the default. The four gates can be switched to **Auto** from **Settings** for
-hands-off advancement, subject to the shared run-capacity limit described below.
+![The Kanban Pilot board with seven workflow columns and a task in progress](docs/media/board-workflow.png)
 
-### Manage task sets
+The board shows your columns, the agent handling each one, the gate controls, and the next action
+for the selected card. The header holds the task-set picker and the **Settings** button.
 
-The active task set is selected in the board header and persisted for the workspace registry at
-`.kanban-pilot/task-sets.json`. The Default set keeps the legacy `.kanban-pilot/tasks` location;
-named sets are stored under `.kanban-pilot/task-sets/` and have independent task files, card
-order, and task-specific chat session ids. A named set can be renamed, but it must be empty
-before it can be deleted. The extension refuses to switch or create a set while any task in the
-current set is running, so a run is never detached from its task-set context.
+![The New Task dialog with a title and description](docs/media/task-create.png)
 
-### Task types and agent proposals
+**New Task** creates a Markdown-backed card — title, optional description, Feature or Bug.
 
-New tasks require one of two types: **Feature** or **Bug**. Each card shows a text type marker
-with an accessible name and tooltip; color is only a supporting visual cue. Tasks from older
-workspaces that have no valid type are loaded as Feature and backfilled with `type: feature`.
-Agent-filed follow-up tasks use the originating task's type unless a proposal supplies the other
-valid type explicitly; malformed proposal types never create an untyped card.
+![A task's detail dialog showing the Open Chat action](docs/media/task-copilot-chat.png)
 
-### Edit an existing task
+Select a card to read its Request, Refined, and Scope sections. **Open Chat** is the explicit
+handoff to that task's private Copilot Chat session.
 
-Select a card and choose **Edit task**. The editor accepts the title and the Markdown in the
-`## Request`, `## Refined`, and `## Scope` sections, including multiline checklists and code
-blocks. Choose **Save changes** to persist the edit, or **Cancel**, close the dialog, click the
-backdrop, or press **Escape** to discard it. Save errors remain visible in the editor so the
-form can be corrected without losing the other fields.
+## Gates: who decides when a card moves
 
-The board editor does not change the task id, workflow column, runtime status or run, chat and
-session metadata, checkpoint, origin metadata, or the existing `scope_hash`. The append-only
-`## Log` is also read-only in this form; workflow actions and run receipts remain the only ways
-those controlled fields change. A task with `status: running` cannot be saved until its run
-stops.
+Every normal pipeline transition has its own **gate**, and all nine gates start out **manual** —
+the card waits for you. Flip any gate to **Auto** in Settings when you'd rather not be asked.
 
-### Organize cards
+**Starting gates** decide when a stage kicks off:
 
-Drag a card between its column peers to set a persisted within-column order. The order survives
-board reloads and extension restarts and is isolated to the active task set. Focus a card and use
-Arrow Up or Arrow Down for the keyboard equivalent; the board announces the resulting position.
-This ordering-only action does not change the task's state, status, run, or chat session and never
-starts an agent. Dragging a card to a different column remains a separate workflow move with the
-existing state-machine semantics. Legacy cards without a stored position receive deterministic
-fallback ordering and are normalized when a new order is saved.
+- `gates.backlogToRefine` — accept a Backlog task and launch Refine automatically.
+- `gates.scopedToApproved` — approve a Scoped task into the Approved ready queue.
+- `gates.approvedToInProgress` — start the next eligible Approved task when capacity is available.
+- `gates.validationAutoStart` — launch Validate when a task reaches Validation.
 
-### Configure Settings
+**Finishing gates** decide when a completed run is allowed to move the card:
 
-Use the board header's **Settings** button to open a keyboard-operable, two-pane surface. The
-sidebar has **Automation gates** and **Agent assignments** categories; switching categories only
-changes the visible main pane and does not write settings. The four gate switches correspond to
-the existing `kanbanPilot.gates.*` settings: **Backlog → Refine**, **Scoped → Approved**,
-**Approved → In Progress**, and **Validation auto-start**. They are manual by default; switching
-a gate to **Auto** persists it at workspace scope and immediately applies it to eligible idle
-tasks.
+- `gates.refineToScoped` — commit a successful Refine receipt into Scoped.
+- `gates.developToValidation` — commit a successful Develop receipt into Validation.
+- `gates.validateToDone` — commit a passing Validate receipt into Done.
+- `gates.validateFailedToInProgress` — send a failed validation verdict back to In Progress.
+- `gates.splitToDone` — retire a Split parent after its children are persisted.
 
-The Agent assignments pane lists all seven columns — **Backlog**, **Refine**, **Scoped**,
-**Approved**, **In Progress**, **Validation**, and **Done**. Edit a label and choose **Save**, or
-choose **Reset** to remove the override and restore **Bro Refiner** for Refine, **Bro Coder** for
-In Progress, **Bro QA** for Validation, and **None** for the resting columns. The column-header
-pencil opens this pane with that column focused. Refine's assignment is also used by **Split**;
-assignments on resting columns are stored/displayed labels only and never start a chat run.
-Legacy `refine`/`develop`/`validate` assignment keys remain supported. Changes made directly in
-workspace settings are reflected in the board and Settings surface automatically.
+When a finishing gate is manual, the run still completes and its result is written to the card's
+log — the card just holds the outcome as **pending** instead of moving. Apply it from the card's
+detail dialog or the **Apply Pending Completion** command whenever you're ready; applying it only
+moves the card and never starts another agent run. Pending outcomes survive reloads and window
+restarts. Auto stage starts still respect the shared run-capacity limit. Blocked or failed work is
+never retried on its own.
 
-## Install the Agent Skill
+## Things you'll do along the way
 
-The repository includes the canonical Kanban Pilot skill at
-`.claude/skills/kanban-pilot/SKILL.md`. From the repository root, install it into the personal
-skill directory for the tool you use:
+### Keep separate piles of work with task sets
 
-```sh
-npm run install:skill:claude
-npm run install:skill:copilot
+Use the **Task set** picker in the header to switch between the built-in **Default** set and any
+named sets you create. Each set keeps its own tasks, its own card order, and its own chat
+sessions, so an experiment doesn't get tangled up with your main work.
+
+- **New** creates a set and switches to it.
+- **Rename** works on named sets; **Delete** works on empty named sets.
+- Default can't be renamed or deleted.
+- You can't switch or create sets while a task is running — a run always stays with its set.
+
+### Edit a card without leaving the board
+
+Select a card and choose **Edit task**. You can change the title and the Markdown in the
+**Request**, **Refined**, and **Scope** sections, checklists and code blocks included. **Save
+changes** keeps it; **Cancel**, Escape, or clicking outside throws it away. If a save fails, the
+message stays on screen so you can fix it without retyping everything.
+
+Editing never changes the card's column, its run state, or its history — those only move through
+workflow actions and run results. A task that's currently running can't be saved until it stops.
+
+### Reorder cards
+
+Drag a card up or down within its column to set an order that sticks across reloads and restarts.
+Prefer the keyboard? Focus a card and use Arrow Up / Arrow Down; the board announces where it
+landed. Reordering never starts a run. Dragging a card to a *different* column is still a normal
+workflow move.
+
+### Split something that's too big
+
+If a task is clearly more than one ticket, click **Split**. Kanban Pilot files the smaller pieces
+as new backlog tasks and leaves the original as a tracking card. Refine also leaves an advisory
+note about whether a split looks worthwhile — a suggestion for you, not an automatic action.
+
+### Run recovery and Split safety
+
+Split is transactional: the parent is retired only after valid, same-run child proposals have
+been persisted in the active task set. Missing or invalid proposals, or a child-write failure,
+leave the parent retryable instead of silently marking it Done; repeated reconciliation does not
+create duplicate children. A timed-out run is marked failed and remains retryable when no receipt
+arrives, but a matching late receipt from that run can still be reconciled. A receipt from a run
+that was stopped, manually moved, or replaced by a newer retry cannot overwrite the newer task
+state.
+
+### Let agents file follow-up work
+
+While developing or validating, an agent can propose follow-up tasks. Those show up as new backlog
+cards, inheriting the parent's Feature/Bug type unless the proposal says otherwise.
+
+### Tune it in Settings
+
+The **Settings** button in the header opens a keyboard-friendly, two-pane editor covering every
+option, grouped into automation gates, agent names per column, task storage and startup, chat,
+tools and model, run behavior, and board layout. Values are saved at workspace scope and can be
+reset to the effective default; invalid values are rejected rather than half-saved. Agent
+assignments are the one batched category: one **Save** commits all seven column selections, while
+each column keeps its own **Reset** control before the shared save.
+
+Agent assignments use keyboard-accessible dropdowns populated when Settings opens or refreshes.
+Choices come from workspace `.github/agents` folders, configured agent-file locations, and the
+user-level `~/.copilot/agents` folder; workspace choices win when names collide. Existing or
+legacy labels remain selectable as a compatibility fallback even when their profile is no longer
+discoverable. The pencil on a column header jumps straight to that column's field. Refine's name
+is also used for **Split**, and names on the resting columns are just labels — they never start a
+chat run.
+
+Gate changes take effect immediately. Chat, tools, model, and run settings apply to the *next*
+run, so changing them never disturbs something already running. Changing the tasks folder or the
+open-on-startup option shows a reload notice, because those are read when the extension starts.
+
+## How many tasks run at once
+
+By default, **one run at a time**. That's the safest setting: parallel agents editing the same
+working tree can step on each other.
+
+Raise `kanbanPilot.run.maxParallelTasks` if you want more, but treat that as opting into concurrent
+edits in the same workspace — set up git worktrees or another isolation strategy yourself if
+parallel runs will be writing code. When capacity is full, extra work simply waits in **Approved**.
+Raising the limit lets waiting work start; lowering it never interrupts runs already going. A
+finished run holding a pending outcome doesn't occupy a slot.
+
+## Where your tasks live
+
+```
+.kanban-pilot/
+├─ tasks/                    # the Default task set
+├─ task-sets/<id>/tasks/     # each named set
+├─ task-sets.json            # which sets exist, and which one is active
+└─ prompts/                  # your stage prompts (yours to edit; never overwritten)
 ```
 
-The Claude command writes to `<user-home>/.claude/skills/kanban-pilot/SKILL.md`, and the Copilot
-command writes to `<user-home>/.copilot/skills/kanban-pilot/SKILL.md`. The commands create missing
-parent directories and overwrite an existing copy. The canonical skill distinguishes direct
-skill runs from extension-supervised prompts: the generated completion contract owns the
-frontmatter boundary for an extension run, while a direct skill run performs its own legal state
-transition. Installed skill copies are snapshots, so re-run the relevant command after every
-repository skill update to refresh the installed version.
+Each task is one Markdown file: a bit of frontmatter (id, type, column, status) plus **Request**,
+**Refined**, **Scope**, and an append-only **Log**.
 
-Stage prompt files under `.kanban-pilot/prompts` are user-owned and are never silently migrated.
-If an existing copy predates the `kanban-pilot: extension-supervised` marker, update it manually
-or remove it to let the extension seed the current built-in default; keep its footer's explicit
-extension-frontmatter ownership rule if retaining the older copy.
+### The activity log
 
-## Visual Walkthrough
-
-The board is the control plane for the task-specific Copilot Chat runs:
-
-![Kanban Pilot board showing the seven workflow columns and a task in In Progress](docs/media/board-workflow.png)
-
-The board shows the staged columns, per-column agent labels, gate controls, and the card action
-for the current task. The header also shows the active task set and its management controls;
-cards show their Feature/Bug marker and can be reordered with a mouse or keyboard. Open
-**Settings** to edit gates and assignments in one place.
-
-![Kanban Pilot New Task dialog with a title and description](docs/media/task-create.png)
-
-Use **New Task** to create a markdown-backed card with a title and an optional description.
-
-![Kanban Pilot task detail dialog with the Open Chat action](docs/media/task-copilot-chat.png)
-
-Select a card to review its Request, Refined, and Scope sections. **Open Chat** is the explicit
-handoff to that task's private GitHub Copilot Chat session, which opens beside the board.
-
-## Features
-
-- **Staged workflow** — Backlog → Refine → Scoped → Approved → In Progress → Validation → Done,
-  with a hard review point before any code is written.
-- **Gated by default** — every stage transition requires an explicit click unless you opt into
-  auto-advance per gate (`kanbanPilot.gates.*`).
-- **Named task sets** — keep independent task files, card ordering, and task-specific sessions
-  in the immutable Default set or additional workspace-local sets.
-- **One private chat session per task** — no context bleed between unrelated tasks.
-- **Docked chat** — the active task's Copilot Chat session opens beside the board, and Refine,
-  Develop, and Validate dock it before the prompt is injected.
-- **Theme-aware, accessible board** — the UI follows VS Code light and dark theme tokens, keeps
-  text contrast readable, and provides keyboard-operable actions and announcements.
-- **Feature/Bug task types** — every new task is classified and every card shows a readable,
-  accessible type marker; agent-proposed children inherit or explicitly override the parent type.
-- **Split** — fan an oversized ticket out into smaller ones instead of scoping it in place.
-- **Split recommendation** — the built-in Refine prompt records an advisory `YES`/`NO`
-  recommendation, rationale, and proposed boundaries when a task may be better split; it does
-  not create child tasks by itself.
-- **Task proposals** — running agents can file follow-up work as new backlog tasks.
-- **In-board task editing** — select a card to edit its title and Markdown Request, Refined, and
-  Scope sections while protected workflow metadata and the append-only Log remain unchanged.
-- **Persisted card ordering** — drag cards within a column or use Arrow Up/Arrow Down to reorder
-  them without starting a run; cross-column drags remain workflow moves.
-- **Settings workspace** — manage Automation gates and all seven column Agent assignments from a
-  responsive two-pane editor, including reset behavior and resting-column display labels.
-- **Run capacity** — one run at a time by default, raised via `kanbanPilot.run.maxParallelTasks`.
-- **Receipt recovery** — late completion receipts are reconciled even when a missing-receipt fallback races with the agent's task-file write, so successful runs do not remain blocked.
-- **Audit trail** — extension-controlled state/status transitions and stage activity start/finish events are appended to each task's `## Log` with UTC timestamps, alongside receipts and task proposals.
-
-### Task activity log
-
-The `## Log` section is an append-only channel shared by the extension and the agent. Agent
-receipts keep their existing `- run:...` grammar, while extension-owned audit entries use a
-distinct `- audit:...` prefix so receipt and proposal parsing remains compatible. Audit lines
-record `state-change`, `status-change`, `activity-start`, and `activity-finish` events. They use
-UTC ISO 8601 timestamps at second precision, for example:
+The `## Log` section is a running history that both Kanban Pilot and the agent write to. Agent
+results appear as `- run:...` lines; Kanban Pilot's own audit entries use `- audit:...` with UTC
+timestamps:
 
 ```text
 - audit:state-change at:2026-08-17T10:00:00Z task:TASK-142 from:backlog to:refine action:accept note:"State changed from backlog to refine via accept."
-- audit:status-change at:2026-08-17T10:00:01Z task:TASK-142 from:idle to:running action:refine note:"Status changed from idle to running via refine."
 - audit:activity-start at:2026-08-17T10:00:01Z task:TASK-142 stage:refine action:refine run:r7 note:"Started refine activity."
 - audit:activity-finish at:2026-08-17T10:00:12Z task:TASK-142 stage:refine action:receipt run:r7 outcome:ok note:"scope written, 3 files"
 ```
 
-State is the workflow column; status is the runtime condition. State and status audit entries
-cover extension-controlled moves, gates, automatic policies, retries, and stop/reset behavior.
-A run records one start after admission and one terminal finish for Refine, Split,
-Develop/Continue, or Validate, including success, blocked/failed receipts, timeout, executor
-errors, missing receipts, manual completion, stop, or a superseding move. A provisional
-missing-receipt finish can receive one explicit, idempotent late-receipt correction. Audit
-events are written with the frontmatter mutation through the serialized task store, so repeated
-watcher/reload reconciliation does not duplicate lifecycle entries. Agent receipts and
-`propose-task` lines keep their existing grammar and can be interleaved with `audit:` lines.
+Every run records one start and one finish — success, failure, timeout, stop, or manual
+completion. If a result arrives late, Kanban Pilot reconciles it, provided a newer retry or a
+manual move hasn't already taken over. Hand edits you make directly to a task file are fully
+supported, but they won't produce audit lines: a file watcher can't tell what the old value was or
+who changed it.
 
-Only extension-controlled transitions are attributed. Direct edits to frontmatter by a person
-or an agent remain supported, but a file watcher cannot reliably determine the old value or the
-initiating action, so those edits are not guaranteed to receive audit entries. The board editor
-also leaves the append-only Log untouched.
+## Install the agent skill
 
-## Requirements
+The repository ships the canonical Kanban Pilot skill at `.claude/skills/kanban-pilot/SKILL.md`.
+From the repository root:
 
-- VS Code 1.125.0 or later.
-- GitHub Copilot Chat, since Kanban Pilot drives it rather than replacing it.
+```sh
+npm run install:skill:claude    # installs to <home>/.claude/skills/kanban-pilot/SKILL.md
+npm run install:skill:copilot   # installs to <home>/.copilot/skills/kanban-pilot/SKILL.md
+```
 
-## Extension Settings
+Both commands create missing folders and overwrite an existing copy. Installed copies are
+snapshots, so re-run the command whenever the repository's skill changes.
 
-This extension contributes the following settings (all under `kanbanPilot.*`):
+Stage prompts in `.kanban-pilot/prompts` belong to you and are never migrated automatically. If an
+older copy predates the `kanban-pilot: extension-supervised` marker, either update it by hand or
+delete it and let the extension write a fresh default.
 
-| Setting | Default | Description |
+## All settings
+
+Every option lives under `kanbanPilot.*` and can be edited from the board's **Settings** pane.
+
+| Setting | Default | What it does |
 | --- | --- | --- |
-| `kanbanPilot.tasksDir` | `.kanban-pilot/tasks` | Workspace-relative folder for the immutable Default task set; additional named sets use `.kanban-pilot/task-sets/<id>/tasks`. |
-| `kanbanPilot.gates.backlogToRefine` | `manual` | `auto` accepts a new task and launches Refine automatically. |
-| `kanbanPilot.gates.scopedToApproved` | `manual` | `auto` approves a freshly-scoped task into the ready queue. |
-| `kanbanPilot.gates.approvedToInProgress` | `manual` | `auto` starts development on the next Approved task when run capacity has room. |
-| `kanbanPilot.gates.validationAutoStart` | `manual` | `auto` launches Validate as soon as a task lands in Validation. |
-| `kanbanPilot.chat.mode` | `agent` | Chat mode requested at injection (`agent` or `ask`). |
-| `kanbanPilot.chat.sessionPrefix` | `kanban-pilot-` | Prefix used to build each task's private session id; named sets include their stable set id. |
-| `kanbanPilot.chat.closeTabOnDone` | `true` | Close a task's chat tab once it reaches Done. |
-| `kanbanPilot.chat.resetOnApprove` | `false` | Clear the task's conversation at the Approve gate. |
-| `kanbanPilot.refine.toolsInclude` | `[]` | Optional allowlist restricting tools available during Refine. |
-| `kanbanPilot.chat.toolsExclude` | `["memory", "resolveMemoryFileUri"]` | Tools denied on every injection, every stage. |
-| `kanbanPilot.chat.modelSelector` | `{}` | Optional `{id, vendor}` to pin a model per run. |
-| `kanbanPilot.chat.agentNames` | `{}` | Per-column labels for `backlog`, `refine`, `scoped`, `approved`, `in-progress`, `validation`, and `done`. Defaults are `None` for resting columns, `Bro Refiner`, `Bro Coder`, and `Bro QA` for the runnable columns; `split` reuses Refine. Legacy `refine`/`develop`/`validate` keys remain supported. Editable from **Settings**. |
-| `kanbanPilot.run.timeoutMinutes` | `20` | Minutes before a run is marked failed. |
-| `kanbanPilot.run.maxParallelTasks` | `1` | Maximum active Refine, Split, Develop/Continue, and Validate runs. Invalid, non-positive, or non-integer values normalize to `1`; values above one opt into concurrent agent edits in the same workspace without worktree isolation. |
-| `kanbanPilot.board.openOnStartup` | `false` | Open the board automatically on workspace load. |
-| `kanbanPilot.layout.dockChat` | `true` | Open the selected task's chat beside the board. |
-| `kanbanPilot.layout.dockChatOnSelect` | `false` | Dock the chat as soon as a card is selected. |
-| `kanbanPilot.chat.allowTaskProposals` | `true` | Let develop/validate runs file typed follow-up work as new backlog tasks; an omitted proposal type inherits the originating task's type. |
+| `tasksDir` | `.kanban-pilot/tasks` | Where the Default task set is stored. Named sets live under `.kanban-pilot/task-sets/<id>/tasks`. |
+| `gates.backlogToRefine` | `manual` | `auto` accepts a new task and starts Refine. |
+| `gates.refineToScoped` | `manual` | `auto` moves a finished Refine to Scoped. |
+| `gates.scopedToApproved` | `manual` | `auto` approves freshly scoped work. |
+| `gates.approvedToInProgress` | `manual` | `auto` starts development when there's capacity. |
+| `gates.developToValidation` | `manual` | `auto` moves finished development to Validation. |
+| `gates.validationAutoStart` | `manual` | `auto` runs Validate as soon as a task reaches Validation. |
+| `gates.validateToDone` | `manual` | `auto` moves a passing validation to Done. |
+| `gates.validateFailedToInProgress` | `manual` | `auto` sends a failed validation back to In Progress. |
+| `gates.splitToDone` | `manual` | `auto` retires a split parent once its children exist. |
+| `chat.mode` | `agent` | Copilot Chat mode used when a prompt is sent (`agent` or `ask`). |
+| `chat.sessionPrefix` | `kanban-pilot-` | Prefix for each task's private session id. |
+| `chat.closeTabOnDone` | `true` | Close a task's chat tab when it's finished (the session is kept). |
+| `chat.resetOnApprove` | `false` | Clear the task's conversation at the Approve gate. |
+| `chat.toolsExclude` | `["memory", "resolveMemoryFileUri"]` | Tools blocked on every stage. |
+| `refine.toolsInclude` | `[]` | Optional allowlist of tools available during Refine. |
+| `chat.modelSelector` | `{}` | Pin a model per run with `{id, vendor}`. |
+| `chat.agentNames` | `{}` | Dropdown-selected labels for each column's agent; the Agent assignments category saves all seven together and preserves legacy values. |
+| `chat.allowTaskProposals` | `true` | Let develop and validate runs file follow-up backlog tasks. |
+| `run.timeoutMinutes` | `20` | How long a run may go before it's marked failed. |
+| `run.maxParallelTasks` | `1` | How many runs may be active at once. |
+| `board.openOnStartup` | `false` | Open the board automatically when the workspace loads. |
+| `layout.dockChat` | `true` | Open the selected task's chat beside the board. |
+| `layout.dockChatOnSelect` | `false` | Dock the chat as soon as you select a card. |
 
-Run capacity is global across all active agent stages and counts persisted `status: running`
-tasks after a reload. The default of one preserves the safest working-tree behavior. When the
-capacity is full, new manual and automatic starts are left untouched rather than assigned a new
-queue status; Approved remains the visible ready queue. Increasing the limit explicitly opts into
-same-workspace concurrent edits, so use a worktree or another isolation strategy separately if
-parallel code-writing runs need filesystem safety. Increasing the limit allows eligible work to
-start on the next reconciliation; decreasing it does not interrupt runs already in progress.
-
-## Known Issues
+## Known issues
 
 None tracked yet.
 
-## Release a Versioned Package
+## Releasing a version
 
-The release workflow runs when a `v<major>.<minor>.<patch>` tag is pushed. To release a version:
+A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
-1. Update the `version` in `package.json` and the matching root versions in `package-lock.json`,
-  then commit the change.
-2. Push a tag that exactly matches the manifest version, such as `v0.2.0`.
-3. GitHub Actions installs dependencies with `npm ci`, runs the existing tests, build, and lint
-  checks, packages the extension with `npm run vsix`, and verifies the VSIX metadata.
-4. After all checks pass, the workflow creates a GitHub Release for the tag and attaches the
-  generated `kanban-pilot-<version>.vsix` asset.
+1. Update `version` in `package.json` (and the matching versions in `package-lock.json`), commit.
+2. Push a tag that exactly matches, e.g. `v0.3.0`.
+3. GitHub Actions installs with `npm ci`, runs tests, build, and lint, packages the VSIX, and
+   checks its metadata.
+4. Once everything passes, it creates the GitHub Release and attaches
+   `kanban-pilot-<version>.vsix`.
 
-## Release Notes
+## Release notes
 
-### 0.2.0
+The current documented release is **0.3.0**.
 
-The v0.2.0 release adds named task sets, typed Feature/Bug cards, in-board task editing,
-persisted within-column ordering, theme-aware accessible board polish, a categorized Settings
-workspace, extension-owned audit logging, configurable parallel run capacity, and an advisory
-split recommendation during Refine. It also improves receipt recovery and legacy-task/settings
-compatibility. See [CHANGELOG.md](CHANGELOG.md) for the complete release history.
+**0.3.0** — Complete manual/auto gates for the normal pipeline with durable pending outcomes;
+the full in-board Settings editor; Copilot custom-agent discovery and assignment dropdowns; one
+shared Agent assignments Save with per-column Reset; transactional Split child-task persistence;
+and timeout recovery with matching late-receipt reconciliation and stale-run protection.
 
-### 0.1.0
+**0.2.0** — Named task sets, Feature/Bug card types, in-board task editing, persisted card
+ordering, a theme-aware and accessible board, the categorized Settings pane, a gate for every
+pipeline edge with durable pending completions, activity logging, configurable run capacity, and
+split recommendations during Refine. Plus better recovery from late run results and improved
+compatibility with older tasks and settings.
 
-Initial build.
+**0.1.0** — Initial build.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history.

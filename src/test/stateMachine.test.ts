@@ -3,15 +3,45 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { COLUMNS, Column, STATUSES, Status } from '../model/task';
+import { COLUMNS, Column, PendingOutcome, STATUSES, Status } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { applyAction, TASK_ACTIONS, TaskAction } from '../board/stateMachine';
+import { applyAction, applyPendingTransition, TASK_ACTIONS, TaskAction } from '../board/stateMachine';
 import { invokeTaskAction, moveTask, pickTaskFor, reorderTask } from '../board/actions';
 import { parseAuditEvents } from '../model/taskLog';
+import { GATE_CATALOG, RECEIPT_COMPLETION_GATES, STAGE_START_GATES } from '../model/gates';
 
 /** M2 — human transitions (PRD §5, §5.2, §6.8's Stop+reset precedent, §12 Q3). */
 
 suite('M2 state machine', () => {
+	test('catalog contains every independent gate with a manual default', () => {
+		assert.strictEqual(GATE_CATALOG.length, 9);
+		assert.strictEqual(STAGE_START_GATES.length, 4);
+		assert.strictEqual(RECEIPT_COMPLETION_GATES.length, 5);
+		assert.ok(GATE_CATALOG.every((gate) => gate.defaultPolicy === 'manual'));
+		assert.ok(GATE_CATALOG.every((gate) => gate.targetStatus === 'idle'));
+	});
+
+	test('pending receipt promotion follows the catalog and cannot act as a human escape', () => {
+		const pending: PendingOutcome = {
+			gate: 'developToValidation',
+			stage: 'develop',
+			result: 'ok',
+			runId: 'r-pending',
+		};
+		assert.deepStrictEqual(
+			applyPendingTransition({ state: 'in-progress', status: 'idle' }, pending),
+			{ state: 'validation', status: 'idle', gate: 'developToValidation' },
+		);
+		assert.strictEqual(applyPendingTransition({ state: 'in-progress', status: 'running' }, pending), undefined);
+		assert.strictEqual(applyPendingTransition({ state: 'approved', status: 'idle' }, pending), undefined);
+		assert.strictEqual(
+			applyPendingTransition(
+				{ state: 'in-progress', status: 'idle' },
+				{ ...pending, gate: 'validateToDone', stage: 'validate' },
+			),
+			undefined,
+		);
+	});
 	test('every legal (state, status, action) triple from §5.2', () => {
 		const legal: [Column, Status, TaskAction, Column, Status][] = [
 			['backlog', 'idle', 'accept', 'refine', 'idle'],
@@ -71,6 +101,24 @@ suite('M2 state machine', () => {
 
 		// §6.14: split launches a run too, same as refine/develop/continue/validate.
 		assert.strictEqual(applyAction({ state: 'backlog', status: 'idle' }, 'split')?.needsAgent, true);
+	});
+
+	test('failed working-column tasks remain retryable after a timeout', () => {
+		assert.deepStrictEqual(applyAction({ state: 'refine', status: 'failed' }, 'refine'), {
+			state: 'refine',
+			status: 'idle',
+			needsAgent: true,
+		});
+		assert.deepStrictEqual(applyAction({ state: 'in-progress', status: 'failed' }, 'continue'), {
+			state: 'in-progress',
+			status: 'idle',
+			needsAgent: true,
+		});
+		assert.deepStrictEqual(applyAction({ state: 'validation', status: 'failed' }, 'validate'), {
+			state: 'validation',
+			status: 'idle',
+			needsAgent: true,
+		});
 	});
 
 	test('every action is illegal everywhere not explicitly listed as legal', () => {

@@ -8,6 +8,30 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.3.0] - 2026-08-18
+
+### Added
+
+- Complete manual/auto gate coverage for the normal workflow pipeline, including durable pending
+	completion outcomes and the explicit Apply Pending Completion action.
+- A full in-board Settings editor for the contributed Kanban Pilot options, with typed validation,
+	workspace-scoped save/reset behavior, and clear next-run or reload boundaries.
+- Copilot custom-agent discovery from workspace, configured, and user-level locations, with
+	keyboard-accessible assignment dropdowns and compatibility for existing labels.
+
+### Changed
+
+- Agent assignments now use one category-level Save for all seven columns while retaining a
+	per-column Reset control; the saved assignments continue to drive board labels and prompts.
+- Split reconciliation now persists valid child tasks in the active task set before retiring the
+	parent, and leaves a retryable outcome when usable children cannot be created.
+
+### Fixed
+
+- Timed-out runs now remain retryable and can recover from a matching late receipt without
+	duplicating outcomes, while Stop, manual moves, and newer retries prevent stale run output from
+	overwriting current task state.
+
 ## [0.2.0] - 2026-08-18
 
 ### Added

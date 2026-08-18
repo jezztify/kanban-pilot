@@ -97,4 +97,10 @@ suite('Extension Test Suite', () => {
 			}
 		}
 	});
+
+	test('Apply Pending Completion is registered and safely ignores an unknown task', async () => {
+		const commands = await vscode.commands.getCommands(true);
+		assert.ok(commands.includes('kanban-pilot.applyPendingOutcome'));
+		await vscode.commands.executeCommand('kanban-pilot.applyPendingOutcome', 'TASK-NOT-FOUND-FOR-PENDING-TEST');
+	});
 });
