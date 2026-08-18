@@ -58,6 +58,7 @@ runs, while this skill owns transitions only for direct runs. The generated
 ---
 id: TASK-007
 title: Add retry backoff for webhook delivery
+type: feature
 state: approved
 status: idle
 created: 2026-08-13T10:04:12Z
@@ -86,6 +87,7 @@ origin_task: TASK-003
 | --- | --- | --- |
 | `id` | `TASK-<n>` | Must match the filename |
 | `title` | free text | |
+| `type` | `feature \| bug` | Exactly one canonical classification. Missing or invalid legacy values normalize to `feature` and are backfilled by the extension when loaded. |
 | `state` | `backlog \| refine \| scoped \| approved \| in-progress \| validation \| done` | The column |
 | `status` | `idle \| running \| paused \| blocked \| failed` | Never invent a value outside this set — an unrecognized `state` or `status` silently resets the card to `backlog`/`idle` on the board |
 | `created`, `updated` | ISO 8601, e.g. `2026-08-13T10:04:12Z` | In a direct skill run, bump `updated` on every frontmatter write you make; extension-supervised runs are updated by `RunManager` |
@@ -290,8 +292,11 @@ you're on. Two things happen together:
 
 1. Add a line to the current task's `## Log`, alongside your receipt:
    ```
-   - propose-task run:<runId> title:"<short title>" note:"<why this is separate, one line>"
+    - propose-task run:<runId> type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
    ```
+  The `type:` field is optional for compatibility with older logs. Omit it to inherit the
+  current task's type; if present, it must be exactly `feature` or `bug`. Never create an
+  invalid or untyped child.
 2. Actually create the new task file yourself, the same way the extension's
    own "New Task" does:
    - Next id: scan `.kanban-pilot/tasks/TASK-*.md` for the highest number in
@@ -302,6 +307,7 @@ you're on. Two things happen together:
      ---
      id: TASK-042
      title: <the title from your propose-task line>
+     type: <feature or bug, inherited from the parent when omitted>
      state: backlog
      status: idle
      created: <now, ISO 8601>

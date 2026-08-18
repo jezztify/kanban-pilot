@@ -103,6 +103,16 @@ suite('M3 receipt grammar', () => {
 
 		assert.deepStrictEqual(parsed, { runId: 'r8', taskId: 'TASK-142', stage: 'develop', result: 'blocked', note: 'needs a decision' });
 	});
+
+	test('audit lines can surround receipts without changing the receipt grammar', () => {
+		const log = [
+			'- audit:activity-start at:2026-08-17T10:00:00Z task:TASK-142 stage:refine action:refine run:r8 note:"Started refine activity."',
+			'- run:r8 task:TASK-142 stage:refine result:ok note:"done"',
+			'- audit:activity-finish at:2026-08-17T10:00:01Z task:TASK-142 stage:refine action:receipt run:r8 outcome:ok note:"done"',
+		].join('\n');
+
+		assert.deepStrictEqual(parseReceipts(log).map((receipt) => receipt.result), ['ok']);
+	});
 });
 
 suite('M3 scope hash', () => {
@@ -236,6 +246,27 @@ suite('M3 prompt templates', () => {
 					);
 				}
 			}
+		} finally {
+			await dispose();
+		}
+	});
+
+	test('the built-in refine template records an advisory split recommendation without starting split or implementation work', async () => {
+		const { folder, dispose } = await tempFolder();
+		try {
+			const template = await loadPromptTemplate(folder, 'refine');
+
+			assert.ok(template.includes('Under `## Refined`, record an unambiguous split recommendation'));
+			assert.ok(template.includes('Split recommendation: YES'));
+			assert.ok(template.includes('Split recommendation: NO'));
+			assert.ok(/whether this task should be split into smaller\s+independent tasks/.test(template));
+			assert.ok(/proposed\s+independent task boundaries/.test(template));
+			assert.ok(/why one task is\s+sufficient/.test(template));
+			assert.ok(template.includes('This recommendation is advisory only'));
+			assert.ok(/do not create child task\s+files/.test(template));
+			assert.ok(template.includes('add `propose-task` lines'));
+			assert.ok(template.includes('invoke the separate `split` action'));
+			assert.ok(template.includes('Do not write or edit any code. This stage is scoping only.'));
 		} finally {
 			await dispose();
 		}

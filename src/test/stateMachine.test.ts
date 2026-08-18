@@ -6,7 +6,8 @@ import * as vscode from 'vscode';
 import { COLUMNS, Column, STATUSES, Status } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { applyAction, TASK_ACTIONS, TaskAction } from '../board/stateMachine';
-import { invokeTaskAction, moveTask, pickTaskFor } from '../board/actions';
+import { invokeTaskAction, moveTask, pickTaskFor, reorderTask } from '../board/actions';
+import { parseAuditEvents } from '../model/taskLog';
 
 /** M2 — human transitions (PRD §5, §5.2, §6.8's Stop+reset precedent, §12 Q3). */
 
@@ -151,6 +152,24 @@ suite('M2 action invocation (src/board/actions.ts)', () => {
 		const after = (await store.readAll()).tasks[0];
 		assert.strictEqual(after.state, 'refine');
 		assert.strictEqual(after.status, 'idle');
+		assert.deepStrictEqual(parseAuditEvents(after.sections['Log']).map((event) => event.kind), ['state-change']);
+		assert.strictEqual(parseAuditEvents(after.sections['Log'])[0].action, 'accept');
+	});
+
+	test('state-machine transitions append cards at the destination end', async () => {
+		const existing = await store.create('Already in refine');
+		await invokeTaskAction(store, existing.id, 'accept');
+
+		const moving = await store.create('Accept into refine');
+		await store.patch(moving.id, { position: '99' });
+		assert.deepStrictEqual(await invokeTaskAction(store, moving.id, 'accept'), {
+			kind: 'applied',
+			needsAgent: false,
+		});
+
+		const refine = (await store.snapshot()).columns.find((column) => column.id === 'refine')!;
+		assert.deepStrictEqual(refine.tasks.map((task) => task.id), [existing.id, moving.id]);
+		assert.deepStrictEqual(refine.tasks.map((task) => task.position), [0, 1]);
 	});
 
 	test('invokeTaskAction refuses an illegal transition without touching disk', async () => {
@@ -231,6 +250,70 @@ suite('M2 action invocation (src/board/actions.ts)', () => {
 		assert.strictEqual(after.checkpoint, 'deadbeef');
 		assert.strictEqual(after.originTask, 'TASK-001');
 		assert.ok(after.sections['Request'].includes('Keep this request.'));
+		assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'state-change' && event.to === 'done'));
+	});
+
+	test('reorderTask changes only within-column order and never creates workflow audit events', async () => {
+		const first = await store.create('First');
+		const second = await store.create('Second');
+		const third = await store.create('Third');
+		const thirdUri = store.fileFor(third.id);
+		const beforeRaw = Buffer.from(await vscode.workspace.fs.readFile(thirdUri)).toString('utf8');
+		const enriched = beforeRaw
+			.replace('## Request\n', '## Notes\nKeep this body.\n\n## Request\n')
+			.replace('chat_reset_required: false', 'chat: kanban-pilot-TASK-003\ncopilot_session_id: session-3\nchat_reset_required: false');
+		await vscode.workspace.fs.writeFile(thirdUri, Buffer.from(enriched, 'utf8'));
+		await store.patch(third.id, { status: 'running', run: 'r-active' });
+		await store.appendLog(third.id, '- existing log entry');
+		const before = (await store.readAll()).tasks.find((task) => task.id === third.id)!;
+		const auditBefore = parseAuditEvents(before.sections['Log']);
+
+		assert.deepStrictEqual(await reorderTask(store, third.id, 'backlog', { beforeTaskId: first.id }), { kind: 'applied' });
+		assert.deepStrictEqual(await reorderTask(store, third.id, 'backlog', { beforeTaskId: second.id }), { kind: 'applied' });
+		assert.deepStrictEqual(await reorderTask(store, third.id, 'backlog', { beforeTaskId: null }), { kind: 'applied' });
+		assert.deepStrictEqual(await reorderTask(store, third.id, 'backlog', { beforeTaskId: null }), { kind: 'no-op' });
+
+		const snapshot = await store.snapshot();
+		assert.deepStrictEqual(snapshot.columns[0].tasks.map((task) => task.id), [first.id, second.id, third.id]);
+		const after = (await store.readAll()).tasks.find((task) => task.id === third.id)!;
+		assert.strictEqual(after.state, before.state);
+		assert.strictEqual(after.status, 'running');
+		assert.strictEqual(after.run, 'r-active');
+		assert.strictEqual(after.chat, 'kanban-pilot-TASK-003');
+		assert.strictEqual(after.copilotSessionId, 'session-3');
+		assert.strictEqual(after.sections['Notes'], 'Keep this body.');
+		assert.deepStrictEqual(parseAuditEvents(after.sections['Log']), auditBefore);
+		assert.strictEqual(after.sections['Log'], before.sections['Log']);
+	});
+
+	test('reorderTask rejects invalid, unknown, and stale targets without a state-machine path', async () => {
+		const task = await store.create('Target validation');
+		const other = await store.create('Other target');
+		const uri = store.fileFor(task.id);
+		const before = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'not-a-column', { beforeTaskId: null }), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { targetIndex: -1 }), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { targetIndex: 99 }), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { targetIndex: 0, beforeTaskId: null }), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', null), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { beforeTaskId: null, ignored: true }), { kind: 'invalid' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { beforeTaskId: 'TASK-999' }), { kind: 'stale' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'done', { beforeTaskId: null }), { kind: 'stale' });
+		assert.deepStrictEqual(await reorderTask(store, 'TASK-999', 'backlog', { beforeTaskId: null }), { kind: 'not-found' });
+		assert.deepStrictEqual(await reorderTask(store, task.id, 'backlog', { beforeTaskId: null }), { kind: 'applied' });
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'), before.replace('position: 0', 'position: 1'));
+	});
+
+	test('cross-column manual moves append at the destination end', async () => {
+		const existing = await store.create('Already done');
+		const moving = await store.create('Move to done');
+		await store.patch(existing.id, { state: 'done' });
+
+		assert.deepStrictEqual(await moveTask(store, moving.id, 'done'), { kind: 'applied' });
+		const done = (await store.snapshot()).columns.find((column) => column.id === 'done')!;
+		assert.deepStrictEqual(done.tasks.map((task) => task.id), [existing.id, moving.id]);
+		assert.deepStrictEqual(done.tasks.map((task) => task.position), [0, 1]);
 	});
 
 	test('pickTaskFor returns an explicit id without reading the store', async () => {

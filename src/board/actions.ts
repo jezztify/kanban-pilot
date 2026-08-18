@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { COLUMNS, Column } from '../model/task';
-import { TaskStore } from '../model/taskStore';
+import type { AuditEventInput, AuditOutcome, AuditStage } from '../model/taskLog';
+import { parseAuditEvents } from '../model/taskLog';
+import { ReorderTarget, TaskStore } from '../model/taskStore';
 import { applyAction, TaskAction } from './stateMachine';
 
 /**
@@ -28,14 +30,99 @@ export type MoveOutcome =
 	| { kind: 'invalid' }
 	| { kind: 'not-found' };
 
+export type ReorderOutcome =
+	| { kind: 'applied' }
+	| { kind: 'no-op' }
+	| { kind: 'invalid' }
+	| { kind: 'not-found' }
+	| { kind: 'stale' };
+
+export interface ActionAuditOptions {
+	activityFinish?: {
+		runId: string;
+		stage: AuditStage;
+		outcome: AuditOutcome;
+		note?: string;
+	};
+}
+
 function isColumn(value: unknown): value is Column {
 	return typeof value === 'string' && (COLUMNS as readonly string[]).includes(value);
+}
+
+function isTaskId(value: unknown): value is string {
+	return typeof value === 'string' && /^TASK-\d+$/.test(value);
+}
+
+function normalizeReorderTarget(value: unknown): ReorderTarget | undefined {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return undefined;
+	}
+
+	const candidate = value as Record<string, unknown>;
+	const hasIndex = Object.prototype.hasOwnProperty.call(candidate, 'targetIndex');
+	const hasAnchor = Object.prototype.hasOwnProperty.call(candidate, 'beforeTaskId');
+	if (Object.keys(candidate).length !== 1 || hasIndex === hasAnchor) {
+		return undefined;
+	}
+	if (hasIndex) {
+		return typeof candidate.targetIndex === 'number' && Number.isInteger(candidate.targetIndex) && candidate.targetIndex >= 0
+			? { targetIndex: candidate.targetIndex }
+			: undefined;
+	}
+	return candidate.beforeTaskId === null || isTaskId(candidate.beforeTaskId)
+		? { beforeTaskId: candidate.beforeTaskId }
+		: undefined;
+}
+
+/**
+ * Validated within-column ordering intent. Unlike a workflow action this path
+ * never calls the state machine, changes runtime metadata, or releases a run.
+ */
+export async function reorderTask(
+	store: TaskStore,
+	taskId: unknown,
+	column: unknown,
+	target: unknown,
+): Promise<ReorderOutcome> {
+	if (!isTaskId(taskId) || !isColumn(column)) {
+		return { kind: 'invalid' };
+	}
+	const normalized = normalizeReorderTarget(target);
+	if (!normalized) {
+		return { kind: 'invalid' };
+	}
+
+	const { tasks } = await store.readAll();
+	const matching = tasks.filter((task) => task.id === taskId);
+	if (matching.length === 0) {
+		return { kind: 'not-found' };
+	}
+	if (matching.length !== 1 || matching[0].state !== column) {
+		return { kind: 'stale' };
+	}
+
+	const columnTasks = tasks.filter((task) => task.state === column);
+	if (normalized.targetIndex !== undefined && normalized.targetIndex > Math.max(0, columnTasks.length - 1)) {
+		return { kind: 'invalid' };
+	}
+	if (
+		normalized.beforeTaskId !== undefined &&
+		normalized.beforeTaskId !== null &&
+		normalized.beforeTaskId !== taskId &&
+		!columnTasks.some((task) => task.id === normalized.beforeTaskId)
+	) {
+		return { kind: 'stale' };
+	}
+
+	return store.reorder(taskId, column, normalized);
 }
 
 export async function invokeTaskAction(
 	store: TaskStore,
 	taskId: string,
 	action: TaskAction,
+	auditOptions: ActionAuditOptions = {},
 ): Promise<InvokeOutcome> {
 	const { tasks } = await store.readAll();
 	const task = tasks.find((t) => t.id === taskId);
@@ -48,8 +135,30 @@ export async function invokeTaskAction(
 		return { kind: 'illegal' };
 	}
 
-	await store.patch(taskId, { state: result.state, status: result.status });
+	const updates: Record<string, string | undefined> = { state: result.state, status: result.status };
+	if (action === 'stop') {
+		updates.run = undefined;
+	}
+	const events: AuditEventInput[] = auditOptions.activityFinish
+		? [{ kind: 'activity-finish', ...auditOptions.activityFinish, action }]
+		: [];
+	await store.auditedPatch(taskId, updates, {
+		action,
+		runId: auditOptions.activityFinish?.runId,
+		outcome: auditOptions.activityFinish?.outcome,
+		events,
+	});
 	return { kind: 'applied', needsAgent: result.needsAgent };
+}
+
+function stageForRunningTask(task: { state: Column; sections: Record<string, string> }, runId: string): AuditStage {
+	const start = parseAuditEvents(task.sections['Log'] ?? '')
+		.reverse()
+		.find((event) => event.kind === 'activity-start' && event.runId === runId);
+	if (start?.stage) {
+		return start.stage;
+	}
+	return task.state === 'in-progress' ? 'develop' : task.state === 'validation' ? 'validate' : 'refine';
 }
 
 export async function moveTask(
@@ -70,7 +179,26 @@ export async function moveTask(
 		return { kind: 'no-op' };
 	}
 
-	await store.patch(task.id, { state: destination, status: 'idle', run: undefined });
+	const events: AuditEventInput[] = task.status === 'running' && task.run
+		? [{
+			kind: 'activity-finish',
+			runId: task.run,
+			stage: stageForRunningTask(task, task.run),
+			outcome: 'superseded',
+			action: 'move',
+			note: `Activity superseded by a manual move to ${destination}.`,
+		}]
+		: [];
+	await store.auditedPatch(task.id, {
+		state: destination,
+		status: 'idle',
+		run: undefined,
+	}, {
+		action: 'move',
+		runId: task.run,
+		outcome: task.status === 'running' ? 'superseded' : undefined,
+		events,
+	});
 	return { kind: 'applied' };
 }
 

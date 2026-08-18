@@ -12,6 +12,19 @@ suite('M3.5 proposal grammar', () => {
 		assert.strictEqual(proposal.runId, 'r19');
 		assert.strictEqual(proposal.title, 'Add retry backoff');
 		assert.strictEqual(proposal.note, 'discovered during implementation');
+		assert.strictEqual(proposal.type, undefined, 'old syntax remains an omitted-type proposal');
+	});
+
+	test('parses an explicit canonical type and rejects an invalid one', () => {
+		const log = [
+			'- propose-task run:r19 type:bug title:"Fix retry backoff" note:"defect found during implementation"',
+			'- propose-task run:r19 type:feature title:"Add metrics" note:"follow-up capability"',
+			'- propose-task run:r19 type:regression title:"Never create this" note:"invalid type"',
+		].join('\n');
+
+		const proposals = parseProposals(log);
+		assert.deepStrictEqual(proposals.map((proposal) => proposal.type), ['bug', 'feature']);
+		assert.deepStrictEqual(proposals.map((proposal) => proposal.title), ['Fix retry backoff', 'Add metrics']);
 	});
 
 	test('ignores free-form prose and unrelated receipt lines around it', () => {

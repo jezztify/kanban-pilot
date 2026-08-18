@@ -224,12 +224,11 @@ This table reproduces the design exactly and is the authoritative spec for card 
 Each column header shows its title, a live count of contained cards, and a per-column **Agent**
 badge — `Backlog 6 / Agent None`, `Refine 2 / Agent Bro Refiner`, `Scoped 3 / Agent None`,
 `Approved 2 / Agent None`, `In Progress 2 / Agent Bro Coder`, `Validation 2 / Agent Bro QA`,
-`Done 5 / Agent None`. As of the stage-wiring pass (§6.6), the badge for the three agent columns
-is **not cosmetic** — it's `resolveAgentName`'s result for that column's stage (`chat/agentNames.ts`),
-the same call `RunManager` makes to open every prompt for that stage, so the badge tells you
-exactly who's about to be asked to do the work. The pencil icon is no longer inert either
-(§12 Q10, now fully closed, §6.17): clicking it opens a small modal to rename that stage's
-persona, writing straight to `kanbanPilot.chat.agentNames`.
+`Done 5 / Agent None`. The badge is the effective value from the shared column-assignment
+resolver (`chat/agentNames.ts`), so the three runnable columns tell you exactly which persona
+the next Refine, Develop, or Validate prompt will address. Every column has an active pencil;
+clicking it opens the combined Settings surface (§6.17) with that column's assignment focused.
+Assignments on resting columns are display labels only and do not create or dispatch runs.
 
 ---
 
@@ -328,8 +327,10 @@ One file per task at `.kanban-pilot/tasks/TASK-142.md`.
 ---
 id: TASK-142
 title: Set up billing webhook
+type: feature         # feature | bug
 state: scoped          # backlog | refine | scoped | approved | in-progress | validation | done
 status: idle           # idle | running | paused | blocked | failed
+position: 0            # optional non-negative numeric order within the current column
 created: 2026-08-13T10:04:12Z
 updated: 2026-08-13T11:22:40Z
 run: null              # active run id, or null
@@ -368,11 +369,20 @@ Add a signed webhook endpoint for Stripe billing events.
 
 | Section | Written by | Notes |
 | --- | --- | --- |
-| Frontmatter | Extension only for extension-supervised runs | The generated prompt explicitly assigns ownership to `RunManager` (§6.5). A direct skill run has no extension supervisor and follows the skill's own legal transition rules. Includes `origin_task` (§6.12) — set only on a task an agent filed via `propose-task`, never by the agent itself |
-| `## Request` | Human | Verbatim original ask; immutable |
-| `## Refined` | Refine stage | Free-form |
-| `## Scope` | Refine stage, then human | The contract the develop stage is held to |
-| `## Log` | Agent (append-only) + extension | The receipt channel |
+| Frontmatter (except `title`) | Extension only for extension-supervised runs | The generated prompt explicitly assigns ownership to `RunManager` (§6.5). A direct skill run has no extension supervisor and follows the skill's own legal transition rules. Includes `position` — an optional non-negative numeric order interpreted within the task's current column — and `origin_task` (§6.12), which is set only on a task an agent filed via `propose-task`, never by the agent itself. The board editor preserves all of these fields, including workflow state/status, ordering, run/session metadata, checkpoint, origin metadata, and `scope_hash` |
+| `title` | Human through the board editor; extension serialization | Single-line, non-blank, at most 200 characters. Editing the title does not alter any other frontmatter field |
+| `type` | Human/agent selection through extension serialization | Exactly one canonical value: `feature` or `bug`. Missing or invalid legacy values are read as `feature` and backfilled to disk when the file is loaded; malformed files without valid frontmatter remain in the malformed-file warning instead of becoming tasks |
+| `## Request` | Human through the board editor | Markdown; editable in the selected task's detail modal rather than being an immutable raw-file-only field |
+| `## Refined` | Refine stage or human through the board editor | Markdown free-form content |
+| `## Scope` | Refine stage or human through the board editor | Markdown contract for Develop; a board edit leaves the existing `scope_hash` unchanged so Develop's human-edit detection still applies |
+| `## Log` | Agent (append-only) + extension | Combined audit, receipt, and proposal channel; the board editor never rewrites, removes, or appends log lines |
+
+The detail modal's **Edit task** action is the human-facing editor for the title and the three
+specification sections. Save validates the payload in the extension host, rejects a fresh
+`status: running` task, and writes through `TaskStore`'s temp-file-and-rename atomic path. A
+failed save leaves the editor open and surfaces a visible error; Cancel, close, backdrop
+dismissal, and Escape discard unsaved values. A successful save refreshes the card and detail
+from disk without invoking the state machine, starting or stopping a run, or creating a receipt.
 
 **Correction, found via live testing (2026-08-13):** "agent is never asked to touch it" used to
 be aspirational, not enforced — nothing in the prompt actually said so. A live develop run wrote
@@ -403,6 +413,36 @@ this far: it's caught before a receipt is even looked for, same as any other sta
 
 `task:` is the misroute detector (§6.9): a receipt whose task id disagrees with the file it
 appeared in is rejected rather than accepted as completion.
+
+**Extension audit grammar** — the extension appends its own one-line events beside agent
+receipts and `propose-task` lines. The distinct `audit:` prefix means existing receipt and
+proposal parsers continue to ignore audit entries:
+
+```
+- audit:state-change at:2026-08-17T10:00:00Z task:TASK-142 from:backlog to:refine action:accept note:"State changed from backlog to refine via accept."
+- audit:status-change at:2026-08-17T10:00:01Z task:TASK-142 from:idle to:running action:refine note:"Status changed from idle to running via refine."
+- audit:activity-start at:2026-08-17T10:00:01Z task:TASK-142 stage:refine action:refine run:r7 note:"Started refine activity."
+- audit:activity-finish at:2026-08-17T10:00:12Z task:TASK-142 stage:refine action:receipt run:r7 outcome:ok note:"scope written, 3 files"
+```
+
+Audit timestamps are UTC ISO 8601 values at second precision and always end in `Z`. State is
+the workflow column (`backlog` through `done`); status is the runtime condition (`idle`,
+`running`, `blocked`, or `failed`, with `paused` reserved for the state machine). When one
+mutation changes both, the state-change entry is written before the status-change entry.
+Activity start is written only after a run is admitted and persisted as `running`. Activity
+finish records `ok`, `blocked`, `failed`, `timeout`, executor `error`, `missing-receipt`,
+`stopped`, or `superseded` outcomes. A missing-receipt fallback is marked provisional; a valid
+late receipt appends one explicit, idempotent correction finish rather than another start.
+Reload reconciliation, repeated file-watcher passes, and stale run results use the task/run
+identity to avoid duplicating lifecycle entries.
+
+The extension writes frontmatter changes and the corresponding audit entries through one
+serialized atomic task-store mutation. Agent receipts and proposals can still be appended and
+interleaved normally, and existing task body sections and unrelated frontmatter remain intact.
+Direct human or agent edits to `state` or `status` are intentionally not attributed: a file
+watcher can observe the new value but cannot reliably infer the old value or initiating action.
+Those edits remain supported, but only extension-controlled transitions are guaranteed to have
+audit entries.
 
 ### 6.4 Run lifecycle
 
@@ -1068,14 +1108,17 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `task/select` | `{ taskId }` — open the task detail modal; docks that task's chat too only if `dockChatOnSelect` is on (§6.10) |
 | view → ext | `task/deselect` | `{}` — close the task detail modal (its × button, a backdrop click, or Escape) |
 | view → ext | `task/move` | `{ taskId, destination }` — manually move a card to another workflow column; the extension validates both values |
+| view → ext | `task/reorder` | `{ taskId, column, beforeTaskId }` or `{ taskId, column, targetIndex }` — reorder within the current column; the extension validates the target against the current filesystem projection |
 | view → ext | `board/ready` | Webview mounted, request initial state |
 | view → ext | `action/invoke` | `{ taskId, action: 'accept' \| 'refine' \| ... }` — Refine, Develop, and Validate first dock the task's chat beside the board when `layout.dockChat` is enabled |
-| view → ext | `task/create` | `{ title, description }` — the New Task modal (§6.16); `description` becomes `## Request`, falling back to `title` when left blank |
+| view → ext | `task/create` | `{ title, description, taskType }` — the New Task modal (§6.16); `taskType` is required and must be `feature` or `bug` (the envelope already uses `type` for the message name), while `description` becomes `## Request`, falling back to `title` when left blank |
+| view → ext | `task/edit` | `{ taskId, content: { title, request, refined, scope } }` — host-validated edit of the title and three Markdown specification sections only; rejects malformed payloads, missing targets, and fresh `status: running` tasks |
 | view → ext | `task/open` | `{ taskId }` — opens the markdown file in an editor |
 | view → ext | `task/openChat` | `{ taskId }` — the modal's Open Chat button; docks that task's chat beside the board (§6.10) |
-| ext → view | `gates/state` | `{ gates }` — current value of all four `kanbanPilot.gates.*` settings (§6.15, §6.17) |
-| view → ext | `gates/set` | `{ key, value: 'manual' \| 'auto' }` — a Gates modal switch flip; also re-runs `applyGatePolicies()` immediately (§6.17) |
-| view → ext | `agentName/set` | `{ stage, value }` — the Edit agent name modal's Save (empty `value` resets to default); writes `kanbanPilot.chat.agentNames` (§6.17) |
+| ext → view | `task/editError` | `{ taskId?, error }` — visible save failure shown without closing the editor |
+| ext → view | `settings/state` | `{ gates, agents }` — current values of all four `kanbanPilot.gates.*` settings and the effective assignment for all seven columns (§6.15, §6.17) |
+| view → ext | `gates/set` | `{ key, value: 'manual' \| 'auto' }` — a Settings gate-switch flip; writes workspace scope and re-runs `applyGatePolicies()` immediately (§6.17) |
+| view → ext | `agentName/set` | `{ column, value }` — a Settings assignment Save/Reset; `column` is one of the seven `Column` values and empty `value` removes the override, restoring its default/`None` (§6.17) |
 
 `task/move` is a manual state override, not a state-machine action: a valid cross-column move
 updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
@@ -1083,7 +1126,32 @@ It preserves the task body and unrelated metadata, does not launch a stage or ap
 and clearing `run` makes any late result from the superseded run fail the existing staleness
 guard. Same-column, unknown-task, and invalid-column requests are no-ops. The normal task-file
 watcher may still apply an explicitly configured automatic gate after the write; the move path
-does not invoke that policy itself. Within-column reordering is not supported.
+does not invoke that policy itself. Cross-column moves append the task at the destination
+column's end. Same-column reordering is a separate ordering-only operation: it updates only the
+extension-owned `position` frontmatter field, preserves state/status/run/chat/session metadata,
+body, and unrelated frontmatter, and never invokes stages, gates, receipts, or the state machine.
+The filesystem snapshot remains authoritative after every request, including invalid, stale,
+duplicate, and no-op targets. `beforeTaskId: null` means the end of the column. A keyboard
+fallback uses Arrow Up/Arrow Down on a focused card, and the webview announces the resulting
+position through its visible/live status region while restoring focus to the card.
+
+`position` is optional for backwards compatibility. Valid finite non-negative values sort first;
+missing or malformed values sort afterward by task id, and equal positions also tie-break by
+task id. A successful reorder writes a contiguous zero-based sequence for the affected column,
+normalising legacy and duplicate values. Ordering is scoped to each task-set directory.
+Creation and cross-column manual moves normalise any legacy positions in the destination
+column before assigning the new card its end index, so a newly placed card is never pulled
+ahead of an older unpositioned card.
+
+`task/edit` is intentionally separate from `action/invoke` and `task/move`: it never changes
+workflow state or runtime status, starts or stops a run, docks chat, or appends a receipt. The
+host re-reads the selected task immediately before saving, validates the task id and all four
+editable values, and rejects a current `status: running` even if the webview sends a forged
+message. The title is trimmed and limited to 200 characters; Request, Refined, and Scope remain
+verbatim multiline Markdown. The atomic write changes only the title, those three body sections,
+and `updated`; it preserves the task id, all other frontmatter, `scope_hash`, unrelated body
+content, and every existing Log line. The successful response is represented by the normal
+watcher/board refresh from disk, while Cancel and every modal dismissal path perform no write.
 
 Constraints: strict CSP with nonce, no external network, all styling via `--vscode-*` theme
 tokens so the board tracks the user's theme, full keyboard navigation.
@@ -1121,6 +1189,12 @@ scrolls the board itself (`overflow-x: auto`, unchanged, already correct) rather
 Verified by measuring `document.documentElement.scrollHeight === window.innerHeight` at a
 constrained viewport with an intentionally overstuffed column, not just eyeballed.
 
+Every card also carries a compact, visible text marker for its durable task type: `Feature` or
+`Bug`. The marker is included in the card projection and task-detail payload, is repeated in the
+detail modal, and exposes the full label through its title, ARIA label, and the card's accessible
+name. Solid versus dashed borders provide a secondary non-color cue, but the readable text is
+the source of meaning; distinguishing Feature from Bug never depends on color alone.
+
 ### 6.12 Agent-initiated task creation
 
 Sketched and deferred to v2 as of v1.25 (§3); shipped ad hoc on 2026-08-13, ahead of M4, at the
@@ -1130,8 +1204,12 @@ user's request — not a milestone-sequence change, a scheduling one.
 folding it into the current one, by adding a line to its own `## Log` next to its receipt:
 
 ```
-- propose-task run:{{runId}} title:"Add retry backoff for webhook delivery" note:"discovered during implementation"
+- propose-task run:{{runId}} type:bug title:"Add retry backoff for webhook delivery" note:"discovered during implementation"
 ```
+
+`type:` is optional for compatibility with older agents. When omitted, the child inherits
+the originating task's type. If present, it must be exactly `feature` or `bug`; an invalid
+explicit value is ignored and can never create an untyped child.
 
 Deliberately shaped like the receipt grammar (§6.3) — a `- `-prefixed, regex-matched line,
 tolerant of surrounding prose — and parsed by a sibling module, `chat/proposals.ts`, that mirrors
@@ -1306,7 +1384,12 @@ inconsistency between two components built separately in the prototype itself.
 task writes it as the task's `## Request` — this is what that field *is*, semantically, not new
 surface bolted onto the schema. Left blank, `## Request` falls back to the title, matching the
 old inline row's only behavior exactly, so a quick title-only add still works the same as before.
-`newTaskFile`/`TaskStore.create` moved to an options object (`{ request?, origin?, now? }`) to
+The modal also requires a `Task type` control with exactly two visible choices, `Feature` and
+`Bug`; the selected canonical value is persisted as `type: feature` or `type: bug`. The command
+palette flow presents the same required choice before creating the file. The extension rejects
+creation intents that omit or provide an invalid type rather than silently creating an untyped
+task.
+`newTaskFile`/`TaskStore.create` moved to an options object (`{ type, request?, origin?, now? }`) to
 carry this alongside §6.12's existing `origin` parameter cleanly — both are "what goes in
 `## Request` and why," so they belong on the same call rather than bolted on as a third positional
 parameter. The command-palette equivalent (`kanban-pilot.newTask`) gained a second, optional
@@ -1319,39 +1402,63 @@ rather than letting two backdrops stack if a card happens to be selected when Ne
 clicked. Same three close paths as every other modal in this extension: its own × button, a
 backdrop click, or Escape.
 
-### 6.17 Gates settings and per-stage agent names — the board's own settings surface
+### 6.17 Settings — gates and per-column agent assignments
 
-Shipped 2026-08-14, closing §12 Q10 for good (three passes total — see that entry's own history)
-and giving M5's gate engine (§6.15) a UI to match: two more modals, both reusing the same
-`.new-task-modal` shell as §6.16's, so all four of this extension's modals (task detail, New
-Task, Gates, Edit agent name) read as one component family rather than four separately-designed
-surfaces.
+The board header exposes one **Settings** button, replacing the former Gates-only entry point.
+It opens one accessible, keyboard-operable modal using the same surface family as the task
+detail and New Task dialogs. The modal is a two-pane settings workspace: a category sidebar
+on the left lists **Automation gates** and **Agent assignments**, while the main pane shows
+the controls for exactly one selected category. Opening from the header predictably selects
+Automation gates; opening from a column's Agent pencil selects Agent assignments and focuses
+and selects that column's input. The two categories contain the four automation gates from
+§6.15 and seven editable Agent assignment rows, one for every workflow column:
 
-**Gates modal.** A new header button, gear icon, next to New Task. Lists the same four gates
-§6.15 defined as toggle switches (`manual`/`auto`), each writing straight to its
-`kanbanPilot.gates.*` setting the instant it's flipped — no Save button, a switch *is* the
-commit. Flipping one to `auto` also calls `RunManager.applyGatePolicies()` immediately, rather
-than waiting for the next file change to trigger the store watcher's sweep: turning a gate on
-should act on whatever's already sitting idle right then, not on the next unrelated edit.
+| Column | Default | Runtime meaning |
+| --- | --- | --- |
+| Backlog | `None` | Resting label only; never dispatches a run |
+| Refine | `Bro Refiner` | Persona for Refine prompts |
+| Scoped | `None` | Resting label only; never dispatches a run |
+| Approved | `None` | Resting label only; never dispatches a run |
+| In Progress | `Bro Coder` | Persona for Develop/Continue prompts |
+| Validation | `Bro QA` | Persona for Validate prompts |
+| Done | `None` | Resting label only; never dispatches a run |
 
-**Edit agent name modal.** The column-header pencil (§5.3) is real now, on the three columns
-that have a stage behind them — clicking it opens a small form pre-filled with the column's
-current resolved name (selected, ready to overwrite), a **Reset to default** action, Cancel, and
-Save. Save posts `{ stage, value }`; the extension reads the current `kanbanPilot.chat.agentNames`
-object (a sparse per-stage map, empty by default), sets or deletes that one key, and writes the
-whole object back. Reset posts an empty value, which the same delete-on-empty logic treats
-identically to backspacing the field to nothing and saving — one code path, not two.
+**Gate controls.** The four switches are `manual`/`auto` and write the existing
+`kanbanPilot.gates.*` setting at workspace scope as soon as they change. Switching one to
+`auto` also calls `RunManager.applyGatePolicies()` immediately, so eligible idle tasks already
+on the board are considered without waiting for another file change. The setting ids and
+defaults remain those defined in §6.15.
 
-**Both close the loop the same way `store.watch` already does for disk (G5):**
-`vscode.workspace.onDidChangeConfiguration` re-pushes `gates/state` or `board/state`
-(re-resolving every column's agent name) whenever `kanbanPilot.gates` or
-`kanbanPilot.chat.agentNames` changes — including a user hand-editing `settings.json` directly,
-not only clicks through these modals. Config is authoritative the same way the task folder is;
-the UI is a projection of it, not the other way around.
+**Agent assignments.** Each row is pre-filled with its effective label and has Save and Reset
+actions. Save posts `{ column, value }`; the extension reads the current sparse
+`kanbanPilot.chat.agentNames` object, trims the value, writes the column key, and persists the
+whole object at workspace scope. Reset posts an empty value, deleting the column override and
+restoring the documented default or `None`. The three runnable column keys are `refine`,
+`in-progress`, and `validation`; `RunManager` resolves them immediately before prompt injection
+for Refine, Develop/Continue, and Validate. `split` maps to the Refine column and therefore
+inherits its assignment. The four resting-column assignments are stored/displayed labels only;
+they have no stage mapping and cannot launch a chat run by themselves.
 
-**All four modals are mutually exclusive.** Opening any one closes whichever of the other three
-was open, rather than letting backdrops stack — the same rule §6.16 established for New Task and
-the task detail modal, extended to cover Gates and Edit agent name too.
+Existing stage-key settings remain compatible: legacy `refine`, `develop`, and `validate` values
+are used as fallbacks when their new column key is absent, while a new column key takes
+precedence. Blank or whitespace-only values are treated as reset. This preserves existing
+workspace settings without migration and keeps the board badge and prompt `@name` sourced from
+the same resolver.
+
+**Configuration is authoritative.** `vscode.workspace.onDidChangeConfiguration` re-pushes both
+`board/state` and `settings/state`, re-resolving every badge and assignment, whenever
+`kanbanPilot.gates` or `kanbanPilot.chat.agentNames` changes. A direct `settings.json` edit is
+therefore reflected just like a Settings interaction; the webview never becomes the source of
+truth.
+
+**Shared modal behavior.** The Settings modal, New Task modal, and task detail modal are
+mutually exclusive. Opening one closes the others. Settings supports the close button,
+backdrop click, and Escape. Its category sidebar uses active and visible-focus semantics,
+supports keyboard selection, and keeps inactive-panel controls out of the contained Tab loop;
+the gate switches, text fields, Save/Reset buttons, and focused column-header pencil remain
+keyboard-operable. The desktop layout uses a sidebar beside the main pane and adapts to a
+stacked, wrapping arrangement at narrow webview widths so category labels and settings
+controls remain usable without clipping.
 
 ---
 
@@ -1373,7 +1480,7 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.refine.toolsInclude` | `string[]` | `[]` | Optional allowlist for refine's tools. Empty means no restriction — verify real tool ids via the Configure Tools picker before setting this, since an allowlist missing a file-edit tool blocks refine from writing its own output |
 | `kanbanPilot.chat.toolsExclude` | `string[]` | `["memory","resolveMemoryFileUri"]` | Tools denied on **every** injection, every stage — the R12 mitigation (§6.8 layer 0). Not user-facing hardening; this is a correctness requirement and ships non-empty by default |
 | `kanbanPilot.chat.modelSelector` | `object` | `{}` | Optional `{id, vendor}` to pin a model per run |
-| `kanbanPilot.chat.agentNames` | `object` | `{}` | Per-stage persona overrides (`{refine, develop, validate}`) for the `@name` a prompt opens with — `split` reuses `refine`'s. Missing/empty keys fall back to the built-in defaults (Bro Refiner / Bro Coder / Bro QA). Editable from the board via each agent column's edit-pencil (§6.17) |
+| `kanbanPilot.chat.agentNames` | `object` | `{}` | Sparse per-column assignment labels for `backlog`, `refine`, `scoped`, `approved`, `in-progress`, `validation`, and `done`. Resting columns default to `None`; runnable columns default to Bro Refiner / Bro Coder / Bro QA, and `split` reuses Refine. Legacy `refine`/`develop`/`validate` keys remain supported as fallbacks. Editable from the combined Settings surface (§6.17) |
 | `kanbanPilot.run.timeoutMinutes` | `number` | `20` | Run marked `failed` after this |
 | `kanbanPilot.run.maxParallelTasks` | `number` | `1` | Maximum active Refine, Split, Develop/Continue, and Validate runs. Invalid, non-positive, or non-integer values normalize to `1`; values above one permit concurrent same-workspace edits without worktree isolation |
 | `kanbanPilot.develop.checkpoint` | `commit \| stash \| none` | `commit` | Pre-develop working-tree snapshot |
@@ -1504,7 +1611,7 @@ additive.
 | **M2** | Manual board | ✅ Done, visually confirmed | New Task; all human transitions (§5, §5.2, §12 Q3 resolved); card actions per §5.2, exhaustively tested; card detail pane; palette commands; delete-with-confirmation; visuals matched to the live prototype, 7 columns (§13); `openBoard` and `spike.seedSampleTasks` confirmed working in the dev host; no agent yet — 35 tests passing |
 | **M3** | All three agent stages, no safety net yet | ✅ **Done, verified live** | *Grew past "refine stage" mid-milestone* (see note below the table). Prompt templates for refine/develop/validate (§6.5); `ChatSessionExecutor` with per-task session binding (§6.6, §6.9's narrow-window protocol); chat dockable beside the board via an explicit Open Chat action (§6.10); receipt detection + `task:` mismatch rejection (§6.9); timeout; `markRunComplete`; activation reconciliation (§6.4); automatic misroute detection via `copilot_session_id` (§6.9); `resetOnApprove` (§6.8 layer 1, now default-off); 71 tests passing. **Backlog → Done confirmed live end to end** (2026-08-13) against a real Copilot host — refine, develop, and validate each ran, wrote a well-formed receipt, and advanced the card correctly, closing with a clean `result:ok` on Done. Three real bugs found and fixed along the way: refine's tools allowlist silently blocking all file edits (§6.6), the webview's markdown renderer breaking board rendering entirely via a template-literal escaping bug (§6.11), and the agent writing invalid values into frontmatter it was never told not to touch (§6.3) |
 | **M4** | Develop safety net | ⬜ **Not started — skipped ahead of M5 at the user's request** | Checkpointing; `revertToCheckpoint`; single-slot *enforcement* (currently only a UI expectation — §8.4). `gates.approvedToInProgress`'s `auto` mode (M5) now depends on this gap more than a purely manual workflow ever did — see §6.15 |
-| **M5** | Gates | ✅ **Done** | Four `manual \| auto` settings, one per human gate (§6.15); `RunManager.applyGatePolicies()` fires the same `handleAction` a click would, swept on activation and on every store change; retries never auto-fire regardless of policy; a hand-rolled single-slot check stands in for M4's real enforcement under `approvedToInProgress` specifically. Board-side settings UI followed (§6.17): a Gates modal with a switch per policy, plus per-stage agent name editing closing §12 Q10 for good — 106 tests passing |
+| **M5** | Gates and Settings | ✅ **Done** | Four `manual \| auto` settings, one per human gate (§6.15); `RunManager.applyGatePolicies()` fires the same `handleAction` a click would, swept on activation and on every store change; retries never auto-fire regardless of policy; a hand-rolled single-slot check stands in for M4's real enforcement under `approvedToInProgress` specifically. Board-side Settings UI (§6.17) combines the gate switches with seven column assignments, legacy-compatible prompt resolution, workspace persistence, direct configuration refresh, and resting-column display labels |
 | **M6** | Polish | ⬜ Not started | Panel serialization, theming, keyboard nav, a11y pass, empty states, README/demo |
 
 **Status legend:** ⬜ Not started · 🟡 In progress · ✅ Done · ⛔ Blocked (see Risks)
@@ -1807,11 +1914,10 @@ are fully implemented but surface in the task detail modal instead (§6.11).
   *target* changes.
 - **Delete requires confirmation** (`vscode.window.showWarningMessage` with `modal: true`) that
   the prototype's single-click "×" doesn't have — deleting a task file has no in-app undo.
-- **The Edit Agent pencil is interactive as of §6.17** on the three agent columns
-  (refine/in-progress/validation) — rendered at the prototype's exact size/position/color, and
-  now wired to a real edit modal, closing §12 Q10. Still inert on the four columns with no stage
-  behind them (`title="Per-column agent assignment is not configurable yet"`), since there's
-  nothing there to rename.
+- **The Agent pencil is interactive as of §6.17** on all seven columns — rendered at the
+  prototype's exact size/position/color, and routed to the combined Settings surface with the
+  selected column focused. Resting-column assignments are intentionally labels only; they remain
+  editable for display and never dispatch a run.
 - **`IBM Plex Mono` is not bundled.** The webview's CSP forbids remote font loading, so the
   agent-name font stack falls back to `var(--vscode-editor-font-family)` / system monospace when
   the font isn't locally installed — visually close (both are monospace grotesques) but not a

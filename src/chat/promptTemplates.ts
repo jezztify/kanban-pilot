@@ -38,7 +38,9 @@ import { Stage } from './receipt';
  *
  * Develop and validate additionally document `propose-task` (§6.12), the
  * optional follow-up-filing line — refine's own template omits it, since
- * refine is scoping the current ticket, not surfacing new ones.
+ * refine is scoping the current ticket, not surfacing new ones. A proposal
+ * may include `type:feature` or `type:bug`; omitting `type:` inherits the
+ * parent task's type, and any other value is invalid.
  *
  * `split` (§6.14) is the odd one out structurally: it's the one place
  * `propose-task` is the *primary* completion path rather than an optional
@@ -90,6 +92,14 @@ anything. Then:
    \`## Refined\`.
 2. Write a concrete implementation checklist under \`## Scope\` — the specific
    files or changes involved, as a list a developer could work through.
+3. Under \`## Refined\`, record an unambiguous split recommendation:
+	write either \`Split recommendation: YES\` or \`Split recommendation: NO\`
+	about whether this task should be split into smaller independent tasks.
+	Include a concise rationale in either case. For \`YES\`, also list proposed
+	independent task boundaries; for \`NO\`, state concisely why one task is
+	sufficient. This recommendation is advisory only: do not create child task
+	files, add \`propose-task\` lines, invoke the separate \`split\` action, or do
+	implementation work.
 
 Do not write or edit any code. This stage is scoping only.
 
@@ -159,7 +169,10 @@ conflict with that and confuse the board.
 If you noticed clearly out-of-scope follow-up work along the way — not
 something to do now, but worth not losing — file it as its own task instead of
 expanding this one. Add up to a few lines like this to the same \`## Log\`:
-- propose-task run:{{runId}} title:"<short title>" note:"<why this is separate, one line>"
+- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
+The \`type:\` field is optional for compatibility: omit it to inherit this
+parent task's type. Use only \`feature\` or \`bug\`; do not file an invalid
+or otherwise untyped child.
 Only do this for concrete, actionable follow-ups you actually noticed while
 working, not speculative ideas or things already covered by Scope.
 `;
@@ -207,7 +220,10 @@ conflict with that and confuse the board.
 If checking turned up clearly out-of-scope follow-up work — not a reason to
 fail this check, but worth not losing — file it as its own task instead of
 folding it in here. Add up to a few lines like this to the same \`## Log\`:
-- propose-task run:{{runId}} title:"<short title>" note:"<why this is separate, one line>"
+- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
+The \`type:\` field is optional for compatibility: omit it to inherit this
+parent task's type. Use only \`feature\` or \`bug\`; do not file an invalid
+or otherwise untyped child.
 Only do this for concrete, actionable follow-ups you actually noticed while
 checking, not speculative ideas.
 `;
@@ -251,6 +267,9 @@ added to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
 - propose-task run:{{runId}} title:"<short title>" note:"<what this piece covers>"
 Then append this line after them:
 - run:{{runId}} task:{{id}} stage:split result:ok note:"split into N tasks: <short list>"
+Each proposal may include \`type:feature\` or \`type:bug\`; omit \`type:\` to
+inherit this parent task's type. Invalid type values are not proposals and
+must not be used.
 This task becomes tracking-only once split — do not also give it an
 implementation Scope, and do not implement anything yourself here.
 

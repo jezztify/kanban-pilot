@@ -47,17 +47,38 @@ export const WORKING_COLUMNS: ReadonlySet<Column> = new Set<Column>(['refine', '
 export const STATUSES = ['idle', 'running', 'paused', 'blocked', 'failed'] as const;
 export type Status = (typeof STATUSES)[number];
 
+/** The only durable classifications a task may have. */
+export const TASK_TYPES = ['feature', 'bug'] as const;
+export type TaskType = (typeof TASK_TYPES)[number];
+
+export const TASK_TYPE_LABELS: Record<TaskType, string> = {
+	feature: 'Feature',
+	bug: 'Bug',
+};
+
+export function isTaskType(value: unknown): value is TaskType {
+	return typeof value === 'string' && (TASK_TYPES as readonly string[]).includes(value);
+}
+
+/** Missing and invalid legacy values are intentionally normalised to Feature. */
+export function normalizeTaskType(value: unknown): TaskType {
+	return isTaskType(value) ? value : 'feature';
+}
+
 export interface Task {
 	/** Stable workspace-local task-set identity; legacy files resolve to Default. */
 	setId: string;
 	id: string;
 	title: string;
+	type: TaskType;
 	state: Column;
 	status: Status;
 	created?: string;
 	updated?: string;
 	/** Active run id, or undefined when idle. */
 	run?: string;
+	/** Optional within-column ordering position owned by the extension. */
+	position?: number;
 	/** Derived chat session id (§6.7). */
 	chat?: string;
 	/**
@@ -80,6 +101,17 @@ export interface Task {
 	body: string;
 }
 
+/** User-editable task content exposed by the board detail editor. */
+export interface EditableTaskContent {
+	title: string;
+	request: string;
+	refined: string;
+	scope: string;
+}
+
+/** The same title limit used by the New Task webview input. */
+export const TASK_TITLE_MAX_LENGTH = 200;
+
 export interface ParsedFile {
 	frontmatter: Record<string, string>;
 	body: string;
@@ -88,6 +120,25 @@ export interface ParsedFile {
 }
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
+
+function parseFrontmatterValue(rawValue: string): string {
+	const trimmed = rawValue.trim();
+	const doubleQuoted = /^"((?:\\.|[^"\\])*)"(?:\s+#.*)?$/.exec(trimmed);
+	if (doubleQuoted) {
+		try {
+			return JSON.parse(`"${doubleQuoted[1]}"`);
+		} catch {
+			return doubleQuoted[1];
+		}
+	}
+
+	const singleQuoted = /^'((?:''|[^'])*)'(?:\s+#.*)?$/.exec(trimmed);
+	if (singleQuoted) {
+		return singleQuoted[1].replace(/''/g, "'");
+	}
+
+	return trimmed.replace(/\s+#.*$/, '').trim();
+}
 
 export function parseFile(raw: string): ParsedFile {
 	const match = FRONTMATTER.exec(raw);
@@ -106,14 +157,9 @@ export function parseFile(raw: string): ParsedFile {
 			continue;
 		}
 		const key = trimmed.slice(0, colon).trim();
-		// Strip trailing ` # comment`, then surrounding quotes.
-		let value = trimmed.slice(colon + 1).replace(/\s+#.*$/, '').trim();
-		if (
-			(value.startsWith('"') && value.endsWith('"')) ||
-			(value.startsWith("'") && value.endsWith("'"))
-		) {
-			value = value.slice(1, -1);
-		}
+		// Support quoted values before stripping trailing ` # comments`, so a
+		// title such as `Fix #123` survives a serialize/parse round trip.
+		const value = parseFrontmatterValue(trimmed.slice(colon + 1));
 		frontmatter[key] = value;
 	}
 
@@ -137,6 +183,20 @@ function isColumn(value: string): value is Column {
 
 function isStatus(value: string): value is Status {
 	return (STATUSES as readonly string[]).includes(value);
+}
+
+/** Positions are non-negative finite numbers; missing/invalid values use the legacy fallback order. */
+export function isValidTaskPosition(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function parseTaskPosition(value: string | undefined): number | undefined {
+	if (!value?.trim()) {
+		return undefined;
+	}
+
+	const parsed = Number(value);
+	return isValidTaskPosition(parsed) ? parsed : undefined;
 }
 
 /**
@@ -163,11 +223,13 @@ export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default')
 		setId,
 		id,
 		title: frontmatter.title || id,
+		type: normalizeTaskType(frontmatter.type),
 		state: state && isColumn(state) ? state : 'backlog',
 		status: status && isStatus(status) ? status : 'idle',
 		created: frontmatter.created || undefined,
 		updated: frontmatter.updated || undefined,
 		run: frontmatter.run && frontmatter.run !== 'null' ? frontmatter.run : undefined,
+		position: parseTaskPosition(frontmatter.position),
 		chat: frontmatter.chat || undefined,
 		copilotSessionId: frontmatter.copilot_session_id || undefined,
 		scopeHash: frontmatter.scope_hash || undefined,
@@ -183,8 +245,10 @@ export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default')
 const KEY_ORDER = [
 	'id',
 	'title',
+	'type',
 	'state',
 	'status',
+	'position',
 	'created',
 	'updated',
 	'run',
@@ -201,8 +265,16 @@ function serializeFrontmatter(frontmatter: Record<string, string>): string {
 		...KEY_ORDER.filter((k) => k in frontmatter),
 		...Object.keys(frontmatter).filter((k) => !KEY_ORDER.includes(k)),
 	];
-	const lines = keys.map((k) => `${k}: ${frontmatter[k]}`);
+	const lines = keys.map((k) => `${k}: ${serializeFrontmatterValue(frontmatter[k])}`);
 	return `---\n${lines.join('\n')}\n---\n`;
+}
+
+function serializeFrontmatterValue(value: string): string {
+	const needsQuoting =
+		value !== value.trim() ||
+		/\s+#/.test(value) ||
+		/^['"]|['"]$/.test(value);
+	return needsQuoting ? JSON.stringify(value) : value;
 }
 
 /**
@@ -221,6 +293,115 @@ export function updateFrontmatter(raw: string, updates: Record<string, string | 
 	}
 
 	return serializeFrontmatter(frontmatter) + body;
+}
+
+const EDITABLE_SECTION_NAMES = ['Request', 'Refined', 'Scope'] as const;
+type EditableSectionName = (typeof EDITABLE_SECTION_NAMES)[number];
+
+/** Validates and normalizes the content accepted by the task editor. */
+export function normalizeEditableTaskContent(value: unknown): EditableTaskContent {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error('Task edit payload must contain title, Request, Refined, and Scope text.');
+	}
+
+	const candidate = value as Record<string, unknown>;
+	if (
+		typeof candidate.title !== 'string' ||
+		typeof candidate.request !== 'string' ||
+		typeof candidate.refined !== 'string' ||
+		typeof candidate.scope !== 'string'
+	) {
+		throw new Error('Task edit payload must contain title, Request, Refined, and Scope text.');
+	}
+
+	const title = candidate.title.trim();
+	if (!title) {
+		throw new Error('Task title cannot be blank.');
+	}
+	if (title.length > TASK_TITLE_MAX_LENGTH) {
+		throw new Error(`Task title must be ${TASK_TITLE_MAX_LENGTH} characters or fewer.`);
+	}
+	if (/[\r\n]/.test(title)) {
+		throw new Error('Task title cannot contain line breaks.');
+	}
+
+	return {
+		title,
+		request: candidate.request,
+		refined: candidate.refined,
+		scope: candidate.scope,
+	};
+}
+
+function replaceEditableSection(
+	segment: string,
+	value: string,
+	newline: string,
+	hasNextHeading: boolean,
+): string {
+	const leading = /^(?:\r\n|\n)/.exec(segment)?.[0] ?? newline;
+	const trailing = /(?:(?:\r\n)|\n)+$/.exec(segment)?.[0] ?? (hasNextHeading ? newline : '');
+	return leading + value + trailing;
+}
+
+/**
+ * Rewrites the title and the three editable body sections while leaving every
+ * other body section, including the append-only Log, untouched.
+ */
+export function updateEditableTaskContent(raw: string, value: unknown): string {
+	const content = normalizeEditableTaskContent(value);
+	const parsed = parseFile(raw);
+	if (parsed.malformed) {
+		throw new Error('Cannot edit a task file without valid frontmatter.');
+	}
+
+	const newline = parsed.body.includes('\r\n') ? '\r\n' : '\n';
+	const headingPattern = /^##[ \t]+([^\r\n]+?)[ \t]*\r?$/gm;
+	const headings = [...parsed.body.matchAll(headingPattern)];
+	const replacements: Record<EditableSectionName, string> = {
+		Request: content.request,
+		Refined: content.refined,
+		Scope: content.scope,
+	};
+	const found = new Set<EditableSectionName>();
+	let body = '';
+	let cursor = 0;
+
+	for (let index = 0; index < headings.length; index++) {
+		const heading = headings[index];
+		const start = heading.index ?? cursor;
+		const headingEnd = start + heading[0].length;
+		const end = headings[index + 1]?.index ?? parsed.body.length;
+		const name = heading[1].trim() as EditableSectionName;
+		body += parsed.body.slice(cursor, headingEnd);
+		if (Object.prototype.hasOwnProperty.call(replacements, name)) {
+			body += replaceEditableSection(parsed.body.slice(headingEnd, end), replacements[name], newline, end < parsed.body.length);
+			found.add(name);
+		} else {
+			body += parsed.body.slice(headingEnd, end);
+		}
+		cursor = end;
+	}
+	body += parsed.body.slice(cursor);
+
+	const missing = EDITABLE_SECTION_NAMES.filter((name) => !found.has(name));
+	if (missing.length) {
+		const sections = missing
+			.map((name) => `## ${name}${newline}${replacements[name]}`)
+			.join(`${newline}${newline}`);
+		const logHeading = /^##[ \t]+Log[ \t]*\r?$/m.exec(body);
+		if (logHeading?.index !== undefined) {
+			const before = body.slice(0, logHeading.index);
+			const after = body.slice(logHeading.index);
+			const separator = before.endsWith(newline) ? newline : `${newline}${newline}`;
+			body = `${before}${separator}${sections}${newline}${newline}${after}`;
+		} else {
+			const separator = body.endsWith(newline) ? newline : `${newline}${newline}`;
+			body = `${body}${separator}${sections}${newline}`;
+		}
+	}
+
+	return serializeFrontmatter({ ...parsed.frontmatter, title: content.title }) + body;
 }
 
 /**
@@ -257,21 +438,37 @@ export interface TaskOrigin {
 }
 
 export interface NewTaskOptions {
+	/** Canonical task classification; legacy callers resolve to Feature. */
+	type?: TaskType;
 	/** The human-typed description (§6.16's New Task modal); falls back to the title if blank. Ignored when `origin` is set. */
 	request?: string;
 	origin?: TaskOrigin;
+	/** Extension-owned initial within-column position, normally supplied by TaskStore. */
+	position?: number;
 	now?: Date;
 }
 
 /** Renders a brand-new task file (§6.3, §6.12, §6.16). */
-export function newTaskFile(id: string, title: string, options: NewTaskOptions = {}): string {
-	const { request, origin, now = new Date() } = options;
+export function newTaskFile(id: string, title: string, options?: NewTaskOptions): string;
+export function newTaskFile(id: string, title: string, type: TaskType, options?: NewTaskOptions): string;
+export function newTaskFile(
+	id: string,
+	title: string,
+	typeOrOptions: TaskType | NewTaskOptions = {},
+	suppliedOptions: NewTaskOptions = {},
+): string {
+	const options = typeof typeOrOptions === 'string'
+		? { ...suppliedOptions, type: typeOrOptions }
+		: typeOrOptions;
+	const { request, origin, position, now = new Date() } = options;
 	const stamp = now.toISOString().replace(/\.\d{3}Z$/, 'Z');
 	const frontmatter = serializeFrontmatter({
 		id,
 		title,
+		type: normalizeTaskType(options.type),
 		state: 'backlog',
 		status: 'idle',
+		...(isValidTaskPosition(position) ? { position: String(position) } : {}),
 		created: stamp,
 		updated: stamp,
 		chat_reset_required: 'false',
