@@ -153,7 +153,18 @@ state.
 ### Let agents file follow-up work
 
 While developing or validating, an agent can propose follow-up tasks. Those show up as new backlog
-cards, inheriting the parent's Feature/Bug type unless the proposal says otherwise.
+cards in the **active task set**, inheriting the parent's Feature/Bug type unless the proposal says
+otherwise. The proposal line belongs in the attached parent task file, so named sets never leak
+children into the legacy Default folder.
+
+The built-in prompts ask the agent to write proposals before the receipt, but the extension also
+handles older prompt files and out-of-order filesystem writes. If a receipt lands first, a bounded
+post-receipt recovery window plus the task-file watcher and next activation pass re-check the
+settled Develop/Validate run and create any valid same-run proposals. Repeated passes are safe: the
+parent outcome is not replayed and each proposal's provenance prevents duplicate children. Invalid,
+foreign, Refine, over-cap, or setting-disabled proposals remain inert. This optional follow-up
+path is separate from **Split**, where child proposals are mandatory and successful persistence is
+required before the parent becomes a tracking card.
 
 ### Tune it in Settings
 
@@ -199,6 +210,36 @@ finished run holding a pending outcome doesn't occupy a slot.
 
 Each task is one Markdown file: a bit of frontmatter (id, type, column, status) plus **Request**,
 **Refined**, **Scope**, and an append-only **Log**.
+
+### Attach images to a task
+
+The **New Task** and **Edit task** dialogs accept one or more PNG, JPEG, GIF, or WebP images up to
+10 MiB each. Use **Attach image** to choose files, or paste an image into the focused Description,
+Request, Refined, or Scope field. Each image is previewed immediately, inserted at the caret, and
+can be removed before saving. Ordinary text paste is unchanged.
+
+Images are durable task-owned files, not data embedded in frontmatter or the log. For example:
+
+```
+.kanban-pilot/tasks/
+├─ TASK-009.md
+└─ TASK-009.attachments/
+   └─ browser-screenshot.png
+```
+
+The Markdown section contains a relative link such as
+`![browser-screenshot](TASK-009.attachments/browser-screenshot.png)`. Named task sets use the
+same layout under `.kanban-pilot/task-sets/<id>/tasks`, so attachments never cross task sets.
+The extension validates MIME type, magic bytes, size, and generated safe names before an atomic
+save; SVG, remote images, raw HTML, arbitrary filesystem paths, and invalid or missing assets are
+not rendered as local images. Cancel, Escape, backdrop dismissal, and failed saves leave staged
+files untouched. Deleting a task removes only its own attachment directory, while legacy and
+text-only tasks remain compatible.
+
+Refine, Develop, Continue, and Validate attach the task Markdown first and its referenced images
+in Markdown order. Agents are told to treat those images as read-only task context unless the
+task Scope explicitly permits modifying them. If automatic chat injection is unavailable, the
+existing clipboard fallback remains text-only.
 
 ### The activity log
 

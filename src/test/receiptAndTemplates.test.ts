@@ -20,6 +20,7 @@ function baseVars(overrides: Partial<TemplateVars> = {}): TemplateVars {
 		request: '',
 		refined: '',
 		scope: '',
+		taskFilePath: '/workspace/.kanban-pilot/task-sets/set-mobile/tasks/TASK-142.md',
 		scopeEdited: false,
 		...overrides,
 	};
@@ -301,6 +302,23 @@ suite('M3 prompt templates', () => {
 			assert.ok(template.includes('stage:validate result:blocked'));
 			assert.ok(template.includes('cannot determine pass or fail'));
 			assert.ok(template.includes('This is a verdict, not a run error'));
+		} finally {
+			await dispose();
+		}
+	});
+
+	test('develop and validate templates use the active task file and order proposals before receipts', async () => {
+		const { folder, dispose } = await tempFolder();
+		try {
+			for (const stage of ['develop', 'validate'] as const) {
+				const template = await loadPromptTemplate(folder, stage);
+				const proposalIndex = template.indexOf('propose-task run:{{runId}}');
+				const receiptIndex = template.indexOf(`stage:${stage} result:`);
+
+				assert.ok(proposalIndex >= 0 && proposalIndex < receiptIndex, `${stage}: proposals must be written before the receipt`);
+				assert.ok(template.includes('{{taskFilePath}}'), `${stage}: must target the active task file`);
+				assert.ok(!template.includes('.kanban-pilot/tasks/{{id}}.md'), `${stage}: must not hard-code the Default task folder`);
+			}
 		} finally {
 			await dispose();
 		}

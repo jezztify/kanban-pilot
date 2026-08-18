@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 
-import { resolveToolsInclude, taskChatOpenOptions } from '../chat/executor';
+import { orderedTaskChatAttachments, resolveToolsInclude, taskChatOpenOptions } from '../chat/executor';
 
 /** M3 — refine's tools allowlist is opt-in, not on by default (PRD §6.6, §6.8). */
 
@@ -32,5 +32,20 @@ suite('task chat open options', () => {
 
 	test('disabling docking preserves the existing focused-session open behavior', () => {
 		assert.deepStrictEqual(taskChatOpenOptions(false), { preserveFocus: false });
+	});
+});
+
+suite('task chat attachment ordering', () => {
+	test('keeps the Markdown task file first and appends images in reference order', () => {
+		const task = vscode.Uri.file('C:/tasks/TASK-9.md');
+		const first = vscode.Uri.file('C:/tasks/TASK-9.attachments/first.png');
+		const second = vscode.Uri.file('C:/tasks/TASK-9.attachments/second.webp');
+
+		assert.deepStrictEqual(orderedTaskChatAttachments(task, [first, second]), [task, first, second]);
+	});
+
+	test('text-only runs retain a single Markdown attachment', () => {
+		const task = vscode.Uri.file('C:/tasks/TASK-9.md');
+		assert.deepStrictEqual(orderedTaskChatAttachments(task), [task]);
 	});
 });

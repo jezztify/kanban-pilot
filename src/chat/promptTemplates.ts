@@ -62,6 +62,8 @@ export interface TemplateVars {
 	request: string;
 	refined: string;
 	scope: string;
+	/** Absolute path of the active task file attached to this chat run. */
+	taskFilePath: string;
 	/** Only meaningful at the develop boundary — did a human edit the scope after refine wrote it? (§6.8) */
 	scopeEdited: boolean;
 }
@@ -78,11 +80,19 @@ scope_hash) or immutable task sections; RunManager applies the state transition
 after it reconciles the receipt.
 `;
 
+export const TASK_ATTACHMENT_CONTEXT = `
+The attached task Markdown file is the authoritative task input. Any image files
+attached after it are also task input and read-only context: inspect them when
+useful, but do not modify, rename, or delete them unless the task's Scope
+explicitly permits that work.
+`;
+
 const DEFAULT_REFINE_TEMPLATE = `@{{agentName}}
 ## [{{projectName}} {{id}}]
 # {{title}}
 
 ${EXTENSION_SUPERVISED_CONTEXT}
+${TASK_ATTACHMENT_CONTEXT}
 
 Refine this ticket to understand more from the user. Read the request below
 and make sure you understand what's actually being asked before writing
@@ -130,6 +140,7 @@ const DEFAULT_DEVELOP_TEMPLATE = `@{{agentName}}
 # {{title}}
 
 ${EXTENSION_SUPERVISED_CONTEXT}
+${TASK_ATTACHMENT_CONTEXT}
 
 Implement this task.
 {{#scopeEdited}}
@@ -148,9 +159,23 @@ something outside it blocks you, stop and report it rather than improvising.
 {{scope}}
 
 ## On Completion
+If you noticed clearly out-of-scope follow-up work along the way — not
+something to do now, but worth not losing — file it as its own task instead of
+expanding this one. Add up to a few lines to the Log section of the attached
+active task file at {{taskFilePath}}. The file is already attached to this
+chat; do not construct a path or write to a hard-coded .kanban-pilot/tasks
+directory. Save every proposal line before writing the receipt so RunManager
+can reconcile proposals written in the same turn:
+- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
+The type: field is optional for compatibility: omit it to inherit this
+parent task's type. Use only feature or bug; do not file an invalid or
+otherwise untyped child.
+Only do this for concrete, actionable follow-ups you actually noticed while
+working, not speculative ideas or things already covered by Scope.
+
 ### Completion
 After completing the implementation work, append this line to the \`## Log\`
-section of \`.kanban-pilot/tasks/{{id}}.md\`:
+section of the attached active task file at {{taskFilePath}}:
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
 ### Non-completion
 If you cannot complete the implementation because a dependency, decision,
@@ -165,16 +190,6 @@ block at the top (its \`state\`/\`status\` fields included), and not \`## Reques
 \`## Refined\`, or \`## Scope\`. The extension owns the frontmatter and moves the
 card on its own once it sees your \`## Log\` line; editing it yourself will
 conflict with that and confuse the board.
-
-If you noticed clearly out-of-scope follow-up work along the way — not
-something to do now, but worth not losing — file it as its own task instead of
-expanding this one. Add up to a few lines like this to the same \`## Log\`:
-- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
-The \`type:\` field is optional for compatibility: omit it to inherit this
-parent task's type. Use only \`feature\` or \`bug\`; do not file an invalid
-or otherwise untyped child.
-Only do this for concrete, actionable follow-ups you actually noticed while
-working, not speculative ideas or things already covered by Scope.
 `;
 
 const DEFAULT_VALIDATE_TEMPLATE = `@{{agentName}}
@@ -182,6 +197,7 @@ const DEFAULT_VALIDATE_TEMPLATE = `@{{agentName}}
 # {{title}}
 
 ${EXTENSION_SUPERVISED_CONTEXT}
+${TASK_ATTACHMENT_CONTEXT}
 
 Validate this task's acceptance criteria. Review the implementation below
 against them — read the actual code, and run tests if any exist for the area
@@ -195,10 +211,24 @@ you're checking. Do not fix anything yourself; only report whether it passes.
 {{scope}}
 
 ## On Completion
+If checking turned up clearly out-of-scope follow-up work — not a reason to
+fail this check, but worth not losing — file it as its own task instead of
+folding it in here. Add up to a few lines to the Log section of the attached
+active task file at {{taskFilePath}}. The file is already attached to this
+chat; do not construct a path or write to a hard-coded .kanban-pilot/tasks
+directory. Save every proposal line before writing the receipt so RunManager
+can reconcile proposals written in the same turn:
+- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
+The type: field is optional for compatibility: omit it to inherit this
+parent task's type. Use only feature or bug; do not file an invalid or
+otherwise untyped child.
+Only do this for concrete, actionable follow-ups you actually noticed while
+checking, not speculative ideas.
+
 ### Completion
 When validation reaches a pass/fail verdict, append exactly one of these
 completion lines to the \`## Log\` section of
-\`.kanban-pilot/tasks/{{id}}.md\`:
+the attached active task file at {{taskFilePath}}, after any proposal lines:
 - run:{{runId}} task:{{id}} stage:validate result:ok note:"<what you checked>"
   — the criteria are met.
 - run:{{runId}} task:{{id}} stage:validate result:failed note:"<what's missing>"
@@ -216,16 +246,6 @@ block at the top (its \`state\`/\`status\` fields included), and not \`## Reques
 \`## Refined\`, or \`## Scope\`. The extension owns the frontmatter and moves the
 card on its own once it sees your \`## Log\` line; editing it yourself will
 conflict with that and confuse the board.
-
-If checking turned up clearly out-of-scope follow-up work — not a reason to
-fail this check, but worth not losing — file it as its own task instead of
-folding it in here. Add up to a few lines like this to the same \`## Log\`:
-- propose-task run:{{runId}} type:<feature|bug> title:"<short title>" note:"<why this is separate, one line>"
-The \`type:\` field is optional for compatibility: omit it to inherit this
-parent task's type. Use only \`feature\` or \`bug\`; do not file an invalid
-or otherwise untyped child.
-Only do this for concrete, actionable follow-ups you actually noticed while
-checking, not speculative ideas.
 `;
 
 const DEFAULT_SPLIT_TEMPLATE = `@{{agentName}}
@@ -233,6 +253,7 @@ const DEFAULT_SPLIT_TEMPLATE = `@{{agentName}}
 # {{title}}
 
 ${EXTENSION_SUPERVISED_CONTEXT}
+${TASK_ATTACHMENT_CONTEXT}
 
 This ticket may be too big for one pass. Decide whether it should be split
 into smaller, independently workable tasks — and if so, do it now, before any

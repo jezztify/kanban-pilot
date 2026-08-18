@@ -124,6 +124,236 @@ export interface Task {
 	body: string;
 }
 
+/** Task-local image attachment constraints (§6.16). */
+export const TASK_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+export const TASK_ATTACHMENT_MIME_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] as const;
+export type TaskAttachmentMimeType = (typeof TASK_ATTACHMENT_MIME_TYPES)[number];
+
+const ATTACHMENT_EXTENSIONS: Record<TaskAttachmentMimeType, string> = {
+	'image/png': 'png',
+	'image/jpeg': 'jpg',
+	'image/gif': 'gif',
+	'image/webp': 'webp',
+};
+const SAFE_ATTACHMENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ATTACHMENT_REFERENCE = /^TASK-\d+\.attachments\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
+const ATTACHMENT_MARKER = /^attachment:\/\/([A-Za-z0-9_-]{1,100})$/;
+
+/** A transient image supplied by a board form; it is never serialized to frontmatter. */
+export interface TaskAttachmentInput {
+	/** Client-generated identity used while replacing `attachment://...` markers. */
+	id?: string;
+	name: string;
+	mimeType: string;
+	data: string | Uint8Array;
+}
+
+export interface NormalizedTaskAttachmentInput {
+	id?: string;
+	name: string;
+	mimeType: TaskAttachmentMimeType;
+	data: Uint8Array;
+}
+
+/** Add/remove intent staged by a create/edit form. */
+export interface TaskAttachmentChanges {
+	add?: readonly TaskAttachmentInput[];
+	remove?: readonly string[];
+}
+
+export interface NormalizedTaskAttachmentChanges {
+	add: NormalizedTaskAttachmentInput[];
+	remove: string[];
+}
+
+/** Metadata for a validated file already owned by a task. */
+export interface TaskAttachmentMetadata {
+	name: string;
+	relativePath: string;
+	mimeType: TaskAttachmentMimeType;
+	size: number;
+}
+
+export function isTaskAttachmentMimeType(value: unknown): value is TaskAttachmentMimeType {
+	return typeof value === 'string' && (TASK_ATTACHMENT_MIME_TYPES as readonly string[]).includes(value);
+}
+
+export function taskAttachmentExtension(mimeType: TaskAttachmentMimeType): string {
+	return ATTACHMENT_EXTENSIONS[mimeType];
+}
+
+export function taskAttachmentMimeTypeForName(name: string): TaskAttachmentMimeType | undefined {
+	const extension = name.toLowerCase().split('.').pop();
+	if (extension === 'png') { return 'image/png'; }
+	if (extension === 'jpg' || extension === 'jpeg') { return 'image/jpeg'; }
+	if (extension === 'gif') { return 'image/gif'; }
+	if (extension === 'webp') { return 'image/webp'; }
+	return undefined;
+}
+
+export function isSafeTaskAttachmentName(value: unknown): value is string {
+	return typeof value === 'string' &&
+		SAFE_ATTACHMENT_NAME.test(value) &&
+		value !== '.' && value !== '..' &&
+		![...value].some((character) => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f);
+}
+
+/** Validates the generated relative path, never trusting a user filesystem path. */
+export function isValidTaskAttachmentReference(taskId: string, value: unknown): value is string {
+	if (typeof value !== 'string' || !/^TASK-\d+$/.test(taskId)) {
+		return false;
+	}
+	const match = ATTACHMENT_REFERENCE.exec(value);
+	return !!match && value.startsWith(`${taskId}.attachments/`) && isSafeTaskAttachmentName(match[1]);
+}
+
+export function isTaskAttachmentReference(value: unknown): value is string {
+	return typeof value === 'string' && ATTACHMENT_REFERENCE.test(value);
+}
+
+export function taskAttachmentReference(taskId: string, name: string): string {
+	if (!/^TASK-\d+$/.test(taskId) || !isSafeTaskAttachmentName(name)) {
+		throw new Error('Invalid generated task attachment path.');
+	}
+	return `${taskId}.attachments/${name}`;
+}
+
+export function taskAttachmentMarker(id: string): string {
+	if (!ATTACHMENT_MARKER.test(`attachment://${id}`)) {
+		throw new Error('Invalid task attachment marker.');
+	}
+	return `attachment://${id}`;
+}
+
+function decodeAttachmentData(value: unknown): Uint8Array {
+	if (value instanceof Uint8Array) {
+		return new Uint8Array(value);
+	}
+	if (typeof value !== 'string') {
+		throw new Error('Task attachments must contain binary data.');
+	}
+
+	const dataUrl = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/i.exec(value);
+	const encoded = dataUrl?.[2] ?? (/^[A-Za-z0-9+/=]+$/.test(value) ? value : undefined);
+	if (!encoded) {
+		throw new Error('Task attachment data must be base64 encoded.');
+	}
+	const bytes = new Uint8Array(Buffer.from(encoded, 'base64'));
+	if (bytes.length === 0) {
+		throw new Error('Task attachment data cannot be empty.');
+	}
+	return bytes;
+}
+
+function hasImageSignature(mimeType: TaskAttachmentMimeType, bytes: Uint8Array): boolean {
+	const startsWith = (signature: number[]): boolean => signature.every((value, index) => bytes[index] === value);
+	if (mimeType === 'image/png') {
+		return startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	}
+	if (mimeType === 'image/jpeg') {
+		return startsWith([0xff, 0xd8, 0xff]);
+	}
+	if (mimeType === 'image/gif') {
+		return startsWith([0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) || startsWith([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
+	}
+	return startsWith([0x52, 0x49, 0x46, 0x46]) &&
+		bytes.length >= 12 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+}
+
+/** Validates one transient image before it reaches filesystem code. */
+export function normalizeTaskAttachmentInput(value: unknown): NormalizedTaskAttachmentInput {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error('Each task attachment must contain a name, MIME type, and image data.');
+	}
+	const candidate = value as Record<string, unknown>;
+	const name = candidate.name;
+	const mimeType = candidate.mimeType ?? candidate.type;
+	if (typeof name !== 'string' || !name.trim() || name !== name.trim() || /[\\/]/.test(name) || name.includes('..')) {
+		throw new Error('Attachment names must be simple file names without path traversal.');
+	}
+	if (!isTaskAttachmentMimeType(mimeType)) {
+		throw new Error('Only PNG, JPEG, GIF, and WebP images are supported; SVG is not supported.');
+	}
+	const id = candidate.id;
+	if (id !== undefined && (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id))) {
+		throw new Error('Invalid task attachment marker.');
+	}
+	const data = decodeAttachmentData(candidate.data);
+	if (data.length > TASK_ATTACHMENT_MAX_BYTES) {
+		throw new Error('Each task image must be 10 MiB or smaller.');
+	}
+	if (!hasImageSignature(mimeType, data)) {
+		throw new Error(`Attachment data does not match ${mimeType}.`);
+	}
+	return { id, name, mimeType, data };
+}
+
+export function normalizeTaskAttachmentChanges(value: unknown): NormalizedTaskAttachmentChanges {
+	if (value === undefined || value === null) {
+		return { add: [], remove: [] };
+	}
+	if (typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error('Task attachment changes must be an object.');
+	}
+	const candidate = value as Record<string, unknown>;
+	const addValue = candidate.add ?? [];
+	const removeValue = candidate.remove ?? [];
+	if (!Array.isArray(addValue) || !Array.isArray(removeValue)) {
+		throw new Error('Task attachment changes must contain add and remove arrays.');
+	}
+	const add = addValue.map(normalizeTaskAttachmentInput);
+	const remove = removeValue.map((entry) => {
+		if (!isTaskAttachmentReference(entry)) {
+			throw new Error('Removed attachment paths must be generated task-local references.');
+		}
+		return entry;
+	});
+	return { add, remove };
+}
+
+/** Finds only Markdown image references that have the task-local shape. */
+export function taskAttachmentReferences(taskId: string, text: string): string[] {
+	const references: string[] = [];
+	const pattern = /!\[[^\]\r\n]*\]\(([^)\s]+)\)/g;
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(text)) !== null) {
+		const href = match[1];
+		if (href.startsWith('attachment://')) {
+			continue;
+		}
+		if (href.startsWith(`${taskId}.attachments/`) || /^TASK-\d+\.attachments\//.test(href)) {
+			if (!isValidTaskAttachmentReference(taskId, href)) {
+				throw new Error('Markdown image references must use a safe task-local attachment path.');
+			}
+			if (!references.includes(href)) {
+				references.push(href);
+			}
+		}
+	}
+	return references;
+}
+
+/** Resolves client-only markers to generated relative references. */
+export function replaceTaskAttachmentMarkers(text: string, replacements: ReadonlyMap<string, string>): string {
+	if (text.includes('attachment://')) {
+		text = text.replace(/attachment:\/\/([A-Za-z0-9_-]{1,100})/g, (_match, id: string) => {
+			const replacement = replacements.get(id);
+			if (!replacement) {
+				throw new Error('The task text references an attachment that was not staged.');
+			}
+			return replacement;
+		});
+		if (text.includes('attachment://')) {
+			throw new Error('The task text contains an invalid attachment marker.');
+		}
+	}
+	return text;
+}
+
+export function removeTaskAttachmentReferences(text: string, references: ReadonlySet<string>): string {
+	return text.replace(/!\[[^\]\r\n]*\]\(([^)\s]+)\)/g, (full, href: string) => references.has(href) ? '' : full);
+}
+
 /** User-editable task content exposed by the board detail editor. */
 export interface EditableTaskContent {
 	title: string;
@@ -547,6 +777,8 @@ export interface NewTaskOptions {
 	type?: TaskType;
 	/** The human-typed description (§6.16's New Task modal); falls back to the title if blank. Ignored when `origin` is set. */
 	request?: string;
+	/** Transient images staged by the create form; never serialized as binary metadata. */
+	attachments?: TaskAttachmentChanges;
 	origin?: TaskOrigin;
 	/** Extension-owned initial within-column position, normally supplied by TaskStore. */
 	position?: number;

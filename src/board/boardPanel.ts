@@ -17,6 +17,7 @@ import {
   isTaskType,
   Status,
   Task,
+  TaskAttachmentChanges,
   TASK_TYPE_LABELS,
   normalizeEditableTaskContent,
 } from '../model/task';
@@ -247,6 +248,7 @@ interface InMessage {
   values?: unknown;
   column?: unknown;
   content?: unknown;
+  attachments?: unknown;
 }
 
 /** Operations the webview needs from the workspace's active-set controller. */
@@ -750,12 +752,14 @@ export class BoardPanel {
 	private readonly disposables: vscode.Disposable[] = [];
 	private selectedTaskId: string | undefined;
   private taskWatcher: vscode.Disposable | undefined;
+  private webviewReady = false;
+  private pendingNewTaskOpen = false;
 
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
     private readonly host: BoardTaskSetHost,
 	) {
-		this.panel.webview.options = { enableScripts: true };
+    this.configureWebview();
 		this.panel.webview.html = this.html();
     this.bindTaskWatcher();
 
@@ -763,6 +767,7 @@ export class BoardPanel {
 			this.panel.webview.onDidReceiveMessage((message: InMessage) => this.onMessage(message)),
       this.host.onDidChange(() => {
         this.selectedTaskId = undefined;
+        this.configureWebview();
         this.bindTaskWatcher();
         void this.pushAll();
       }),
@@ -795,6 +800,22 @@ export class BoardPanel {
 
   private get runManager(): RunManager {
     return this.host.runManager;
+  }
+
+  private configureWebview(): void {
+    this.panel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this.store.directory],
+    };
+  }
+
+  /** Opens the canonical attachment-capable New Task modal from a command. */
+  openNewTask(): void {
+    this.pendingNewTaskOpen = true;
+    if (this.webviewReady) {
+      this.pendingNewTaskOpen = false;
+      void this.panel.webview.postMessage({ type: 'newTask/open' });
+    }
   }
 
   private bindTaskWatcher(): void {
@@ -831,6 +852,11 @@ export class BoardPanel {
 			case 'board/ready':
         await this.host.ready;
 				await this.pushAll();
+        this.webviewReady = true;
+        if (this.pendingNewTaskOpen) {
+          this.pendingNewTaskOpen = false;
+          await this.panel.webview.postMessage({ type: 'newTask/open' });
+        }
 				return;
 
       case 'taskSet/select':
@@ -957,14 +983,20 @@ export class BoardPanel {
         if (!title || !isTaskType(message.taskType)) {
 					return;
 				}
-        const task = await this.store.create(title, {
-          type: message.taskType,
-          request: message.description?.trim(),
-        });
-				this.selectedTaskId = task.id;
-				// The watcher fires from this same write, but selection changed
-				// independently of disk state, so push explicitly rather than wait.
-				await this.pushAll();
+        try {
+          const task = await this.store.create(title, {
+            type: message.taskType,
+            request: message.description?.trim(),
+            attachments: message.attachments as TaskAttachmentChanges | undefined,
+          });
+          this.selectedTaskId = task.id;
+          // The watcher fires from this same write, but selection changed
+          // independently of disk state, so push explicitly rather than wait.
+          await this.pushAll();
+          await this.panel.webview.postMessage({ type: 'task/createSuccess', taskId: task.id });
+        } catch (error) {
+          await this.reportCreateError(error instanceof Error ? error.message : String(error));
+        }
 				return;
 			}
 
@@ -975,7 +1007,11 @@ export class BoardPanel {
         }
         try {
           const content = normalizeEditableTaskContent(message.content);
-          await this.store.edit(message.taskId, content);
+          await this.store.edit(
+            message.taskId,
+            content,
+            message.attachments as TaskAttachmentChanges | undefined,
+          );
           // The edit mutation is authoritative on disk. Push immediately so
           // the card and detail are fresh even before the watcher callback.
           await this.pushAll();
@@ -1181,6 +1217,7 @@ export class BoardPanel {
 		}
 
 		const logLines = (task.sections['Log'] ?? '').trim().split(/\r?\n/).filter(Boolean);
+    const attachments = await this.store.listAttachments(task.id);
 
 		await this.panel.webview.postMessage({
 			type: 'task/detail',
@@ -1198,6 +1235,13 @@ export class BoardPanel {
 				scope: task.sections['Scope'] ?? '',
 				lastLog: logLines.at(-1) ?? '',
 				originTask: task.originTask,
+        attachments: attachments.map((attachment) => ({
+          name: attachment.name,
+          relativePath: attachment.relativePath,
+          mimeType: attachment.mimeType,
+          size: attachment.size,
+          src: this.panel.webview.asWebviewUri(attachment.uri).toString(),
+        })),
         pending: pendingView(task),
         moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
 				// The card face shows one button (primary); this is where the
@@ -1210,6 +1254,10 @@ export class BoardPanel {
   private async reportEditError(taskId: string | undefined, error: string): Promise<void> {
     void vscode.window.showErrorMessage(error);
     await this.panel.webview.postMessage({ type: 'task/editError', taskId, error });
+  }
+
+  private async reportCreateError(error: string): Promise<void> {
+    await this.panel.webview.postMessage({ type: 'task/createError', error });
   }
 
   private async reportSettingsError(key: string | undefined, error: string): Promise<void> {
@@ -1250,7 +1298,7 @@ export class BoardPanel {
           typeLabel: TASK_TYPE_LABELS[task.type],
 					status: task.status,
 					primary: primaryAction(task.state, task.status),
-					originTask: task.originTask,
+						originTask: task.originTask,
           pending: pendingView(task),
 					canSplit: canSplit(task.state, task.status),
 				})),
@@ -1260,6 +1308,8 @@ export class BoardPanel {
 
 	dispose(): void {
 		BoardPanel.current = undefined;
+    this.webviewReady = false;
+    this.pendingNewTaskOpen = false;
     this.taskWatcher?.dispose();
     this.taskWatcher = undefined;
 		this.panel.dispose();
@@ -1279,6 +1329,7 @@ export class BoardPanel {
 			"default-src 'none'",
 			`style-src 'nonce-${nonce}'`,
 			`script-src 'nonce-${nonce}'`,
+      `img-src ${this.panel.webview.cspSource} data:`,
 		].join('; ');
 
     const actionLabelsJson = JSON.stringify(ACTION_LABELS);
@@ -1669,6 +1720,21 @@ export class BoardPanel {
   }
   .field-textarea { resize: vertical; min-height: 90px; }
   .field-input::placeholder, .field-textarea::placeholder { color: var(--vscode-descriptionForeground); }
+  .attachment-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .attachment-picker { display: none; }
+  .attachment-hint { color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.35; }
+  .attachment-shelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+  .attachment-card {
+    display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 8px;
+    min-width: 0; padding: 7px; border: 1px solid var(--vscode-panel-border);
+    border-radius: 8px; background: var(--vscode-editorWidget-background);
+  }
+  .attachment-card img { width: 42px; height: 42px; object-fit: cover; border-radius: 5px; background: var(--vscode-editor-background); }
+  .attachment-card-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+  .attachment-card-meta { color: var(--vscode-descriptionForeground); font-size: 10px; margin-top: 2px; }
+  .attachment-remove { border: none; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 4px; border-radius: 4px; }
+  .attachment-remove:hover { color: var(--vscode-errorForeground); background: var(--vscode-toolbar-hoverBackground); }
+  .attachment-error { color: var(--vscode-errorForeground); font-size: 11px; line-height: 1.35; }
   .new-task-actions { display: flex; justify-content: flex-end; gap: 12px; }
   .task-edit-form { display: flex; flex-direction: column; gap: 14px; }
   .task-edit-form .field-textarea { min-height: 120px; }
@@ -2259,6 +2325,13 @@ export class BoardPanel {
       <label class="field">
         <span class="field-label">Description</span>
         <textarea class="field-textarea" id="newTaskDescription" placeholder="What needs to happen?" rows="4"></textarea>
+        <div class="attachment-controls">
+          <button type="button" class="btn-chip" id="newTaskAttach">Attach image</button>
+          <span class="attachment-hint">PNG, JPEG, GIF, or WebP · up to 10 MiB · paste an image here</span>
+        </div>
+        <input class="attachment-picker" id="newTaskPicker" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple />
+        <div class="attachment-error" id="newTaskAttachmentError" role="alert" aria-live="assertive" hidden></div>
+        <div class="attachment-shelf" id="newTaskAttachments" aria-label="Attached images"></div>
       </label>
       <label class="field">
         <span class="field-label">Task type</span>
@@ -2339,18 +2412,37 @@ export class BoardPanel {
    * content this renders is not fully trusted input.
    */
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function isSafeUrl(href) {
     return /^https?:\\/\\//i.test(href);
   }
 
-  function renderInline(raw) {
+  function isTaskAttachmentReference(value) {
+    return /^TASK-\\d+\\.attachments\\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+  }
+
+  function isSafeImageSource(src) {
+    return typeof src === 'string' && /^vscode-webview-resource:/i.test(src);
+  }
+
+  function taskImageAlt(value) {
+    const clean = String(value || '').replace(/[\\[\\]\\r\\n]/g, ' ').trim();
+    return clean || 'Task image';
+  }
+
+  function renderInline(raw, attachments) {
     const codeTokens = [];
     let masked = raw.replace(/\`([^\`]+)\`/g, (_m, code) => {
       codeTokens.push(code);
       return '' + (codeTokens.length - 1) + '';
+    });
+    const attachmentMap = new Map((attachments || []).map((attachment) => [attachment.relativePath, attachment]));
+    const imageTokens = [];
+    masked = masked.replace(/!\\[([^\\]\\r\\n]*)\\]\\(([^)\\s]+)\\)/g, (_m, alt, href) => {
+      imageTokens.push({ alt: taskImageAlt(alt), href });
+      return 'I' + (imageTokens.length - 1) + '';
     });
     const linkTokens = [];
     masked = masked.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (_m, label, href) => {
@@ -2367,11 +2459,19 @@ export class BoardPanel {
         ? '<a href="' + escapeHtml(link.href) + '">' + escapeHtml(link.label) + '</a>'
         : escapeHtml(link.label);
     });
+    out = out.replace(/I(\\d+)/g, (_m, i) => {
+      const image = imageTokens[Number(i)];
+      const attachment = isTaskAttachmentReference(image.href) ? attachmentMap.get(image.href) : undefined;
+      if (!attachment || !isSafeImageSource(attachment.src)) {
+        return '<span class="task-image-placeholder" role="img" aria-label="Image unavailable: ' + escapeHtml(image.alt) + '">Image unavailable: ' + escapeHtml(image.alt) + '</span>';
+      }
+      return '<img class="task-image" loading="lazy" src="' + escapeHtml(attachment.src) + '" alt="' + escapeHtml(image.alt) + '">';
+    });
     out = out.replace(/(\\d+)/g, (_m, i) => '<code>' + escapeHtml(codeTokens[Number(i)]) + '</code>');
     return out;
   }
 
-  function renderMarkdown(src) {
+  function renderMarkdown(src, attachments) {
     if (!src) { return ''; }
     const lines = src.replace(/\\r\\n/g, '\\n').split('\\n');
     const out = [];
@@ -2398,7 +2498,7 @@ export class BoardPanel {
       if (heading) {
         closeList();
         const level = heading[1].length;
-        out.push('<h' + level + '>' + renderInline(heading[2].trim()) + '</h' + level + '>');
+        out.push('<h' + level + '>' + renderInline(heading[2].trim(), attachments) + '</h' + level + '>');
         i++;
         continue;
       }
@@ -2410,7 +2510,7 @@ export class BoardPanel {
           quoteLines.push(lines[i].replace(/^>\\s?/, ''));
           i++;
         }
-        out.push('<blockquote>' + renderInline(quoteLines.join(' ')) + '</blockquote>');
+        out.push('<blockquote>' + renderInline(quoteLines.join(' '), attachments) + '</blockquote>');
         continue;
       }
 
@@ -2420,7 +2520,7 @@ export class BoardPanel {
         const checked = checklist[1].toLowerCase() === 'x';
         out.push(
           '<li><label><input type="checkbox" disabled' + (checked ? ' checked' : '') + '><span>' +
-            renderInline(checklist[2]) + '</span></label></li>',
+            renderInline(checklist[2], attachments) + '</span></label></li>',
         );
         i++;
         continue;
@@ -2429,7 +2529,7 @@ export class BoardPanel {
       const bullet = line.match(/^[-*]\\s+(.*)$/);
       if (bullet) {
         if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
-        out.push('<li>' + renderInline(bullet[1]) + '</li>');
+        out.push('<li>' + renderInline(bullet[1], attachments) + '</li>');
         i++;
         continue;
       }
@@ -2437,7 +2537,7 @@ export class BoardPanel {
       const numbered = line.match(/^\\d+\\.\\s+(.*)$/);
       if (numbered) {
         if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
-        out.push('<li>' + renderInline(numbered[1]) + '</li>');
+        out.push('<li>' + renderInline(numbered[1], attachments) + '</li>');
         i++;
         continue;
       }
@@ -2455,7 +2555,7 @@ export class BoardPanel {
         paraLines.push(lines[i]);
         i++;
       }
-      out.push('<p>' + renderInline(paraLines.join(' ')) + '</p>');
+      out.push('<p>' + renderInline(paraLines.join(' '), attachments) + '</p>');
     }
     closeList();
     return out.join('');
@@ -3157,7 +3257,7 @@ export class BoardPanel {
       const section = el('div');
       section.appendChild(el('div', 'modal-section-label', label));
       const sectionBody = el('div', 'modal-section-body');
-      sectionBody.innerHTML = renderMarkdown(text);
+      sectionBody.innerHTML = renderMarkdown(text, task.attachments || []);
       section.appendChild(sectionBody);
       body.appendChild(section);
     }
@@ -3173,6 +3273,190 @@ export class BoardPanel {
   }
 
   let editingTaskId = null;
+
+  const TASK_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+  const TASK_ATTACHMENT_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+  let attachmentIdSequence = 0;
+
+  function createAttachmentState(existing) {
+    return { add: [], remove: [], existing: Array.isArray(existing) ? existing : [] };
+  }
+
+  function attachmentId() {
+    attachmentIdSequence += 1;
+    return 'image-' + Date.now().toString(36) + '-' + attachmentIdSequence.toString(36);
+  }
+
+  function displayFileName(file, fallback) {
+    const original = typeof file.name === 'string' && file.name ? file.name : fallback;
+    const extension = file.type === 'image/jpeg' ? '.jpg' : ('.' + file.type.split('/')[1]);
+    let name = original.replace(/[\\/]/g, '-').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/\.\.+/g, '.');
+    name = name.replace(/^-+|-+$/g, '').slice(0, 100);
+    if (!name) { name = 'image' + extension; }
+    return name;
+  }
+
+  function fileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('The image could not be read.'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function formatAttachmentSize(size) {
+    if (size >= 1024 * 1024) { return (size / (1024 * 1024)).toFixed(1) + ' MiB'; }
+    return Math.max(1, Math.round(size / 1024)) + ' KiB';
+  }
+
+  function setAttachmentError(node, message) {
+    node.textContent = message || '';
+    node.hidden = !message;
+  }
+
+  function removeAttachmentMarkdown(text, reference) {
+    const escaped = reference.replace(/[.*+?^\${}()|[\]\\]/g, '\\$&');
+    return text.replace(new RegExp('!\\\\[[^\\\\]\\\\r\\\\n]*\\\\]\\\\(' + escaped + '\\\\)', 'g'), '');
+  }
+
+  function imageMarkerPresent(text, id) {
+    return text.indexOf('attachment://' + id) !== -1;
+  }
+
+  function attachmentTextareas(container) {
+    return Array.from(container.querySelectorAll('textarea[data-attachment-target="true"]'));
+  }
+
+  function renderAttachmentShelf(state, shelf, textareas, errorNode) {
+    shelf.textContent = '';
+    const visible = state.existing.filter((attachment) => !state.remove.includes(attachment.relativePath));
+    const items = state.add.map((attachment) => ({ ...attachment, staged: true, src: attachment.data }))
+      .concat(visible.map((attachment) => ({ ...attachment, staged: false })));
+    for (const attachment of items) {
+      const card = el('div', 'attachment-card');
+      const image = document.createElement('img');
+      image.src = attachment.src;
+      image.alt = attachment.name;
+      card.appendChild(image);
+      const text = el('div');
+      text.appendChild(el('div', 'attachment-card-name', attachment.name));
+      text.appendChild(el('div', 'attachment-card-meta', (attachment.staged ? 'Staged · ' : 'Saved · ') + formatAttachmentSize(attachment.size || 0)));
+      card.appendChild(text);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'attachment-remove';
+      remove.textContent = 'Remove';
+      remove.setAttribute('aria-label', 'Remove image ' + attachment.name);
+      remove.addEventListener('click', () => {
+        if (attachment.staged) {
+          state.add = state.add.filter((candidate) => candidate.id !== attachment.id);
+          for (const textarea of textareas) {
+            textarea.value = removeAttachmentMarkdown(textarea.value, 'attachment://' + attachment.id);
+          }
+        } else {
+          if (!state.remove.includes(attachment.relativePath)) {
+            state.remove.push(attachment.relativePath);
+          }
+          for (const textarea of textareas) {
+            textarea.value = removeAttachmentMarkdown(textarea.value, attachment.relativePath);
+          }
+        }
+        setAttachmentError(errorNode, '');
+        renderAttachmentShelf(state, shelf, textareas, errorNode);
+      });
+      card.appendChild(remove);
+      shelf.appendChild(card);
+    }
+  }
+
+  function insertAttachment(textarea, attachment, cursor) {
+    const marker = '![' + attachment.name + '](attachment://' + attachment.id + ')';
+    const start = cursor && typeof cursor.start === 'number'
+      ? cursor.start
+      : (typeof textarea.selectionStart === 'number' ? textarea.selectionStart : textarea.value.length);
+    const end = cursor && typeof cursor.end === 'number'
+      ? cursor.end
+      : (typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start);
+    textarea.value = textarea.value.slice(0, start) + marker + textarea.value.slice(end);
+    const caret = start + marker.length;
+    textarea.focus();
+    textarea.setSelectionRange(caret, caret);
+    if (cursor) {
+      cursor.start = caret;
+      cursor.end = caret;
+    }
+  }
+
+  function attachImageFile(file, textarea, state, shelf, textareas, errorNode, cursor) {
+    if (!file || !TASK_ATTACHMENT_TYPES.has(file.type)) {
+      setAttachmentError(errorNode, 'Only PNG, JPEG, GIF, and WebP images are supported.');
+      return Promise.resolve();
+    }
+    if (file.size > TASK_ATTACHMENT_MAX_BYTES) {
+      setAttachmentError(errorNode, 'Each image must be 10 MiB or smaller.');
+      return Promise.resolve();
+    }
+    return fileAsDataUrl(file).then((data) => {
+      const attachment = {
+        id: attachmentId(),
+        name: displayFileName(file, 'pasted-image.' + file.type.split('/')[1]),
+        mimeType: file.type,
+        data,
+        size: file.size,
+      };
+      state.add.push(attachment);
+      insertAttachment(textarea, attachment, cursor);
+      setAttachmentError(errorNode, '');
+      renderAttachmentShelf(state, shelf, textareas, errorNode);
+    }).catch((error) => {
+      setAttachmentError(errorNode, error && error.message ? error.message : 'The image could not be read.');
+    });
+  }
+
+  function wireAttachmentForm(container, state, picker, shelf, errorNode, buttons) {
+    const textareas = attachmentTextareas(container);
+    let target = textareas[0];
+    for (const textarea of textareas) {
+      textarea.addEventListener('focus', () => { target = textarea; });
+      textarea.addEventListener('click', () => { target = textarea; });
+      textarea.addEventListener('paste', (event) => {
+        const imageItems = Array.from(event.clipboardData && event.clipboardData.items || [])
+          .filter((item) => item.kind === 'file' && item.type.indexOf('image/') === 0);
+        if (!imageItems.length) { return; }
+        event.preventDefault();
+        const cursor = {
+          start: typeof textarea.selectionStart === 'number' ? textarea.selectionStart : textarea.value.length,
+          end: typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : textarea.value.length,
+        };
+        void imageItems.reduce(
+          (promise, item) => promise.then(() => attachImageFile(
+            item.getAsFile(), textarea, state, shelf, textareas, errorNode, cursor,
+          )),
+          Promise.resolve(),
+        );
+      });
+    }
+    for (const button of buttons) {
+      button.addEventListener('click', () => {
+        target = button.closest('.field').querySelector('textarea') || target;
+        picker.click();
+      });
+      button.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          button.click();
+        }
+      });
+    }
+    picker.addEventListener('change', () => {
+      const files = Array.from(picker.files || []);
+      picker.value = '';
+      void files.reduce((promise, file) => promise.then(() => attachImageFile(file, target, state, shelf, textareas, errorNode)), Promise.resolve());
+    });
+    renderAttachmentShelf(state, shelf, textareas, errorNode);
+    return { textareas, state };
+  }
 
   function renderEditDetail(task) {
     if (!task || task.canEdit === false) {
@@ -3233,6 +3517,7 @@ export class BoardPanel {
     titleField.appendChild(titleInput);
     form.appendChild(titleField);
 
+    const attachmentButtons = [];
     for (const [label, id, value, description] of [
       ['Request', 'taskEditRequest', task.request, 'Original task request in Markdown'],
       ['Refined', 'taskEditRefined', task.refined, 'Refined problem statement and acceptance criteria in Markdown'],
@@ -3245,10 +3530,48 @@ export class BoardPanel {
       textarea.id = id;
       textarea.rows = 6;
       textarea.value = value;
+      textarea.dataset.attachmentTarget = 'true';
       textarea.setAttribute('aria-label', label + ' — ' + description);
       field.appendChild(textarea);
+      const controls = el('div', 'attachment-controls');
+      const attach = el('span', 'btn-chip', 'Attach image');
+      attach.setAttribute('role', 'button');
+      attach.tabIndex = 0;
+      attach.setAttribute('aria-label', 'Attach an image to ' + label);
+      controls.appendChild(attach);
+      controls.appendChild(el('span', 'attachment-hint', 'Paste an image here or choose a file.'));
+      field.appendChild(controls);
+      attachmentButtons.push(attach);
       form.appendChild(field);
     }
+
+    const attachmentField = el('div', 'field');
+    attachmentField.appendChild(el('span', 'field-label', 'Attached images'));
+    const attachmentPicker = document.createElement('input');
+    attachmentPicker.className = 'attachment-picker';
+    attachmentPicker.type = 'file';
+    attachmentPicker.accept = 'image/png,image/jpeg,image/gif,image/webp';
+    attachmentPicker.multiple = true;
+    const attachmentError = el('div', 'attachment-error');
+    attachmentError.id = 'taskEditAttachmentError';
+    attachmentError.hidden = true;
+    attachmentError.setAttribute('role', 'alert');
+    attachmentError.setAttribute('aria-live', 'assertive');
+    const attachmentShelf = el('div', 'attachment-shelf');
+    attachmentShelf.id = 'taskEditAttachments';
+    attachmentShelf.setAttribute('aria-label', 'Attached images');
+    attachmentField.appendChild(attachmentPicker);
+    attachmentField.appendChild(attachmentError);
+    attachmentField.appendChild(attachmentShelf);
+    form.appendChild(attachmentField);
+    const attachmentUi = wireAttachmentForm(
+      form,
+      createAttachmentState(task.attachments),
+      attachmentPicker,
+      attachmentShelf,
+      attachmentError,
+      attachmentButtons,
+    );
 
     const actions = el('div', 'task-edit-actions');
     const cancel = el('button', 'btn-chip', 'Cancel');
@@ -3278,15 +3601,22 @@ export class BoardPanel {
       }
       error.textContent = '';
       error.hidden = true;
+      const content = {
+        title,
+        request: document.getElementById('taskEditRequest').value,
+        refined: document.getElementById('taskEditRefined').value,
+        scope: document.getElementById('taskEditScope').value,
+      };
+      const allText = content.request + '\\n' + content.refined + '\\n' + content.scope;
+      const attachmentChanges = {
+        add: attachmentUi.state.add.filter((attachment) => imageMarkerPresent(allText, attachment.id)),
+        remove: attachmentUi.state.remove,
+      };
       vscode.postMessage({
         type: 'task/edit',
         taskId: task.id,
-        content: {
-          title,
-          request: document.getElementById('taskEditRequest').value,
-          refined: document.getElementById('taskEditRefined').value,
-          scope: document.getElementById('taskEditScope').value,
-        },
+        content,
+        ...(attachmentChanges.add.length || attachmentChanges.remove.length ? { attachments: attachmentChanges } : {}),
       });
     });
     body.appendChild(form);
@@ -3383,6 +3713,16 @@ export class BoardPanel {
         error.hidden = false;
         error.focus();
       }
+    } else if (msg.type === 'task/createSuccess') {
+      newTaskPending = false;
+      newTaskSubmit.disabled = false;
+      closeNewTaskModal();
+    } else if (msg.type === 'task/createError') {
+      newTaskPending = false;
+      newTaskSubmit.disabled = false;
+      newTaskError.textContent = msg.error || 'Could not create the task.';
+      newTaskError.hidden = false;
+      newTaskError.focus();
     } else if (msg.type === 'settings/state') {
       lastSettings = msg;
       renderSettings(lastSettings);
@@ -3393,6 +3733,8 @@ export class BoardPanel {
           settingErrorFor(row, msg.error || 'The setting could not be saved.');
         }
       }
+    } else if (msg.type === 'newTask/open') {
+      openNewTaskModal();
     }
   });
 
@@ -3400,6 +3742,21 @@ export class BoardPanel {
   const newTaskInput = document.getElementById('newTaskInput');
   const newTaskDescription = document.getElementById('newTaskDescription');
   const newTaskType = document.getElementById('newTaskType');
+  const newTaskAttach = document.getElementById('newTaskAttach');
+  const newTaskPicker = document.getElementById('newTaskPicker');
+  const newTaskError = document.getElementById('newTaskAttachmentError');
+  const newTaskShelf = document.getElementById('newTaskAttachments');
+  const newTaskSubmit = document.getElementById('newTaskSubmit');
+  let newTaskPending = false;
+  newTaskDescription.dataset.attachmentTarget = 'true';
+  const newTaskAttachmentUi = wireAttachmentForm(
+    document.getElementById('newTaskForm'),
+    createAttachmentState([]),
+    newTaskPicker,
+    newTaskShelf,
+    newTaskError,
+    [newTaskAttach],
+  );
 
   function openNewTaskModal() {
     document.getElementById('detailBackdrop').classList.remove('open'); // mutually exclusive with task detail
@@ -3408,6 +3765,12 @@ export class BoardPanel {
     newTaskInput.value = '';
     newTaskDescription.value = '';
     newTaskType.value = 'feature';
+    newTaskPending = false;
+    newTaskSubmit.disabled = false;
+    setAttachmentError(newTaskError, '');
+    newTaskAttachmentUi.state.add = [];
+    newTaskAttachmentUi.state.remove = [];
+    renderAttachmentShelf(newTaskAttachmentUi.state, newTaskShelf, newTaskAttachmentUi.textareas, newTaskError);
     newTaskInput.focus();
   }
   function closeNewTaskModal() {
@@ -3423,11 +3786,24 @@ export class BoardPanel {
   document.getElementById('newTaskForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const title = newTaskInput.value.trim();
-    if (!title) { return; }
+    if (!title) {
+      newTaskInput.focus();
+      return;
+    }
+    if (newTaskPending) { return; }
     const taskType = newTaskType.value;
     if (taskType !== 'feature' && taskType !== 'bug') { return; }
-    vscode.postMessage({ type: 'task/create', title, description: newTaskDescription.value.trim(), taskType });
-    closeNewTaskModal();
+    newTaskPending = true;
+    newTaskSubmit.disabled = true;
+    const description = newTaskDescription.value.trim();
+    const additions = newTaskAttachmentUi.state.add.filter((attachment) => imageMarkerPresent(description, attachment.id));
+    vscode.postMessage({
+      type: 'task/create',
+      title,
+      description,
+      taskType,
+      ...(additions.length ? { attachments: { add: additions } } : {}),
+    });
   });
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && newTaskBackdrop.classList.contains('open')) { closeNewTaskModal(); }

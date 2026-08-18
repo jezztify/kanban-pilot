@@ -9,9 +9,15 @@ import {
 	encodePendingOutcome,
 	isPendingOutcome,
 	isValidTaskPosition,
+	normalizeTaskAttachmentInput,
 	normalizeTaskType,
+	removeTaskAttachmentReferences,
+	replaceTaskAttachmentMarkers,
 	STATUSES,
 	Status,
+	TASK_ATTACHMENT_MAX_BYTES,
+	taskAttachmentReference,
+	taskAttachmentReferences,
 	newTaskFile,
 	parseSections,
 	taskFromRaw,
@@ -55,6 +61,16 @@ Add a signed webhook endpoint.
 ## Log
 - run:r7 task:TASK-142 stage:refine result:ok note:"scope written, 3 files"
 `;
+
+const PNG = new Uint8Array([
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x00,
+]);
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+const WEBP = new Uint8Array([
+	0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00,
+	0x57, 0x45, 0x42, 0x50,
+]);
 
 suite('M1 task schema', () => {
 	test('parses frontmatter and body sections', () => {
@@ -237,6 +253,43 @@ suite('M1 task schema', () => {
 		assert.strictEqual(taskFromRaw(raw)?.originTask, undefined);
 	});
 
+	test('validates task image types, signatures, size, and generated references', () => {
+		assert.strictEqual(normalizeTaskAttachmentInput({
+			id: 'paste-1', name: 'screen shot.png', mimeType: 'image/png', data: PNG,
+		}).mimeType, 'image/png');
+		assert.strictEqual(normalizeTaskAttachmentInput({
+			name: 'photo.jpg', mimeType: 'image/jpeg', data: JPEG,
+		}).mimeType, 'image/jpeg');
+		assert.throws(
+			() => normalizeTaskAttachmentInput({ name: 'vector.svg', mimeType: 'image/svg+xml', data: '<svg />' }),
+			/SVG is not supported/,
+		);
+		assert.throws(
+			() => normalizeTaskAttachmentInput({ name: '../escape.png', mimeType: 'image/png', data: PNG }),
+			/path traversal/,
+		);
+		assert.throws(
+			() => normalizeTaskAttachmentInput({ name: 'not-an-image.png', mimeType: 'image/png', data: JPEG }),
+			/does not match/,
+		);
+		const oversized = new Uint8Array(TASK_ATTACHMENT_MAX_BYTES + 1);
+		oversized.set(PNG);
+		assert.throws(
+			() => normalizeTaskAttachmentInput({ name: 'large.png', mimeType: 'image/png', data: oversized }),
+			/10 MiB or smaller/,
+		);
+
+		const reference = taskAttachmentReference('TASK-009', 'screen-shot.png');
+		assert.deepStrictEqual(taskAttachmentReferences('TASK-009', `![screen](${reference})`), [reference]);
+		assert.throws(
+			() => taskAttachmentReferences('TASK-009', '![other](TASK-010.attachments/other.png)'),
+			/safe task-local/,
+		);
+		const replacements = new Map([['paste-1', reference]]);
+		assert.strictEqual(replaceTaskAttachmentMarkers('before ![screen](attachment://paste-1)', replacements), `before ![screen](${reference})`);
+		assert.strictEqual(removeTaskAttachmentReferences(`a ![screen](${reference}) b`, new Set([reference])), 'a  b');
+	});
+
 	test('round-trips valid pending completion metadata and ignores invalid payloads', () => {
 		const pending = {
 			gate: 'refineToScoped' as const,
@@ -314,6 +367,82 @@ suite('M1 task store', () => {
 		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(created.id))).toString('utf8');
 		assert.match(raw, /type: bug/);
 		assert.strictEqual((await store.readAll()).tasks[0].type, 'bug');
+	});
+
+	test('creates, lists, edits, and removes task-local image attachments atomically', async () => {
+		const created = await store.create('Image evidence', {
+			request: 'Before\n\n![first](attachment://first)\n\n![second](attachment://second)\n\nAfter',
+			attachments: {
+				add: [
+					{ id: 'first', name: 'screen shot.png', mimeType: 'image/png', data: PNG },
+					{ id: 'second', name: 'photo.jpg', mimeType: 'image/jpeg', data: JPEG },
+				],
+			},
+		});
+		const firstReference = taskAttachmentReference(created.id, 'screen-shot.png');
+		const secondReference = taskAttachmentReference(created.id, 'photo.jpg');
+		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(created.id))).toString('utf8');
+		assert.ok(raw.includes(`![first](${firstReference})`));
+		assert.ok(raw.includes(`![second](${secondReference})`));
+		assert.strictEqual(raw.includes('attachment://'), false);
+		assert.deepStrictEqual((await store.listAttachments(created.id)).map((attachment) => attachment.relativePath), [firstReference, secondReference]);
+		assert.strictEqual((await vscode.workspace.fs.readFile(store.attachmentFileFor(created.id, firstReference))).byteLength, PNG.byteLength);
+
+		await store.edit(created.id, {
+			title: created.title,
+			request: `Keep ![first](${firstReference})`,
+			refined: '![new evidence](attachment://new-evidence)',
+			scope: '',
+		}, {
+			add: [{ id: 'new-evidence', name: 'new evidence.webp', mimeType: 'image/webp', data: WEBP }],
+			remove: [secondReference],
+		});
+		const after = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(created.id))).toString('utf8');
+		const newReference = taskAttachmentReference(created.id, 'new-evidence.webp');
+		assert.ok(after.includes(`![new evidence](${newReference})`));
+		assert.ok(after.includes(firstReference));
+		assert.ok(!after.includes(secondReference));
+		assert.deepStrictEqual((await store.listAttachments(created.id)).map((attachment) => attachment.relativePath), [firstReference, newReference]);
+		await assert.rejects(
+			async () => { await vscode.workspace.fs.stat(store.attachmentFileFor(created.id, secondReference)); },
+		);
+	});
+
+	test('failed attachment persistence rolls back Markdown and binary files', async () => {
+		let renameCount = 0;
+		const renameWithFailure: vscode.FileSystem['rename'] = async (source, target, options) => {
+			if (++renameCount === 2) {
+				throw new Error('injected attachment rename failure');
+			}
+			return vscode.workspace.fs.rename(source, target, options);
+		};
+		const failingStore = new TaskStore(dir, 'default', renameWithFailure);
+
+		await assert.rejects(
+			() => failingStore.create('Should roll back', {
+			attachments: { add: [{ name: 'failure.png', mimeType: 'image/png', data: PNG }] },
+			}),
+			/injected attachment rename failure/,
+		);
+		assert.deepStrictEqual((await failingStore.readAll()).tasks, []);
+		assert.deepStrictEqual(
+			(await vscode.workspace.fs.readDirectory(dir)).filter(([name]) => /\.attachments$|\.reorder\./.test(name)),
+			[],
+		);
+	});
+
+	test('deletes only the task-owned attachment directory', async () => {
+		const first = await store.create('First with image', {
+			attachments: { add: [{ name: 'first.png', mimeType: 'image/png', data: PNG }] },
+		});
+		const second = await store.create('Second with image', {
+			attachments: { add: [{ name: 'second.png', mimeType: 'image/png', data: PNG }] },
+		});
+		await store.delete(first.id);
+		await assert.rejects(async () => { await vscode.workspace.fs.stat(store.fileFor(first.id)); });
+		await assert.rejects(async () => { await vscode.workspace.fs.stat(store.attachmentDirectoryFor(first.id)); });
+		assert.strictEqual((await store.readAll()).tasks[0].id, second.id);
+		assert.strictEqual((await store.listAttachments(second.id)).length, 1);
 	});
 
 	test('persists pending outcomes, preserves the body, and clears them on ordinary mutations', async () => {
@@ -881,6 +1010,29 @@ suite('task sets', () => {
 		assert.deepStrictEqual(await first.reorder('TASK-002', 'backlog', { beforeTaskId: 'TASK-001' }), { kind: 'applied' });
 		assert.deepStrictEqual((await first.snapshot()).columns[0].tasks.map((task) => task.id), ['TASK-002', 'TASK-001']);
 		assert.deepStrictEqual((await second.snapshot()).columns[0].tasks.map((task) => task.id), ['TASK-001', 'TASK-002']);
+	});
+
+	test('same task ids keep attachment directories isolated across named sets', async () => {
+		const first = new TaskStore(vscode.Uri.joinPath(root, 'one'), 'set-one');
+		const second = new TaskStore(vscode.Uri.joinPath(root, 'two'), 'set-two');
+		await first.ensureDirectory();
+		await second.ensureDirectory();
+		const firstTask = await first.create('First evidence', {
+			attachments: { add: [{ name: 'first.png', mimeType: 'image/png', data: PNG }] },
+		});
+		const secondTask = await second.create('Second evidence', {
+			attachments: { add: [{ name: 'second.png', mimeType: 'image/png', data: PNG }] },
+		});
+
+		assert.strictEqual(firstTask.id, secondTask.id);
+		assert.deepStrictEqual((await first.listAttachments(firstTask.id)).map((attachment) => attachment.relativePath), [
+			taskAttachmentReference(firstTask.id, 'first.png'),
+		]);
+		assert.deepStrictEqual((await second.listAttachments(secondTask.id)).map((attachment) => attachment.relativePath), [
+			taskAttachmentReference(secondTask.id, 'second.png'),
+		]);
+		await assert.rejects(async () => { await vscode.workspace.fs.stat(first.attachmentFileFor(firstTask.id, taskAttachmentReference(firstTask.id, 'second.png'))); });
+		await assert.rejects(async () => { await vscode.workspace.fs.stat(second.attachmentFileFor(secondTask.id, taskAttachmentReference(secondTask.id, 'first.png'))); });
 	});
 });
 

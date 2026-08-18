@@ -4,17 +4,30 @@ import {
 	COLUMNS,
 	Column,
 	EditableTaskContent,
+	NormalizedTaskAttachmentInput,
 	PendingOutcome,
 	Status,
 	isTaskType,
+	isSafeTaskAttachmentName,
+	isValidTaskAttachmentReference,
 	isValidTaskPosition,
+	normalizeTaskAttachmentChanges,
+	normalizeTaskAttachmentInput,
 	NewTaskOptions,
 	Task,
+	TaskAttachmentMetadata,
+	taskAttachmentExtension,
+	taskAttachmentMimeTypeForName,
+	taskAttachmentReference,
+	taskAttachmentReferences,
 	TaskType,
 	normalizeEditableTaskContent,
 	newTaskFile,
 	parseFile,
+	parseSections,
 	parsePendingOutcome,
+	removeTaskAttachmentReferences,
+	replaceTaskAttachmentMarkers,
 	taskFromRaw,
 	updateEditableTaskContent,
 	updateFrontmatter,
@@ -59,7 +72,7 @@ export type TaskChangeKind = 'position-only' | 'other';
 
 interface AtomicWrite {
 	uri: vscode.Uri;
-	content: string;
+	content: string | Uint8Array;
 	positionOnly?: boolean;
 }
 
@@ -69,6 +82,69 @@ interface AtomicBatchEntry extends AtomicWrite {
 	original?: Uint8Array;
 	existed: boolean;
 	commitAttempted: boolean;
+}
+
+interface AtomicDeleteEntry {
+	uri: vscode.Uri;
+	original?: Uint8Array;
+	existed: boolean;
+	commitAttempted: boolean;
+}
+
+export interface StoredTaskAttachment extends TaskAttachmentMetadata {
+	uri: vscode.Uri;
+}
+
+interface AllocatedAttachment {
+	input: NormalizedTaskAttachmentInput;
+	name: string;
+	relativePath: string;
+	uri: vscode.Uri;
+}
+
+function attachmentAltText(name: string): string {
+	return name.replace(/[\[\]\r\n]/g, ' ').trim() || 'Task image';
+}
+
+function materializeAttachmentReferences(
+	taskId: string,
+	content: EditableTaskContent,
+	allocated: readonly AllocatedAttachment[],
+	removed: readonly string[],
+): EditableTaskContent {
+	const removedSet = new Set(removed);
+	const replacements = new Map<string, string>();
+	for (const attachment of allocated) {
+		if (attachment.input.id) {
+			if (replacements.has(attachment.input.id)) {
+				throw new Error('Task attachment markers must be unique.');
+			}
+			replacements.set(attachment.input.id, attachment.relativePath);
+		}
+	}
+
+	const materialized = {
+		...content,
+		request: replaceTaskAttachmentMarkers(removeTaskAttachmentReferences(content.request, removedSet), replacements),
+		refined: replaceTaskAttachmentMarkers(removeTaskAttachmentReferences(content.refined, removedSet), replacements),
+		scope: replaceTaskAttachmentMarkers(removeTaskAttachmentReferences(content.scope, removedSet), replacements),
+	};
+	for (const attachment of allocated) {
+		const marker = attachment.input.id ? `attachment://${attachment.input.id}` : undefined;
+		const alreadyReferenced = marker !== undefined &&
+			(content.request.includes(marker) || content.refined.includes(marker) || content.scope.includes(marker));
+		if (alreadyReferenced) {
+			continue;
+		}
+		materialized.request = `${materialized.request.trimEnd()}${materialized.request.trim() ? '\n\n' : ''}![${attachmentAltText(attachment.input.name)}](${attachment.relativePath})`;
+	}
+
+	// This call also rejects a task-local path that belongs to another task or
+	// contains traversal, while leaving ordinary/remote Markdown images alone.
+	for (const section of [materialized.request, materialized.refined, materialized.scope]) {
+		taskAttachmentReferences(taskId, section);
+	}
+	return materialized;
 }
 
 export interface AuditedPatchOptions {
@@ -174,6 +250,96 @@ export class TaskStore {
 
 	fileFor(id: string): vscode.Uri {
 		return vscode.Uri.joinPath(this.tasksDir, `${id}.md`);
+	}
+
+	/** The only directory in which files belonging to one task may live. */
+	attachmentDirectoryFor(id: string): vscode.Uri {
+		if (!/^TASK-\d+$/.test(id)) {
+			throw new Error(`Invalid task id: ${id}`);
+		}
+		return vscode.Uri.joinPath(this.tasksDir, `${id}.attachments`);
+	}
+
+	/** Resolves a validated generated relative reference without accepting paths from disk. */
+	attachmentFileFor(id: string, relativePath: string): vscode.Uri {
+		if (!isValidTaskAttachmentReference(id, relativePath)) {
+			throw new Error('Invalid task attachment path.');
+		}
+		const name = relativePath.slice(`${id}.attachments/`.length);
+		return vscode.Uri.joinPath(this.attachmentDirectoryFor(id), name);
+	}
+
+	private async listAttachmentFilesInternal(id: string): Promise<StoredTaskAttachment[]> {
+		const directory = this.attachmentDirectoryFor(id);
+		let entries: [string, vscode.FileType][];
+		try {
+			entries = await vscode.workspace.fs.readDirectory(directory);
+		} catch {
+			return [];
+		}
+
+		const attachments: StoredTaskAttachment[] = [];
+		for (const [name, type] of entries) {
+			if (type !== vscode.FileType.File || !isSafeTaskAttachmentName(name)) {
+				continue;
+			}
+			const mimeType = taskAttachmentMimeTypeForName(name);
+			if (!mimeType) {
+				continue;
+			}
+			const uri = vscode.Uri.joinPath(directory, name);
+			try {
+				const bytes = await vscode.workspace.fs.readFile(uri);
+				const validated = normalizeTaskAttachmentInput({ name, mimeType, data: bytes });
+				attachments.push({
+					name,
+					relativePath: taskAttachmentReference(id, name),
+					mimeType: validated.mimeType,
+					size: bytes.byteLength,
+					uri,
+				});
+			} catch {
+				// Invalid, oversized, or corrupt files are never exposed as task
+				// attachments. The Markdown renderer handles a missing reference.
+			}
+		}
+		return attachments;
+	}
+
+	/** Returns only valid image files referenced by this task, in Markdown order. */
+	async listAttachments(id: string): Promise<StoredTaskAttachment[]> {
+		const files = await this.listAttachmentFilesInternal(id);
+		if (files.length === 0) {
+			return [];
+		}
+		let raw: string;
+		try {
+			raw = Buffer.from(await vscode.workspace.fs.readFile(this.fileFor(id))).toString('utf8');
+		} catch {
+			return [];
+		}
+		const parsed = parseFile(raw);
+		const sections = parseSections(parsed.body);
+		let references: string[];
+		try {
+			references = taskAttachmentReferences(
+				id,
+				['Request', 'Refined', 'Scope'].map((name) => sections[name] ?? '').join('\n'),
+			);
+		} catch {
+			// A hand-edited invalid or cross-task image reference must not make a
+			// legacy task disappear from the board or prevent its detail modal opening.
+			references = [];
+		}
+		const byReference = new Map(files.map((attachment) => [attachment.relativePath, attachment]));
+		return references
+			.map((reference) => byReference.get(reference))
+			.filter((attachment): attachment is StoredTaskAttachment => attachment !== undefined);
+	}
+
+	/** Convenience boundary for ChatExecutor callers; routing stays set-local. */
+	async attachmentUrisForTask(id: string): Promise<vscode.Uri[]> {
+		return (await this.listAttachments(id)).map((attachment) => attachment.uri);
 	}
 
 	async ensureDirectory(): Promise<void> {
@@ -306,8 +472,8 @@ export class TaskStore {
 	 * are removed. This keeps a failed reorder or create from leaving a partial
 	 * column normalization behind.
 	 */
-	private async writeAtomicBatch(writes: AtomicWrite[]): Promise<void> {
-		if (writes.length === 0) {
+	private async writeAtomicBatch(writes: AtomicWrite[], deletes: vscode.Uri[] = []): Promise<void> {
+		if (writes.length === 0 && deletes.length === 0) {
 			return;
 		}
 
@@ -316,6 +482,11 @@ export class TaskStore {
 			...write,
 			temp: write.uri.with({ path: `${write.uri.path}.reorder.${batchId}.${index}.tmp` }),
 			backup: write.uri.with({ path: `${write.uri.path}.reorder.${batchId}.${index}.bak` }),
+			existed: false,
+			commitAttempted: false,
+		}));
+		const removals: AtomicDeleteEntry[] = deletes.map((uri) => ({
+			uri,
 			existed: false,
 			commitAttempted: false,
 		}));
@@ -349,14 +520,36 @@ export class TaskStore {
 					}
 				}
 
-				await vscode.workspace.fs.writeFile(write.temp, Buffer.from(write.content, 'utf8'));
+				await vscode.workspace.fs.writeFile(
+					write.temp,
+					typeof write.content === 'string' ? Buffer.from(write.content, 'utf8') : write.content,
+				);
 				if (write.existed) {
 					await vscode.workspace.fs.writeFile(write.backup, write.original!);
+				}
+			}
+			for (const removal of removals) {
+				try {
+					removal.original = await vscode.workspace.fs.readFile(removal.uri);
+					removal.existed = true;
+				} catch (error) {
+					const code = typeof error === 'object' && error !== null && 'code' in error
+						? (error as { code?: unknown }).code
+						: undefined;
+					if (code !== 'FileNotFound') {
+						throw error;
+					}
 				}
 			}
 			for (const write of temporary) {
 				write.commitAttempted = true;
 				await this.renameFile(write.temp, write.uri, { overwrite: true });
+			}
+			for (const removal of removals) {
+				removal.commitAttempted = true;
+				if (removal.existed) {
+					await vscode.workspace.fs.delete(removal.uri);
+				}
 			}
 			committed = true;
 		} catch (error) {
@@ -376,6 +569,17 @@ export class TaskStore {
 				} catch {
 					// Preserve the original provider error. The rollback is best effort
 					// because a failing provider may reject the restoration too.
+				}
+			}
+			for (const removal of removals) {
+				if (!removal.commitAttempted || !removal.existed) {
+					continue;
+				}
+				try {
+					await vscode.workspace.fs.writeFile(removal.uri, removal.original!);
+				} catch {
+					// Preserve the original provider error if the deleted attachment
+					// cannot be restored by the provider.
 				}
 			}
 			throw error;
@@ -455,6 +659,61 @@ export class TaskStore {
 		}
 	}
 
+	private async allocateAttachments(
+		id: string,
+		inputs: readonly NormalizedTaskAttachmentInput[],
+	): Promise<AllocatedAttachment[]> {
+		const used = new Set<string>();
+		try {
+			for (const [name, type] of await vscode.workspace.fs.readDirectory(this.attachmentDirectoryFor(id))) {
+				if (isSafeTaskAttachmentName(name)) {
+					used.add(name);
+				}
+			}
+		} catch {
+			/* The directory is created by the caller when the first image is written. */
+		}
+		const allocated: AllocatedAttachment[] = [];
+		for (const input of inputs) {
+			const sourceStem = input.name.replace(/\.[^.]+$/, '');
+			const stem = sourceStem.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'image';
+			const extension = taskAttachmentExtension(input.mimeType);
+			let name = `${stem}.${extension}`;
+			let suffix = 2;
+			while (used.has(name) || !isSafeTaskAttachmentName(name)) {
+				name = `${stem}-${suffix++}.${extension}`;
+			}
+			used.add(name);
+			allocated.push({
+				input,
+				name,
+				relativePath: taskAttachmentReference(id, name),
+				uri: vscode.Uri.joinPath(this.attachmentDirectoryFor(id), name),
+			});
+		}
+		return allocated;
+	}
+
+	private async attachmentDirectoryExists(id: string): Promise<boolean> {
+		try {
+			return (await vscode.workspace.fs.stat(this.attachmentDirectoryFor(id))).type === vscode.FileType.Directory;
+		} catch {
+			return false;
+		}
+	}
+
+	private async cleanupEmptyAttachmentDirectory(id: string): Promise<void> {
+		const directory = this.attachmentDirectoryFor(id);
+		try {
+			const entries = await vscode.workspace.fs.readDirectory(directory);
+			if (entries.length === 0) {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			}
+		} catch {
+			/* The directory may not exist or another provider may have removed it. */
+		}
+	}
+
 	async create(title: string, options?: NewTaskOptions): Promise<Task>;
 	async create(title: string, type: TaskType, options?: Omit<NewTaskOptions, 'type'>): Promise<Task>;
 	async create(
@@ -466,21 +725,53 @@ export class TaskStore {
 			const options: NewTaskOptions = typeof typeOrOptions === 'string'
 				? { ...suppliedOptions, type: typeOrOptions }
 				: typeOrOptions;
+			const attachmentChanges = normalizeTaskAttachmentChanges(options.attachments);
+			if (attachmentChanges.remove.length > 0) {
+				throw new Error('A new task cannot remove existing attachments.');
+			}
+			if (options.origin && attachmentChanges.add.length > 0) {
+				throw new Error('Agent-filed tasks cannot include staged binary attachments.');
+			}
 			await this.ensureDirectory();
 			const id = await this.nextId();
 			const { tasks } = await this.readAllInternal(false);
 			const backlog = orderTasks(tasks.filter((task) => task.state === 'backlog'));
 			const position = backlog.length;
+			const allocated = await this.allocateAttachments(id, attachmentChanges.add);
+			const materialized = materializeAttachmentReferences(id, {
+				title,
+				request: options.request?.trim() || title,
+				refined: '',
+				scope: '',
+			}, allocated, []);
 			const content = newTaskFile(id, title, {
 				type: options.type,
-				request: options?.request,
+				request: options.origin ? options.request : materialized.request,
 				origin: options?.origin,
 				position,
 				now: options?.now,
 			});
 			const writes = await this.positionWrites(backlog);
-			writes.push({ uri: this.fileFor(id), content });
+		for (const attachment of allocated) {
+			writes.push({ uri: attachment.uri, content: attachment.input.data });
+		}
+		writes.push({ uri: this.fileFor(id), content });
+		const hadAttachmentDirectory = await this.attachmentDirectoryExists(id);
+		if (allocated.length > 0 && !hadAttachmentDirectory) {
+			await vscode.workspace.fs.createDirectory(this.attachmentDirectoryFor(id));
+		}
+		try {
 			await this.writeAtomicBatch(writes);
+		} catch (error) {
+			if (allocated.length > 0 && !hadAttachmentDirectory) {
+				try {
+					await vscode.workspace.fs.delete(this.attachmentDirectoryFor(id), { recursive: true });
+				} catch {
+					/* Preserve the provider error; the directory may contain a failed temp. */
+				}
+			}
+			throw error;
+		}
 
 			const task = taskFromRaw(content, id, this.setId);
 			if (!task) {
@@ -588,7 +879,7 @@ export class TaskStore {
 	 * other extension-owned writes. Runtime state and the append-only Log are
 	 * intentionally not part of this operation.
 	 */
-	async edit(id: string, value: unknown): Promise<Task> {
+	async edit(id: string, value: unknown, attachmentValue?: unknown): Promise<Task> {
 		return this.serialize(async () => {
 			if (typeof id !== 'string' || !TASK_FILE.test(`${id}.md`)) {
 				throw new Error(`Invalid task id: ${String(id)}`);
@@ -612,7 +903,18 @@ export class TaskStore {
 			}
 
 			const content: EditableTaskContent = normalizeEditableTaskContent(value);
-			const edited = updateEditableTaskContent(raw, content);
+			const attachmentChanges = normalizeTaskAttachmentChanges(attachmentValue);
+			if (attachmentChanges.remove.some((reference) => !isValidTaskAttachmentReference(id, reference))) {
+				throw new Error('Removed attachments must belong to the current task.');
+			}
+			const allocated = await this.allocateAttachments(id, attachmentChanges.add);
+			const materialized = materializeAttachmentReferences(
+				id,
+				content,
+				allocated,
+				attachmentChanges.remove,
+			);
+			const edited = updateEditableTaskContent(raw, materialized);
 			const now = new Date();
 			const previousUpdated = current.updated ? Date.parse(current.updated) : Number.NaN;
 			if (Number.isFinite(previousUpdated) && now.getTime() <= previousUpdated) {
@@ -622,7 +924,39 @@ export class TaskStore {
 				updated: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),
 				pending_outcome: undefined,
 			});
-			await this.writeAtomic(uri, updated);
+			const existingAttachments = await this.listAttachmentFilesInternal(id);
+			const sections = parseSections(parseFile(updated).body);
+			const references = new Set(taskAttachmentReferences(
+				id,
+				['Request', 'Refined', 'Scope'].map((name) => sections[name] ?? '').join('\n'),
+			));
+			const deletes = existingAttachments
+				.filter((attachment) => !references.has(attachment.relativePath))
+				.map((attachment) => attachment.uri);
+			const writes: AtomicWrite[] = allocated.map((attachment) => ({
+				uri: attachment.uri,
+				content: attachment.input.data,
+			}));
+			writes.push({ uri, content: updated });
+			const hadAttachmentDirectory = await this.attachmentDirectoryExists(id);
+			if (allocated.length > 0 && !hadAttachmentDirectory) {
+				await vscode.workspace.fs.createDirectory(this.attachmentDirectoryFor(id));
+			}
+			try {
+				await this.writeAtomicBatch(writes, deletes);
+			} catch (error) {
+				if (allocated.length > 0 && !hadAttachmentDirectory) {
+					try {
+						await vscode.workspace.fs.delete(this.attachmentDirectoryFor(id), { recursive: true });
+					} catch {
+						/* Preserve the provider error. */
+					}
+				}
+				throw error;
+			}
+			if (deletes.length > 0) {
+				await this.cleanupEmptyAttachmentDirectory(id);
+			}
 
 			const task = taskFromRaw(updated, id, this.setId);
 			if (!task) {
@@ -770,6 +1104,30 @@ export class TaskStore {
 			const uri = this.fileFor(id);
 			const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
 			await this.writeAtomic(uri, appendLogLine(raw, line));
+		});
+	}
+
+	/** Deletes one task and only its task-specific attachment directory. */
+	async delete(id: string): Promise<void> {
+		await this.serialize(async () => {
+			if (!/^TASK-\d+$/.test(id)) {
+				throw new Error(`Invalid task id: ${id}`);
+			}
+			try {
+				await vscode.workspace.fs.delete(this.attachmentDirectoryFor(id), { recursive: true });
+			} catch (error) {
+				if (
+					error &&
+					typeof error === 'object' &&
+					'code' in error &&
+					(error as { code?: unknown }).code === 'FileNotFound'
+				) {
+					/* Legacy and text-only tasks have no attachment directory. */
+				} else {
+					throw error;
+				}
+			}
+			await vscode.workspace.fs.delete(this.fileFor(id));
 		});
 	}
 

@@ -313,34 +313,7 @@ export function activate(context_: vscode.ExtensionContext) {
 				return;
 			}
 			await ctx.ready;
-			const title = await vscode.window.showInputBox({
-				prompt: 'Task title',
-				placeHolder: 'e.g. Prepare launch notes',
-			});
-			if (!title?.trim()) {
-				return;
-			}
-			// §6.16: matches the board's own New Task modal — title required,
-			// description optional (falls back to the title as Request if left blank).
-			const description = await vscode.window.showInputBox({
-				prompt: 'Description (optional)',
-				placeHolder: 'What needs to happen?',
-			});
-			const taskType = await vscode.window.showQuickPick<{ label: string; description: string; value: TaskType }>(
-				[
-					{ label: 'Feature', description: 'A new capability or improvement.', value: 'feature' },
-					{ label: 'Bug', description: 'A defect or regression to fix.', value: 'bug' },
-				],
-				{ placeHolder: 'Task type (required)' },
-			);
-			if (!taskType) {
-				return;
-			}
-			await createTaskFromCommandInput(ctx.store, {
-				title,
-				description,
-				taskType: taskType.value,
-			});
+			BoardPanel.show(ctx, context_.extensionUri).openNewTask();
 		}),
 
 		vscode.commands.registerCommand('kanban-pilot.createTaskSet', async () => {
