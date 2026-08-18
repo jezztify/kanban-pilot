@@ -266,7 +266,19 @@ export function activate(context_: vscode.ExtensionContext) {
 		let previousMaxParallelTasks = normalizeMaxParallelTasks(runConfig.get<number>('maxParallelTasks', 1));
 		context_.subscriptions.push(
 			vscode.workspace.onDidChangeConfiguration((event) => {
-				if (!event.affectsConfiguration('kanbanPilot.run.maxParallelTasks')) {
+				if (event.affectsConfiguration('kanbanPilot.tasksDir')) {
+					void vscode.window.showInformationMessage(
+						'Kanban Pilot task folder changed. Reload the VS Code window to switch the active task-set context safely.',
+					);
+				}
+				if (event.affectsConfiguration('kanbanPilot.board.openOnStartup')) {
+					void vscode.window.showInformationMessage(
+						'Kanban Pilot startup setting changed. Reload the VS Code window for it to take effect.',
+					);
+				}
+				const capacityChanged = event.affectsConfiguration('kanbanPilot.run.maxParallelTasks');
+				const gatesChanged = event.affectsConfiguration('kanbanPilot.gates');
+				if (!capacityChanged && !gatesChanged) {
 					return;
 				}
 				const currentMaxParallelTasks = normalizeMaxParallelTasks(
@@ -274,8 +286,10 @@ export function activate(context_: vscode.ExtensionContext) {
 				);
 				const increased = currentMaxParallelTasks > previousMaxParallelTasks;
 				previousMaxParallelTasks = currentMaxParallelTasks;
-				if (increased) {
-					void workspaceContext?.runManager.reconcileTaskChange().then(() => workspaceContext.runManager.applyGatePolicies());
+				if (gatesChanged || increased) {
+					void workspaceContext?.ready
+						.then(() => workspaceContext.runManager.reconcileTaskChange())
+						.then(() => workspaceContext.runManager.applyGatePolicies());
 				}
 			}),
 		);
@@ -471,6 +485,35 @@ export function activate(context_: vscode.ExtensionContext) {
 			}
 			const note = await vscode.window.showInputBox({ prompt: 'One-line summary' });
 			await ctx.runManager.markRunComplete(id, result.label as 'ok' | 'blocked' | 'failed', note ?? '');
+		}),
+
+		vscode.commands.registerCommand('kanban-pilot.applyPendingOutcome', async (taskId?: string) => {
+			const ctx = context();
+			if (!ctx) {
+				return;
+			}
+			await ctx.ready;
+			const { tasks } = await ctx.store.readAll();
+			const pending = tasks.filter((task) => task.pendingOutcome);
+			let id = taskId;
+			if (!id) {
+				if (pending.length === 0) {
+					void vscode.window.showInformationMessage('No pending completion outcomes are available.');
+					return;
+				}
+				const pick = await vscode.window.showQuickPick(
+					pending.map((task) => ({
+						label: task.id,
+						description: `${task.title} — ${task.pendingOutcome!.gate}`,
+						id: task.id,
+					})),
+					{ placeHolder: 'Apply which pending completion?' },
+				);
+				id = pick?.id;
+			}
+			if (id) {
+				await ctx.runManager.applyPendingOutcome(id);
+			}
 		}),
 
 		vscode.commands.registerCommand('kanban-pilot.deleteTask', async (taskId?: string) => {

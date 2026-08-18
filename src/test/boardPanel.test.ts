@@ -6,21 +6,31 @@ import * as vscode from 'vscode';
 import { JSDOM } from 'jsdom';
 
 import {
+	ALL_KANBAN_SETTING_KEYS,
 	BoardPanel,
 	BoardTaskSetHost,
 	GATES,
 	isAgentColumn,
 	isAgentNameValue,
+	isEditableSettingKey,
 	isGateKey,
 	persistAgentNameOverride,
+	persistAgentNameOverrides,
 	persistGateSetting,
+	persistSetting,
+	resetSetting,
 	SETTINGS_COLUMNS,
+	SETTING_DEFINITIONS,
 	settingsStateFor,
+	settingsValuesFor,
+	primaryAction,
 	updateAgentNameOverrides,
+	validateSettingValue,
 } from '../board/boardPanel';
 import { Executor } from '../chat/executor';
 import { RunManager } from '../chat/runManager';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
+import { encodePendingOutcome } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 
 const noopExecutor: Executor = {
@@ -74,6 +84,12 @@ function clickElement(element: unknown): void {
 }
 
 suite('BoardPanel Settings', () => {
+	test('failed timeout cards keep their normal retry action', () => {
+		assert.strictEqual(primaryAction('refine', 'failed'), 'refine');
+		assert.strictEqual(primaryAction('in-progress', 'failed'), 'continue');
+		assert.strictEqual(primaryAction('validation', 'failed'), 'validate');
+	});
+
 	test('validates gate and column payload values and projects all seven effective labels', () => {
 		assert.strictEqual(isGateKey('backlogToRefine'), true);
 		assert.strictEqual(isGateKey('unknown'), false);
@@ -87,8 +103,12 @@ suite('BoardPanel Settings', () => {
 		const state = settingsStateFor(
 			{ backlogToRefine: 'auto', scopedToApproved: 'manual' },
 			{ backlog: 'Queue Keeper', 'in-progress': 'Ship It Steve' },
+			[{ name: 'Queue Keeper', description: 'Handles the queue', source: 'workspace' }],
 		);
 		assert.deepStrictEqual(state.gates, { backlogToRefine: 'auto', scopedToApproved: 'manual' });
+		assert.deepStrictEqual(state.availableAgents, [
+			{ name: 'Queue Keeper', description: 'Handles the queue', source: 'workspace' },
+		]);
 		assert.strictEqual(Object.keys(state.agents).length, 7);
 		assert.strictEqual(state.agents.backlog, 'Queue Keeper');
 		assert.strictEqual(state.agents.refine, 'Bro Refiner');
@@ -99,6 +119,68 @@ suite('BoardPanel Settings', () => {
 			SETTINGS_COLUMNS.map((column) => column.id),
 			['backlog', 'refine', 'scoped', 'approved', 'in-progress', 'validation', 'done'],
 		);
+	});
+
+	test('keeps the in-board catalog aligned with all 24 contributed keys', () => {
+		assert.strictEqual(ALL_KANBAN_SETTING_KEYS.length, 24);
+		assert.deepStrictEqual([...SETTING_DEFINITIONS].map((definition) => definition.key), [...ALL_KANBAN_SETTING_KEYS]);
+		assert.strictEqual(isEditableSettingKey('chat.agentNames'), true);
+		assert.strictEqual(isEditableSettingKey('kanbanPilot.chat.mode'), false);
+		assert.strictEqual(validateSettingValue('chat.mode', 'ask').ok, true);
+		assert.strictEqual(validateSettingValue('chat.mode', 'invalid').ok, false);
+		assert.strictEqual(validateSettingValue('tasksDir', '.kanban-pilot/tasks').ok, true);
+		assert.strictEqual(validateSettingValue('tasksDir', '../outside').ok, false);
+		assert.strictEqual(validateSettingValue('tasksDir', 'C:\\outside').ok, false);
+		assert.strictEqual(validateSettingValue('run.timeoutMinutes', 0).ok, false);
+		assert.strictEqual(validateSettingValue('run.timeoutMinutes', 2.5).ok, true);
+		assert.strictEqual(validateSettingValue('run.maxParallelTasks', 0).ok, false);
+		assert.strictEqual(validateSettingValue('run.maxParallelTasks', 1.5).ok, false);
+		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search', 'edit']).ok, true);
+		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search\nedit']).ok, false);
+		assert.strictEqual(validateSettingValue('chat.modelSelector', { id: 'gpt', vendor: 'copilot' }).ok, true);
+		assert.strictEqual(validateSettingValue('chat.modelSelector', { unknown: 'value' }).ok, false);
+		assert.strictEqual(validateSettingValue('chat.agentNames', { refine: 'Custom Refiner' }).ok, true);
+		assert.strictEqual(validateSettingValue('chat.agentNames', { unknown: 'Agent' }).ok, false);
+
+		const values = settingsValuesFor({
+			get<T>(key: string, fallback?: T): T | undefined {
+				if (key === 'chat.mode') { return 'ask' as T; }
+				if (key === 'run.maxParallelTasks') { return 3 as T; }
+				if (key === 'chat.toolsExclude') { return ['memory'] as T; }
+				return fallback;
+			},
+		} as Pick<vscode.WorkspaceConfiguration, 'get'>);
+		assert.strictEqual(values['chat.mode'], 'ask');
+		assert.strictEqual(values['run.maxParallelTasks'], 3);
+		assert.deepStrictEqual(values['chat.toolsExclude'], ['memory']);
+		assert.strictEqual(values['chat.closeTabOnDone'], true);
+	});
+
+	test('persists validated settings at workspace scope and resets without writing invalid payloads', async () => {
+		const writes: { key: string; value: unknown; target: vscode.ConfigurationTarget }[] = [];
+		const configuration = {
+			async update(key: string, value: unknown, target: vscode.ConfigurationTarget) {
+				writes.push({ key, value, target });
+			},
+		};
+
+		const valid = await persistSetting(configuration, 'chat.toolsExclude', ['memory', 'resolveMemoryFileUri']);
+		assert.strictEqual(valid.ok, true);
+		assert.deepStrictEqual(writes[0], {
+			key: 'chat.toolsExclude',
+			value: ['memory', 'resolveMemoryFileUri'],
+			target: vscode.ConfigurationTarget.Workspace,
+		});
+		const invalid = await persistSetting(configuration, 'run.maxParallelTasks', 0);
+		assert.strictEqual(invalid.ok, false);
+		assert.strictEqual(writes.length, 1);
+		assert.strictEqual(await resetSetting(configuration, 'chat.toolsExclude'), true);
+		assert.deepStrictEqual(writes[1], {
+			key: 'chat.toolsExclude',
+			value: undefined,
+			target: vscode.ConfigurationTarget.Workspace,
+		});
+		assert.strictEqual(await resetSetting(configuration, 'not-a-setting'), false);
 	});
 
 	test('updates and resets column assignments while preserving legacy compatibility', () => {
@@ -146,6 +228,36 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(writes.length, 2);
 	});
 
+	test('persists all agent assignments in one atomic workspace write', async () => {
+		const writes: { key: string; value: unknown; target: vscode.ConfigurationTarget }[] = [];
+		const configuration = {
+			async update(key: string, value: unknown, target: vscode.ConfigurationTarget) {
+				writes.push({ key, value, target });
+			},
+		};
+
+		await persistAgentNameOverrides(configuration, { develop: 'Legacy Coder', validate: 'Legacy QA' }, {
+			backlog: 'Queue Keeper',
+			refine: 'Local Refiner',
+			scoped: '',
+			approved: '',
+			'in-progress': 'Ship It Steve',
+			validation: 'Quality Pilot',
+			done: '',
+		});
+
+		assert.deepStrictEqual(writes, [{
+			key: 'chat.agentNames',
+			value: {
+				backlog: 'Queue Keeper',
+				refine: 'Local Refiner',
+				'in-progress': 'Ship It Steve',
+				validation: 'Quality Pilot',
+			},
+			target: vscode.ConfigurationTarget.Workspace,
+		}]);
+	});
+
 	test('renders one Settings entry point and rejects invalid webview messages', async () => {
 		const directory = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-board-${Date.now()}-${Math.random().toString(36).slice(2)}`),
@@ -190,6 +302,13 @@ suite('BoardPanel Settings', () => {
 			assert.match(panel.webview.html, /id="settingsCategoryAgents"[^>]*role="tab"[^>]*aria-selected="false"[^>]*aria-controls="settingsPanelAgents"[^>]*tabindex="-1"/);
 			assert.match(panel.webview.html, /id="settingsPanelGates"[^>]*role="tabpanel"[^>]*aria-labelledby="settingsCategoryGates"/);
 			assert.match(panel.webview.html, /id="settingsPanelAgents"[^>]*role="tabpanel"[^>]*aria-labelledby="settingsCategoryAgents"[^>]*hidden[^>]*aria-hidden="true"/);
+			for (const key of ALL_KANBAN_SETTING_KEYS) {
+				assert.ok(panel.webview.html.includes(`"key":"${key}"`), `catalog includes ${key}`);
+			}
+			for (const category of ['Workspace', 'Chat', 'Tools', 'Run', 'Layout']) {
+				assert.ok(panel.webview.html.includes(`id="settingsPanel${category}"`));
+				assert.ok(panel.webview.html.includes(`id="settingsFields${category}"`));
+			}
 			assert.match(panel.webview.html, /id="settingsMain"[^>]*role="region"/);
 			assert.ok(!panel.webview.html.includes('id="gatesToggle"'));
 			assert.ok(!panel.webview.html.includes('id="agentNameModal"'));
@@ -209,8 +328,18 @@ suite('BoardPanel Settings', () => {
 			assert.match(script, /event\.key === 'Home'/);
 			assert.match(script, /event\.key === 'End'/);
 			assert.match(script, /settings-panel:not\(\[hidden\]\)/);
+			assert.match(script, /document\.createElement\('select'\)/);
+			assert.match(script, /availableAgents/);
+			assert.match(script, /settings\/refresh/);
+			assert.match(script, /SETTING_DEFINITIONS/);
+			assert.match(script, /type: 'settings\/set'/);
+			assert.match(script, /type: 'settings\/reset'/);
+			assert.match(script, /settingControlValue/);
+			assert.match(script, /setting-error/);
+			assert.match(script, /Reload required after saving or resetting/);
+			assert.doesNotMatch(script, /agent-setting-input/);
 			assert.match(script, /type: 'gates\/set'/);
-			assert.match(script, /type: 'agentName\/set'/);
+			assert.match(script, /type: 'agents\/save'/);
 			assert.match(script, /type: 'task\/edit'/);
 			assert.match(panel.webview.html, /id="newTaskType"[^>]*required/);
 			assert.match(panel.webview.html, /<option value="feature">Feature<\/option>/);
@@ -393,6 +522,121 @@ suite('BoardPanel Settings', () => {
 					});
 				},
 			});
+			dispatchWebviewMessage(dom, {
+			type: 'settings/state',
+			gates: {},
+			agents: {
+				backlog: 'None',
+				refine: 'Bro Refiner',
+				scoped: 'None',
+				approved: 'None',
+				'in-progress': 'Legacy Coder',
+				validation: 'Quality Pilot',
+				done: 'None',
+			},
+			availableAgents: [
+				{ name: 'Local Agent', description: 'Workspace agent', source: 'workspace' },
+				{ name: 'Quality Pilot', description: 'Checks quality', source: 'user' },
+			],
+			values: {
+				tasksDir: '.kanban-pilot/tasks',
+				'chat.mode': 'agent',
+				'chat.sessionPrefix': 'kanban-pilot-',
+				'chat.closeTabOnDone': true,
+				'chat.resetOnApprove': false,
+				'refine.toolsInclude': [],
+				'chat.toolsExclude': ['memory'],
+				'chat.modelSelector': { id: 'gpt', vendor: 'copilot' },
+				'run.timeoutMinutes': 20,
+				'run.maxParallelTasks': 1,
+				'board.openOnStartup': false,
+				'layout.dockChat': true,
+				'layout.dockChatOnSelect': false,
+				'chat.allowTaskProposals': true,
+			},
+		});
+		clickElement(dom.window.document.getElementById('settingsToggle'));
+		const settingsDocument = dom.window.document;
+		assert.ok(posted.some((message) => (
+			message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'settings/refresh'
+		)));
+		assert.strictEqual(settingsDocument.querySelectorAll('.agent-setting-select').length, 7);
+		assert.strictEqual(
+			Array.from(settingsDocument.querySelectorAll('#settingsPanelAgents button'))
+				.filter((button) => button.textContent === 'Save').length,
+			1,
+		);
+		assert.strictEqual(settingsDocument.querySelectorAll('.agent-setting-actions button').length, 7);
+		assert.strictEqual(settingsDocument.querySelectorAll('.setting-row').length, 14);
+		assert.strictEqual((settingsDocument.getElementById('setting-chat-toolsExclude') as HTMLTextAreaElement).value, 'memory');
+		assert.strictEqual((settingsDocument.getElementById('setting-chat-modelSelector-id') as HTMLInputElement).value, 'gpt');
+		const taskDirInput = settingsDocument.getElementById('setting-tasksDir') as HTMLInputElement;
+		taskDirInput.value = 'custom/tasks';
+		clickElement(settingsDocument.querySelector('#setting-tasksDir-row .setting-actions button'));
+		assert.deepStrictEqual(
+			JSON.parse(JSON.stringify(posted.filter((message) => (
+				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'settings/set'
+			)).at(-1))),
+			{ type: 'settings/set', key: 'tasksDir', value: 'custom/tasks' },
+		);
+		const toolsExclude = settingsDocument.getElementById('setting-chat-toolsExclude') as HTMLTextAreaElement;
+		toolsExclude.value = 'memory\nsearch';
+		clickElement(settingsDocument.querySelector('#setting-chat-toolsExclude-row .setting-actions button'));
+		assert.deepStrictEqual(
+			JSON.parse(JSON.stringify(posted.filter((message) => (
+				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'settings/set'
+			)).at(-1))),
+			{ type: 'settings/set', key: 'chat.toolsExclude', value: ['memory', 'search'] },
+		);
+		clickElement(settingsDocument.querySelector('#setting-chat-toolsExclude-row .setting-actions button:nth-child(2)'));
+		assert.deepStrictEqual(
+			JSON.parse(JSON.stringify(posted.filter((message) => (
+				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'settings/reset'
+			)).at(-1))),
+			{ type: 'settings/reset', key: 'chat.toolsExclude' },
+		);
+		dispatchWebviewMessage(dom, { type: 'settings/error', key: 'run.maxParallelTasks', error: 'Must be at least 1.' });
+		const settingError = settingsDocument.getElementById('setting-run-maxParallelTasks-error');
+		assert.strictEqual(settingError?.hidden, false);
+		assert.strictEqual(settingError?.textContent, 'Must be at least 1.');
+		const refineSelect = settingsDocument.getElementById('agent-select-refine') as HTMLSelectElement;
+		assert.strictEqual(refineSelect.value, '');
+		assert.strictEqual(refineSelect.options[0]?.textContent, 'Bro Refiner');
+		assert.ok(!Array.from(refineSelect.options).some((option) => option.textContent === 'Bro Refiner (current)'));
+		const legacySelect = settingsDocument.getElementById('agent-select-in-progress') as HTMLSelectElement;
+		assert.strictEqual(legacySelect.value, 'Legacy Coder');
+		assert.ok(Array.from(legacySelect.options).some((option) => option.textContent === 'Legacy Coder (current)'));
+		refineSelect.value = 'Local Agent';
+		clickElement(settingsDocument.querySelector('#agent-setting-refine .agent-setting-actions button'));
+		assert.strictEqual(refineSelect.value, '', 'Reset should clear only its column until the shared Save is clicked');
+
+		const expectedAssignments = {
+			backlog: 'Local Agent',
+			refine: '',
+			scoped: 'Quality Pilot',
+			approved: '',
+			'in-progress': 'Quality Pilot',
+			validation: '',
+			done: 'Local Agent',
+		};
+		for (const [column, value] of Object.entries(expectedAssignments)) {
+			(settingsDocument.getElementById('agent-select-' + column) as HTMLSelectElement).value = value;
+		}
+		const beforeAgentSaveMessages = posted.length;
+		clickElement(settingsDocument.getElementById('agentSettingsSave'));
+		const agentSaveMessage = posted.slice(beforeAgentSaveMessages).find((message) => (
+			message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'agents/save'
+		));
+		assert.deepStrictEqual(
+			JSON.parse(JSON.stringify(agentSaveMessage)),
+			{ type: 'agents/save', values: expectedAssignments },
+		);
+		assert.strictEqual(
+			posted.slice(beforeAgentSaveMessages).filter((message) => (
+				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'agentName/set'
+			)).length,
+			0,
+		);
 
 			const taskEditMessages = () => posted.filter((message) => (
 				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'task/edit'
@@ -547,10 +791,172 @@ suite('BoardPanel Settings', () => {
 	}
 	});
 
-	test('defines the same four gate rows used by the Settings protocol', () => {
+	test('defines the same nine gate rows used by the Settings protocol', () => {
 		assert.deepStrictEqual(
 			GATES.map((gate) => gate.key),
-			['backlogToRefine', 'scopedToApproved', 'approvedToInProgress', 'validationAutoStart'],
+			[
+				'backlogToRefine',
+				'refineToScoped',
+				'scopedToApproved',
+				'approvedToInProgress',
+				'developToValidation',
+				'validationAutoStart',
+				'validateToDone',
+				'validateFailedToInProgress',
+				'splitToDone',
+			],
 		);
+	});
+
+	test('projects and renders pending completion with an accessible apply action', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-pending-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-pending-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardPendingTest',
+			'Kanban Pilot Pending Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
+		const board = new constructor(panel, host);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Pending Develop completion');
+			await store.patch(task.id, {
+				state: 'in-progress',
+				status: 'idle',
+				pending_outcome: encodePendingOutcome({
+					gate: 'developToValidation',
+					stage: 'develop',
+					result: 'ok',
+					runId: 'r-pending',
+				}),
+			});
+
+			const toView = (board as unknown as {
+				toView(snapshot: unknown, agentNames: unknown, taskSets: unknown[]): unknown;
+			}).toView.bind(board);
+			const projected = toView(await store.snapshot(), {}, [activeSet]) as {
+				columns: { id: string; cards: { id: string; pending?: { gate: string; label: string; stage: string; result: string; runId: string } }[] }[];
+			};
+			const projectedCard = projected.columns.find((column) => column.id === 'in-progress')?.cards
+				.find((card) => card.id === task.id);
+			assert.deepStrictEqual(projectedCard?.pending, {
+				gate: 'developToValidation',
+				label: 'Develop → Validation',
+				description: 'Commit a successful Develop receipt into Validation automatically.',
+				stage: 'develop',
+				result: 'ok',
+				runId: 'r-pending',
+			});
+
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({
+							postMessage(message: unknown) {
+								posted.push(message);
+							},
+						}),
+					});
+				},
+			});
+			const pendingView = projectedCard?.pending;
+			assert.ok(pendingView);
+			dispatchWebviewMessage(dom, {
+				type: 'board/state',
+				selectedTaskId: task.id,
+				snapshot: {
+					malformed: [],
+					taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+					activeTaskSetId: activeSet.id,
+					activeTaskSetName: activeSet.name,
+					columns: [{
+						id: 'in-progress',
+						label: 'In Progress',
+						agent: 'Bro Coder',
+						stage: 'develop',
+						count: 1,
+						cards: [{
+							id: task.id,
+							title: task.title,
+							type: 'feature',
+							typeLabel: 'Feature',
+							status: 'idle',
+							primary: 'continue',
+							pending: pendingView,
+							canSplit: false,
+						}],
+					}],
+				},
+			});
+			const card = dom.window.document.querySelector('.card');
+			assert.strictEqual(card?.querySelector('.status-text.pending')?.textContent, 'Pending: Develop → Validation');
+			assert.strictEqual(card?.querySelector('.status-text.pending')?.getAttribute('aria-label'), 'Pending completion: Develop → Validation');
+			assert.match(card?.getAttribute('aria-label') ?? '', /Pending completion: Develop → Validation/);
+
+			dispatchWebviewMessage(dom, {
+				type: 'task/detail',
+				task: {
+					id: task.id,
+					title: task.title,
+					type: 'feature',
+					typeLabel: 'Feature',
+					state: 'in-progress',
+					stateLabel: 'In Progress',
+					status: 'idle',
+					canEdit: true,
+					request: '',
+					refined: '',
+					scope: '',
+					lastLog: '',
+					pending: pendingView,
+					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
+					secondary: null,
+				},
+			});
+			const applyButton = Array.from(dom.window.document.querySelectorAll('button'))
+				.find((button) => button.textContent === 'Apply Develop → Validation');
+			assert.ok(applyButton);
+			assert.strictEqual(applyButton?.getAttribute('aria-label'), 'Apply pending completion: Develop → Validation');
+			clickElement(applyButton);
+			assert.deepStrictEqual(
+				JSON.parse(JSON.stringify(posted.at(-1))),
+				{ type: 'pending/apply', taskId: task.id },
+			);
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
 	});
 });

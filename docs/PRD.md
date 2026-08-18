@@ -340,6 +340,9 @@ scope_hash: 4e91a0c    # hash of ## Scope as refine wrote it; mismatch ⇒ human
 chat_reset_required: false    # set when a misroute may have polluted this session (§6.9)
 checkpoint: a3f9c21    # git sha of pre-develop checkpoint
 origin_task: TASK-118  # set only if this task was filed by another task's run (§6.12)
+origin_run: r19        # source run for durable proposal reconciliation (§6.12)
+origin_proposal: a1b2c3d4e5f6  # stable source-proposal identity (§6.14)
+pending_outcome: {"gate":"refineToScoped","stage":"refine","result":"ok","runId":"r7","scopeHash":"4e91a0c"}  # extension-owned receipt completion waiting for its gate (§6.15)
 ---
 
 ## Request
@@ -369,7 +372,7 @@ Add a signed webhook endpoint for Stripe billing events.
 
 | Section | Written by | Notes |
 | --- | --- | --- |
-| Frontmatter (except `title`) | Extension only for extension-supervised runs | The generated prompt explicitly assigns ownership to `RunManager` (§6.5). A direct skill run has no extension supervisor and follows the skill's own legal transition rules. Includes `position` — an optional non-negative numeric order interpreted within the task's current column — and `origin_task` (§6.12), which is set only on a task an agent filed via `propose-task`, never by the agent itself. The board editor preserves all of these fields, including workflow state/status, ordering, run/session metadata, checkpoint, origin metadata, and `scope_hash` |
+| Frontmatter (except `title`) | Extension only for extension-supervised runs | The generated prompt explicitly assigns ownership to `RunManager` (§6.5). A direct skill run has no extension supervisor and follows the skill's own legal transition rules. Includes `position` — an optional non-negative numeric order interpreted within the task's current column — `origin_task`, `origin_run`, and `origin_proposal` (§6.12, §6.14), which are set only on a task an agent filed via `propose-task`, never by the agent itself, and `pending_outcome` (§6.15), a validated flat JSON scalar written only by receipt reconciliation. The board editor preserves all of these fields, including workflow state/status, ordering, run/session metadata, checkpoint, origin metadata, `scope_hash`, and pending completion metadata |
 | `title` | Human through the board editor; extension serialization | Single-line, non-blank, at most 200 characters. Editing the title does not alter any other frontmatter field |
 | `type` | Human/agent selection through extension serialization | Exactly one canonical value: `feature` or `bug`. Missing or invalid legacy values are read as `feature` and backfilled to disk when the file is loaded; malformed files without valid frontmatter remain in the malformed-file warning instead of becoming tasks |
 | `## Request` | Human through the board editor | Markdown; editable in the selected task's detail modal rather than being an immutable raw-file-only field |
@@ -431,10 +434,14 @@ the workflow column (`backlog` through `done`); status is the runtime condition 
 mutation changes both, the state-change entry is written before the status-change entry.
 Activity start is written only after a run is admitted and persisted as `running`. Activity
 finish records `ok`, `blocked`, `failed`, `timeout`, executor `error`, `missing-receipt`,
-`stopped`, or `superseded` outcomes. A missing-receipt fallback is marked provisional; a valid
-late receipt appends one explicit, idempotent correction finish rather than another start.
+`stopped`, or `superseded` outcomes. Missing-receipt and timeout fallbacks are marked
+provisional and retain a parseable marker receipt while the task remains retryable. A valid
+late receipt from the same run and stage can recover either fallback only while the task is
+still in the expected working column with no newer run or later manual transition; it appends
+one explicit, idempotent correction finish rather than another start.
 Reload reconciliation, repeated file-watcher passes, and stale run results use the task/run
-identity to avoid duplicating lifecycle entries.
+identity and audit order to avoid duplicating lifecycle entries or allowing an old timed-out
+run to reclaim newer work.
 
 The extension writes frontmatter changes and the corresponding audit entries through one
 serialized atomic task-store mutation. Agent receipts and proposals can still be appended and
@@ -462,9 +469,15 @@ sequenceDiagram
     C->>F: edits repo, appends "- run:r8 ... result:ok"
     F-->>R: blockOnResponse resolves; re-read finds the receipt
     R->>R: both signals present → ok
-    R->>B: runComplete(ok)
-    B->>F: state=validation, status=idle, run=null
-    B->>U: card moves to Validation, awaiting Validate
+    R->>F: status=idle, run=null, pending_outcome (manual policy)
+    alt developToValidation=auto
+      R->>F: apply pending outcome; state=validation, clear pending
+      B->>U: card moves to Validation, awaiting Validate
+    else manual policy
+      B->>U: card stays In Progress with Apply Pending Completion
+      U->>B: click Apply Pending Completion
+      B->>F: state=validation, clear pending
+    end
 ```
 
     This lifecycle describes an extension-supervised run: the agent supplies the
@@ -473,11 +486,26 @@ sequenceDiagram
     run does not use this executor/ watcher boundary and instead follows the
     standalone skill's direct-run transition rules.
 
+    For a manual receipt-completion gate, `runComplete(ok)` means the run is finished, not that the
+    card has crossed the next column boundary. The extension persists `pending_outcome` beside the
+    cleared `run` field, so the decision survives reload and can be applied from the card detail
+    dialog, palette command, activation reconciliation, a file-watcher pass, or a later gate-setting
+    change. Automatic promotion and the explicit human action both validate the matching receipt and
+    use one compare-and-set state-machine path; an outcome cannot be applied twice or used to launch
+    another stage run. Human-only retries, Stop + reset, Reopen, and arbitrary moves remain outside
+    this completion protocol.
+
 **Failure and escape hatches** — all of which are required, because the receipt is a
 cooperative protocol with a non-deterministic party:
 
-- **Timeout** (`kanbanPilot.run.timeoutMinutes`, default 20) → status `failed`, card offers retry.
-  Still required: `blockOnResponse` is a promise that can outlive the run's usefulness.
+- **Timeout** (`kanbanPilot.run.timeoutMinutes`, default 20) → a parseable `result:failed`
+  timeout marker, a provisional `timeout` audit finish, status `failed`, and a normal retry
+  affordance. Before committing that fallback, the extension rechecks the task file for a
+  receipt written around the deadline. If the Copilot turn later writes a matching receipt,
+  the watcher, activation reconciliation, or bounded backstop may apply its ordinary
+  stage-specific result exactly once. A newer retry, Stop, or manual move supersedes the old
+  run and prevents that late output from changing the card. Still required: `blockOnResponse`
+  is a promise that can outlive the run's usefulness, and its eventual rejection is consumed.
 - **Awaited but no receipt** → status `blocked`. Usually means the agent stopped to ask a
   question — `blockOnResponse` counts *pending user confirmation* as terminal, so this is the
   common case, not an edge case. The card deep-links into its session (§6.7) so the user lands
@@ -1116,9 +1144,13 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `task/open` | `{ taskId }` — opens the markdown file in an editor |
 | view → ext | `task/openChat` | `{ taskId }` — the modal's Open Chat button; docks that task's chat beside the board (§6.10) |
 | ext → view | `task/editError` | `{ taskId?, error }` — visible save failure shown without closing the editor |
-| ext → view | `settings/state` | `{ gates, agents }` — current values of all four `kanbanPilot.gates.*` settings and the effective assignment for all seven columns (§6.15, §6.17) |
+| ext → view | `settings/state` | `{ gates, agents, availableAgents, values }` — current gate modes, effective assignments for all seven columns, discovered user-invocable Copilot custom-agent choices, and effective values for every contributed setting (§6.15, §6.17) |
 | view → ext | `gates/set` | `{ key, value: 'manual' \| 'auto' }` — a Settings gate-switch flip; writes workspace scope and re-runs `applyGatePolicies()` immediately (§6.17) |
 | view → ext | `agentName/set` | `{ column, value }` — a Settings assignment Save/Reset; `column` is one of the seven `Column` values and empty `value` removes the override, restoring its default/`None` (§6.17) |
+| view → ext | `settings/set` | `{ key, value }` — validates and writes one typed contributed setting at workspace scope; invalid payloads are rejected without a write (§6.17) |
+| view → ext | `settings/save` | `{ values }` — validates a batch before writing any values, so malformed settings cannot cause a partial update (§6.17) |
+| view → ext | `settings/reset` | `{ key }` — removes one workspace override, restoring its effective global/default value; gate resets also re-run gate policies (§6.17) |
+| ext → view | `settings/error` | `{ key?, error }` — inline validation or persistence failure for the affected setting (§6.17) |
 
 `task/move` is a manual state override, not a state-machine action: a valid cross-column move
 updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
@@ -1223,7 +1255,10 @@ confirmed present — no new bookkeeping needed for "already handled." Each prop
 real task via the ordinary `TaskStore.create()` path (§8.1's id allocation, §6.2's atomic write),
 processed sequentially rather than in parallel so each `create`'s `nextId()` scan sees the
 previous one already on disk. A proposed task lands in Backlog exactly like a human-typed one —
-no state-machine changes at all.
+no state-machine changes at all. Extension-created children carry `origin_run` and a stable
+`origin_proposal` identity as well as `origin_task`; those fields let split reconciliation
+recognise a child that was persisted before a reload or before a later watcher pass and avoid
+creating it again.
 
 **Scope and safety:**
 - **Stages:** develop and validate only. Refine is scoping the *current* ticket, not surfacing
@@ -1233,8 +1268,9 @@ no state-machine changes at all.
   confused agent filing dozens of tasks is a nuisance worth capping, not a policy worth exposing.
 - **Setting:** `kanbanPilot.chat.allowTaskProposals` (default `true`) — off makes `propose-task`
   lines inert text, same as any other line that doesn't match a known grammar.
-- **Traceability:** the frontmatter gains one field, `origin_task` (`Task.originTask`), set only
-  on an agent-filed task — never on a human-typed one. The new task's `## Request` also gets a
+- **Traceability:** the frontmatter gains `origin_task`, `origin_run`, and (when available)
+  `origin_proposal` (`Task.originTask`, `Task.originRunId`, and `Task.originProposalKey`), set
+  only on an agent-filed task — never on a human-typed one. The new task's `## Request` also gets a
   human-readable line, `_Filed automatically by TASK-142's run r19._`, ahead of the agent's own
   note explaining *why*.
 - **Visibility:** the open question this carried into v2 — should an agent-filed card look
@@ -1242,9 +1278,10 @@ no state-machine changes at all.
   modal both show a small **Proposed** badge (`.badge-proposed`) whenever `originTask` is set,
   reusing the modal's indigo accent (§6.11) rather than adding a new one.
 
-**Field ownership (§6.3) gains a row:** `origin_task` is extension-only, exactly like the rest of
-frontmatter — an agent never sets it on its own task, only ever (indirectly) on one it files via
-`propose-task`, and only the extension actually writes it.
+**Field ownership (§6.3) gains a row:** `origin_task`, `origin_run`, and `origin_proposal` are
+extension-only, exactly like the rest of frontmatter — an agent never sets them on its own task,
+only ever (indirectly) on one it files via `propose-task`, and only the extension actually writes
+them.
 
 ### 6.13 An alternate driver: the Claude Code skill
 
@@ -1295,38 +1332,88 @@ retires to `state: done` — tracking-only, nothing left for it to represent, ra
 tracks child-task completion, and building that felt like the wrong thing to add just to avoid
 picking Done). Unlike develop/validate's proposals, split's are **not** gated by
 `kanbanPilot.chat.allowTaskProposals` — filing children is the entire point of clicking the icon,
-not an optional side effect worth a global off switch. `result:blocked` (the agent decided the
-ticket is already small enough) parks it back in `refine`/`blocked` exactly where an ordinary
-Refine click can pick it up — no new escape hatch needed, that path already existed.
+not an optional side effect worth a global off switch. A successful split is transactional at
+the reconciliation boundary: RunManager waits briefly for proposal lines that may be observed
+after the receipt, accepts only valid same-run lines (deduplicated and capped at five), creates
+children sequentially through the active TaskStore, and reads the store back before applying the
+parent's `done` transition. The parent is never retired while an accepted child is missing.
+
+If a successful split has no usable proposals, or any child cannot be persisted, RunManager
+appends an actionable retry marker, leaves the parent in `refine`/`blocked`, and keeps the split
+receipt eligible for bounded late-receipt and watcher/activation reconciliation. A proposal line
+written before the receipt, after the receipt, after the temporary blocked marker, or before a
+reload is therefore handled at the same active task file; a later pass creates only missing
+children and then retires the parent. A `blocked` or `failed` split receipt never creates
+children. This recovery path is deliberately separate from the ordinary optional follow-up
+setting and does not consume `allowTaskProposals`.
+
+The durable child identity is the composite of `origin_task`, `origin_run`, and
+`origin_proposal`; `origin_proposal` hashes the source run id, accepted type, title, and note.
+That provenance is the idempotency key across repeated filesystem events, late receipt recovery,
+and extension activation. Older children that have only the
+original `origin_task`/request provenance remain recognisable for compatibility. `result:blocked`
+from the agent (the ticket is already small enough) also parks the parent in `refine`/`blocked`
+exactly where an ordinary Refine click can pick it up — no new escape hatch is needed.
 
 **Prompt template:** `split.md`, seeded like the other three. Structurally the odd one out
 (module doc in `promptTemplates.ts`): reads `## Request` and, conditionally, any existing
 `## Refined`/`## Scope` (split can be launched as a retry on an already-scoped task); its
 `## On Completion` treats `propose-task` as the primary path, not develop/validate's optional
-extra. Same persona as refine (`Bro Refiner`, `agentNames.ts`) — this is scoping work, not a
-reason to invent a fourth agent identity.
+extra. It tells the agent to append all proposals before exactly one receipt to the attached
+active task file; that file may be under a named task set, so the prompt never assumes the
+legacy `.kanban-pilot/tasks` path. Same persona as refine (`Bro Refiner`, `agentNames.ts`) — this
+is scoping work, not a reason to invent a fourth agent identity.
 
 ### 6.15 Gate policy engine (M5)
 
-Four independent settings, `manual | auto`, one per human gate in the pipeline — the thing M5
-was scoped around. `manual` (every default) is the behaviour this whole document has assumed up
-to this section: G3's "gated by default" is a property of the *defaults*, not something the code
-enforces structurally — flipping a setting to `auto` is a real, intentional trade of a human
-click for throughput, not a loophole.
+Nine independent settings, `manual | auto`, cover every normal pipeline edge and stage-start
+edge in the supported workflow. `manual` (every default) is the behaviour this whole document
+has assumed up to this section: G3's "gated by default" is a property of the *defaults*, not
+something the code enforces structurally — flipping a setting to `auto` is a real, intentional
+trade of a human click for throughput, not a loophole. Stop, Reopen, retries/Continue, and
+arbitrary manual board moves remain human-only escape controls and are deliberately absent from
+this catalog.
 
-| Setting | Governs | `auto` behaviour |
-| --- | --- | --- |
-| `gates.backlogToRefine` | Backlog → Refine | Accepts a new Backlog task **and** launches its refine run, in one continuous step — Refine has no queue concept, so there's no reason to stop halfway |
-| `gates.scopedToApproved` | Scoped → Approved | Approves a freshly-scoped task into the Approved ready-queue only — does **not** also start development. Approved is §8.4's deliberate queue, not a pass-through, so this gate and the next stay independent even though `backlogToRefine` fuses its own equivalent pair |
-| `gates.approvedToInProgress` | Approved → In Progress | Starts development on the next Approved task when the shared run-capacity limit has room |
-| `gates.validationAutoStart` | Validation → Done (via Validate) | Launches Validate the moment a task lands in Validation |
+| Setting | Governs | Kind | `auto` behaviour |
+| --- | --- | --- | --- |
+| `gates.backlogToRefine` | Backlog → Refine | stage start | Accepts a new Backlog task **and** launches its Refine run, in one continuous step — Refine has no queue concept, so there is no reason to stop halfway |
+| `gates.refineToScoped` | successful Refine → Scoped | receipt completion | Commits the successful Refine receipt into Scoped |
+| `gates.scopedToApproved` | Scoped → Approved | stage start | Approves a freshly-scoped task into the Approved ready queue only — it does **not** also start development |
+| `gates.approvedToInProgress` | Approved → In Progress | stage start | Starts development on the next Approved task when the shared run-capacity limit has room |
+| `gates.developToValidation` | successful Develop → Validation | receipt completion | Commits the successful Develop receipt into Validation |
+| `gates.validationAutoStart` | Validation → Validate | stage start | Launches Validate the moment a task is idle in Validation |
+| `gates.validateToDone` | successful Validate → Done | receipt completion | Commits a successful Validate receipt into Done |
+| `gates.validateFailedToInProgress` | criteria-not-met Validate → In Progress | receipt completion | Commits a `result:failed` validation verdict back into In Progress |
+| `gates.splitToDone` | successful Split parent → Done | receipt completion | Retires the Split parent after all accepted children are persisted |
 
-**Corrected while implementing, not just documented:** the table's fourth row used to read
-`inProgressToDone`, defaulting to `auto`. It never corresponded to a real transition once the
-Validation column was added (§12 Q10) — Validate's own `result:ok` already lands on Done
-automatically, the same way refine's lands on Scoped, with no separate human click in between to
-gate. Replaced with `validationAutoStart`, defaulting `manual` like the other three (the old
-`auto` default doesn't carry over to a different setting governing a different thing).
+The original four setting identifiers — `backlogToRefine`, `scopedToApproved`,
+`approvedToInProgress`, and `validationAutoStart` — remain stable and retain their `manual`
+defaults. The five added identifiers are independent settings; in particular,
+`validationAutoStart` controls launching Validate and is not an alias for either Validation
+receipt-completion gate. No existing workspace setting is silently reinterpreted.
+
+#### Receipt-completion lifecycle
+
+Receipt-completion gates do not rerun an agent. When a matching receipt arrives, `RunManager`
+records the normal activity finish and, for a `manual` policy, writes an extension-owned flat
+`pending_outcome` frontmatter value containing the catalog gate id, stage, result, run id, and
+the Refine scope hash when applicable. The run is already complete (`status: idle`, `run` is
+cleared), while the card remains in its source column. The card badge/detail dialog and the
+`Apply Pending Completion` command expose the one-time human decision. `pending/apply` calls
+the same validated `applyPendingOutcome()` path used by automatic promotion; it requires the
+matching receipt to remain in the task's log, checks the expected source state/status and
+pending payload with compare-and-set semantics, emits the ordinary state/status audit entries,
+and clears the pending value. A duplicate, stale, hand-edited, or superseded payload is a
+no-op rather than a second transition.
+
+With an `auto` policy, the same promotion is attempted immediately after the receipt and again
+on activation, file-watcher reconciliation, or a gate-setting refresh. A policy change to
+`auto` therefore promotes already-eligible idle pending work; resetting it returns to the
+documented `manual` default without changing unrelated settings. A late valid receipt can
+recover a provisional missing-receipt or timeout marker, and its pending outcome follows the
+same policy path. Blocked or failed executor outcomes and retryable blocked/failed tasks never
+start automatically. Successful Split still must have usable same-run proposals and all
+accepted children persisted before its receipt can create the pending Done outcome.
 
 **Mechanism — `RunManager.applyGatePolicies()`:** a single sweep over every task, firing
 `handleAction` (the same entry point a click uses) for whichever tasks are both `status: idle`
@@ -1345,12 +1432,13 @@ in a gated column and the matching setting is `auto`. Two things worth being exp
   deliberate line M5 draws even though nothing in G3 strictly requires it.
 
 The gate delegates admission to the same shared coordinator as every manual stage action. A
-sweep that finds more eligible tasks than the configured capacity starts only as many as fit;
-remaining tasks are left untouched in their current columns. The coordinator reserves capacity
-before applying a transition, counts persisted `status: running` tasks after reload, and releases
-reservations on completion, failure, timeout, stop, manual movement, or stale-run detection.
-The default remains one, while values above one are an explicit same-workspace concurrency opt-in
-and do not provide worktree isolation.
+sweep that finds more eligible stage starts than the configured capacity starts only as many as
+fit; remaining tasks are left untouched in their current columns. Receipt promotion itself does
+not consume a run slot. The coordinator reserves capacity before applying a stage-start
+transition, counts persisted `status: running` tasks after reload, and releases reservations on
+completion, failure, timeout, stop, manual movement, or stale-run detection. The default remains
+one, while values above one are an explicit same-workspace concurrency opt-in and do not provide
+worktree isolation.
 
 ### 6.16 New Task modal
 
@@ -1402,16 +1490,20 @@ rather than letting two backdrops stack if a card happens to be selected when Ne
 clicked. Same three close paths as every other modal in this extension: its own × button, a
 backdrop click, or Escape.
 
-### 6.17 Settings — gates and per-column agent assignments
+### 6.17 Settings — complete contributed configuration
 
 The board header exposes one **Settings** button, replacing the former Gates-only entry point.
 It opens one accessible, keyboard-operable modal using the same surface family as the task
 detail and New Task dialogs. The modal is a two-pane settings workspace: a category sidebar
-on the left lists **Automation gates** and **Agent assignments**, while the main pane shows
+on the left lists **Automation gates**, **Agent assignments**, **Task storage & startup**,
+**Chat**, **Tools & model**, **Run behavior**, and **Board & layout**, while the main pane shows
 the controls for exactly one selected category. Opening from the header predictably selects
 Automation gates; opening from a column's Agent pencil selects Agent assignments and focuses
-and selects that column's input. The two categories contain the four automation gates from
-§6.15 and seven editable Agent assignment rows, one for every workflow column:
+and selects that column's input. The surface exposes every current `package.json` contribution
+under `kanbanPilot.*`: the nine automation gates, seven editable Agent assignment rows, and
+typed controls for the remaining settings. `chat.agentNames` remains represented by the
+column editor rather than by an uneditable raw object control. The seven assignment rows cover
+every workflow column:
 
 | Column | Default | Runtime meaning |
 | --- | --- | --- |
@@ -1423,21 +1515,47 @@ and selects that column's input. The two categories contain the four automation 
 | Validation | `Bro QA` | Persona for Validate prompts |
 | Done | `None` | Resting label only; never dispatches a run |
 
-**Gate controls.** The four switches are `manual`/`auto` and write the existing
+**Gate controls.** The nine switches are `manual`/`auto` and write the corresponding
 `kanbanPilot.gates.*` setting at workspace scope as soon as they change. Switching one to
-`auto` also calls `RunManager.applyGatePolicies()` immediately, so eligible idle tasks already
-on the board are considered without waiting for another file change. The setting ids and
-defaults remain those defined in §6.15.
+`auto` also calls `RunManager.applyGatePolicies()` immediately, so eligible idle tasks and
+pending receipt outcomes already on the board are considered without waiting for another file
+change. The four original setting ids remain stable; the five new ids and all defaults are those
+defined in §6.15. Receipt-completion switches never launch another agent when they promote a
+pending outcome.
 
-**Agent assignments.** Each row is pre-filled with its effective label and has Save and Reset
-actions. Save posts `{ column, value }`; the extension reads the current sparse
+**Typed settings.** Every non-gate setting has a control matching its contribution schema:
+enum settings use native choices, booleans use accessible switches, numbers use bounded numeric
+inputs, `tasksDir` and `chat.sessionPrefix` use single-line validated text inputs, tool arrays
+use newline-delimited textareas, and `chat.modelSelector` uses optional `id` and `vendor` text
+fields. Each row displays its default and any next-run or reload note, and provides Save and
+Reset actions. Save validates before writing the exact `kanbanPilot.<key>` at workspace scope;
+Reset writes `undefined` at workspace scope to remove only that override and restore the
+effective global/default value. Invalid or malformed payloads produce an inline accessible error
+and never cause a partial batch write. The settings catalog is derived from the 24 current
+manifest keys; obsolete documentation-only settings are not rendered.
+
+**Agent assignments.** Each row is pre-filled with its effective label and has a native,
+keyboard-accessible dropdown, Save, and Reset actions. The dropdown is rebuilt from a fresh
+scan of the active workspace's `.github/agents` directories, the user-level `~/.copilot/agents`
+directory, and enabled `chat.agentFilesLocations` entries. It reads only the custom-agent
+frontmatter needed for the picker: `name` (falling back to the `.agent.md`/`.md` filename),
+`description`, `target`, and user-invocation visibility. Profiles that are malformed, unreadable,
+targeted at another environment, or hidden with `user-invocable: false`/legacy `infer: false`
+are omitted. Names are sorted deterministically, de-duplicated, and prefer workspace-local
+profiles over configured and user-level profiles. The dropdown always includes a `None` reset
+choice and retains the current configured label as a compatibility choice when that profile is
+not currently discoverable, so a scan never silently changes an existing assignment.
+
+Save posts `{ column, value }`; the extension reads the current sparse
 `kanbanPilot.chat.agentNames` object, trims the value, writes the column key, and persists the
 whole object at workspace scope. Reset posts an empty value, deleting the column override and
 restoring the documented default or `None`. The three runnable column keys are `refine`,
 `in-progress`, and `validation`; `RunManager` resolves them immediately before prompt injection
 for Refine, Develop/Continue, and Validate. `split` maps to the Refine column and therefore
 inherits its assignment. The four resting-column assignments are stored/displayed labels only;
-they have no stage mapping and cannot launch a chat run by themselves.
+they have no stage mapping and cannot launch a chat run by themselves. Opening Settings requests
+another scan, and configuration changes to `chat.agentFilesLocations` refresh the available
+choices without requiring an extension reload.
 
 Existing stage-key settings remain compatible: legacy `refine`, `develop`, and `validate` values
 are used as fallbacks when their new column key is absent, while a new column key takes
@@ -1446,10 +1564,20 @@ workspace settings without migration and keeps the board badge and prompt `@name
 the same resolver.
 
 **Configuration is authoritative.** `vscode.workspace.onDidChangeConfiguration` re-pushes both
-`board/state` and `settings/state`, re-resolving every badge and assignment, whenever
-`kanbanPilot.gates` or `kanbanPilot.chat.agentNames` changes. A direct `settings.json` edit is
-therefore reflected just like a Settings interaction; the webview never becomes the source of
-truth.
+`board/state` and `settings/state`, re-resolving effective values, badges, and assignments,
+whenever any `kanbanPilot` setting changes, and re-scanning agent choices when
+`chat.agentFilesLocations` changes. A direct `settings.json` edit is therefore reflected just
+like a Settings interaction without recreating the webview; the webview never becomes the
+source of truth. Gate changes apply immediately. Chat, tool, model, run, and docking values are
+read for the next relevant action or run, while an already-running task is not interrupted.
+Increasing `run.maxParallelTasks` triggers reconciliation; lowering it does not stop existing
+runs. `chat.closeTabOnDone` closes the matching task session tab after receipt-driven or manual
+completion when enabled, while retaining the session.
+
+**Activation-boundary settings.** `tasksDir` is read when the active task-set context is created,
+and `board.openOnStartup` is read during activation. Saving or resetting either setting displays
+an explicit reload notice rather than pretending that the current context has already switched.
+The extension does not hot-swap a task store or active run manager while work may be in flight.
 
 **Shared modal behavior.** The Settings modal, New Task modal, and task detail modal are
 mutually exclusive. Opening one closes the others. Settings supports the close button,
@@ -1469,9 +1597,14 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `kanbanPilot.gates.backlogToRefine` | `manual \| auto` | `manual` | Auto-accept a new Backlog task **and** launch its refine run — one continuous step (§6.15) |
+| `kanbanPilot.gates.refineToScoped` | `manual \| auto` | `manual` | Auto-commit a successful Refine receipt into Scoped; manual mode leaves a durable pending outcome for Apply Pending Completion (§6.15) |
 | `kanbanPilot.gates.scopedToApproved` | `manual \| auto` | `manual` | Auto-approve a freshly-scoped task into the Approved ready-queue. Does **not** also auto-develop — that's a separate gate below, deliberately, since Approved is §8.4's queue |
 | `kanbanPilot.gates.approvedToInProgress` | `manual \| auto` | `manual` | Auto-start development on the next Approved task when the shared run-capacity limit has room (§6.15) |
-| `kanbanPilot.gates.validationAutoStart` | `manual \| auto` | `manual` | Auto-launch Validate the moment a task lands in Validation. Replaces an earlier `inProgressToDone` entry that stopped corresponding to anything once the Validation column was added — validate's own `result:ok` already lands on Done automatically, same as refine → scoped |
+| `kanbanPilot.gates.developToValidation` | `manual \| auto` | `manual` | Auto-commit a successful Develop receipt into Validation; manual mode leaves a durable pending outcome for Apply Pending Completion (§6.15) |
+| `kanbanPilot.gates.validationAutoStart` | `manual \| auto` | `manual` | Auto-launch Validate the moment a task lands in Validation. This is independent from Validate's receipt-completion gates; a successful Validate receipt has its own configurable path to Done |
+| `kanbanPilot.gates.validateToDone` | `manual \| auto` | `manual` | Auto-commit a successful Validate receipt into Done; manual mode leaves a durable pending outcome for Apply Pending Completion (§6.15) |
+| `kanbanPilot.gates.validateFailedToInProgress` | `manual \| auto` | `manual` | Auto-commit a criteria-not-met Validate verdict back to In Progress; manual mode leaves the verdict pending for a human decision (§6.15) |
+| `kanbanPilot.gates.splitToDone` | `manual \| auto` | `manual` | Auto-retire a successful Split parent after all accepted children are persisted; manual mode leaves a durable pending outcome (§6.15) |
 | `kanbanPilot.tasksDir` | `string` | `.kanban-pilot/tasks` | Workspace-relative folder used by the immutable Default task set; additional named sets use `.kanban-pilot/task-sets/<stable-id>/tasks` |
 | `kanbanPilot.chat.mode` | `agent \| ask` | `agent` | Chat mode requested at injection |
 | `kanbanPilot.chat.sessionPrefix` | `string` | `kanban-pilot-` | Session-id prefix; Default uses `<prefix><taskId>`, while named sets include the stable set id before `<taskId>` (§6.7) |
@@ -1483,7 +1616,6 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.chat.agentNames` | `object` | `{}` | Sparse per-column assignment labels for `backlog`, `refine`, `scoped`, `approved`, `in-progress`, `validation`, and `done`. Resting columns default to `None`; runnable columns default to Bro Refiner / Bro Coder / Bro QA, and `split` reuses Refine. Legacy `refine`/`develop`/`validate` keys remain supported as fallbacks. Editable from the combined Settings surface (§6.17) |
 | `kanbanPilot.run.timeoutMinutes` | `number` | `20` | Run marked `failed` after this |
 | `kanbanPilot.run.maxParallelTasks` | `number` | `1` | Maximum active Refine, Split, Develop/Continue, and Validate runs. Invalid, non-positive, or non-integer values normalize to `1`; values above one permit concurrent same-workspace edits without worktree isolation |
-| `kanbanPilot.develop.checkpoint` | `commit \| stash \| none` | `commit` | Pre-develop working-tree snapshot |
 | `kanbanPilot.board.openOnStartup` | `boolean` | `false` | Open the board on workspace load |
 | `kanbanPilot.layout.dockChat` | `boolean` | `true` | Master switch for docking the chat beside the board at all (§6.10) |
 | `kanbanPilot.layout.dockChatOnSelect` | `boolean` | `false` | Dock on card selection; when `false`, docking happens only via the detail pane's Open Chat button or a stage run's own open+inject |
@@ -1504,9 +1636,15 @@ creating a set because the new set becomes active, is refused while the active s
 running task; this keeps file watchers, automatic gate processing,
 receipts, and chat actions bound to one store at a time. Task ids remain local to a set, while
 chat session ids, run reservations, and receipt de-duplication keys include the stable set id.
+All RunManager proposal and split-child writes use the active set's TaskStore, directory, and
+id allocation. In particular, a split launched from a named set appends proposals to its attached
+task file and creates children under `.kanban-pilot/task-sets/<stable-id>/tasks`; it never falls
+back to the immutable Default directory. Split reconciliation can therefore retry after a
+separate proposal/receipt filesystem event or activation without changing the board context.
 
-> `refine → scoped` is intentionally not configurable: it is not a gate but the landing of a
-> run's output, and Scoped is itself the review column.
+> Receipt-completion boundaries such as `refine → scoped` are configurable through their
+> dedicated completion gates. In manual mode the receipt is still final for the run, but the
+> card remains in its source column with a durable pending outcome until the human applies it.
 
 > **`develop.checkpoint` is still not registered.** It's M4's concern specifically — nothing
 > reads it until checkpointing exists, so declaring it now would be config with no behavior
@@ -1519,7 +1657,7 @@ chat session ids, run reservations, and receipt de-duplication keys include the 
 
 `openBoard` · `newTask` · `createTaskSet` · `renameTaskSet` · `deleteTaskSet` · `acceptTask` · `refineTask` · `splitTask` · `approveTask` ·
 `developTask` · `continueRun` · `stopRun` · `validateTask` · `reopenTask` · `openTaskFile` ·
-`openTaskChat` · `deleteTask` · `markRunComplete` · `seedSampleTasks`
+`openTaskChat` · `deleteTask` · `markRunComplete` · `applyPendingOutcome` · `seedSampleTasks`
 
 > `splitTask` (§6.14) was missing from this list and from `package.json`/`extension.ts` for a
 > full session before it was caught and fixed — a real gap, not a documentation lag: §7's own
@@ -1611,7 +1749,7 @@ additive.
 | **M2** | Manual board | ✅ Done, visually confirmed | New Task; all human transitions (§5, §5.2, §12 Q3 resolved); card actions per §5.2, exhaustively tested; card detail pane; palette commands; delete-with-confirmation; visuals matched to the live prototype, 7 columns (§13); `openBoard` and `spike.seedSampleTasks` confirmed working in the dev host; no agent yet — 35 tests passing |
 | **M3** | All three agent stages, no safety net yet | ✅ **Done, verified live** | *Grew past "refine stage" mid-milestone* (see note below the table). Prompt templates for refine/develop/validate (§6.5); `ChatSessionExecutor` with per-task session binding (§6.6, §6.9's narrow-window protocol); chat dockable beside the board via an explicit Open Chat action (§6.10); receipt detection + `task:` mismatch rejection (§6.9); timeout; `markRunComplete`; activation reconciliation (§6.4); automatic misroute detection via `copilot_session_id` (§6.9); `resetOnApprove` (§6.8 layer 1, now default-off); 71 tests passing. **Backlog → Done confirmed live end to end** (2026-08-13) against a real Copilot host — refine, develop, and validate each ran, wrote a well-formed receipt, and advanced the card correctly, closing with a clean `result:ok` on Done. Three real bugs found and fixed along the way: refine's tools allowlist silently blocking all file edits (§6.6), the webview's markdown renderer breaking board rendering entirely via a template-literal escaping bug (§6.11), and the agent writing invalid values into frontmatter it was never told not to touch (§6.3) |
 | **M4** | Develop safety net | ⬜ **Not started — skipped ahead of M5 at the user's request** | Checkpointing; `revertToCheckpoint`; single-slot *enforcement* (currently only a UI expectation — §8.4). `gates.approvedToInProgress`'s `auto` mode (M5) now depends on this gap more than a purely manual workflow ever did — see §6.15 |
-| **M5** | Gates and Settings | ✅ **Done** | Four `manual \| auto` settings, one per human gate (§6.15); `RunManager.applyGatePolicies()` fires the same `handleAction` a click would, swept on activation and on every store change; retries never auto-fire regardless of policy; a hand-rolled single-slot check stands in for M4's real enforcement under `approvedToInProgress` specifically. Board-side Settings UI (§6.17) combines the gate switches with seven column assignments, legacy-compatible prompt resolution, workspace persistence, direct configuration refresh, and resting-column display labels |
+| **M5** | Gates and Settings | ✅ **Done** | Nine independent `manual \| auto` settings cover stage starts and receipt completions (§6.15); `RunManager.applyGatePolicies()` uses the shared stage and promotion paths, swept on activation and on every store change; retries, Stop, Reopen, and arbitrary moves never auto-fire; a hand-rolled single-slot check stands in for M4's real enforcement under `approvedToInProgress` specifically. Board-side Settings UI (§6.17) combines the gate switches with seven column assignments, legacy-compatible prompt resolution, workspace persistence, direct configuration refresh, durable manual pending completions, and resting-column display labels |
 | **M6** | Polish | ⬜ Not started | Panel serialization, theming, keyboard nav, a11y pass, empty states, README/demo |
 
 **Status legend:** ⬜ Not started · 🟡 In progress · ✅ Done · ⛔ Blocked (see Risks)
@@ -1743,7 +1881,7 @@ session?), which decides §6.8 layer 1 rather than the executor choice.
 | **R9** | User manually types into a task's session, or deletes the chat tab mid-run | **Low** | Sessions are user-visible by design and manual input is legitimate; the receipt still gates completion. A deleted session is re-minted from the derived URI on next run |
 | **R10** | `newChat` fails to clear the session at the Approve gate, so the agent's superseded scope survives into implementation and silently overrides the human's edit | **High — CONFIRMED by M0**, root cause identified | v3 probe: fresh never-used session id, runtime codeword, `newChat` invoked, session id changed — codeword still recalled. Root cause is R12, not ordinary conversational carryover. **Mitigation moved to §6.8 layer 0**: `toolsExclude: MEMORY_TOOLS` on every injection, ahead of and independent of session reset. `newChat`'s own reliability for ordinary carryover is separately backstopped by layers 1–3 and the split-session fallback |
 | **R12** | Copilot's built-in `memory` tool ("Manage persistent memory across conversations," confirmed present in the Configure Tools picker under the built-in `vscode` toolset, enabled globally by default) persists content across sessions, across `newChat`, and across task boundaries — invisible to and unpreventable by anything session-identity-based in this document | **Resolved** | `toolsExclude: ['memory', 'resolveMemoryFileUri']` on every `ChatExecutor` call, unconditionally (§6.6, §6.8 layer 0). **Mitigation verified**, not assumed: a run with exclusion active left `~/Library/.../memory-tool/memories/codeword.md` unchanged on disk — the write itself was blocked, not merely recall. The store also lives entirely outside any workspace folder, so refine's workspace-scoped `search`/`codebase` tools (§6.6) cannot reach it independently of the exclusion — the indirect-discovery concern in open question 9 is closed too |
-| **R3** | Agent edits far outside the agreed scope | **Medium** | Pre-run checkpoint + one-click revert; scope checklist restated in the prompt; diff review gate available via `inProgressToDone: manual` |
+| **R3** | Agent edits far outside the agreed scope | **Medium** | Pre-run checkpoint + one-click revert; scope checklist restated in the prompt; receipt completion remains a reviewable manual gate by default |
 | **R4** | Agent corrupts the task file while appending | **Medium** | Extension owns frontmatter; body parsed leniently; malformed file → card shows a repair action rather than disappearing |
 | **R5** | Board and disk drift under rapid edits | **Medium** | Disk is authoritative; watcher-driven re-read; webview never holds state; writes are atomic (temp + rename) |
 | **R6** | Chat panel is busy with an unrelated conversation | **Low** | Injection is user-initiated; warn if a run is already in flight |

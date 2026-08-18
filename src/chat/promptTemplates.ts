@@ -263,7 +263,10 @@ that's the normal Refine stage's job, not this one.
 ## On Completion
 ### Completion
 If you split this ticket, file each smaller task first — one line per task,
-added to the \`## Log\` section of \`.kanban-pilot/tasks/{{id}}.md\`:
+added to the \`## Log\` section of the attached active task file for this task.
+The active file may be inside a named task set; do not construct a path or write
+to a hard-coded \`.kanban-pilot/tasks\` directory. Save every proposal line
+before writing the receipt so RunManager can reconcile the complete split:
 - propose-task run:{{runId}} title:"<short title>" note:"<what this piece covers>"
 Then append this line after them:
 - run:{{runId}} task:{{id}} stage:split result:ok note:"split into N tasks: <short list>"

@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -128,6 +128,11 @@
         "category": "Kanban Pilot"
       },
       {
+        "command": "kanban-pilot.applyPendingOutcome",
+        "title": "Apply Pending Completion",
+        "category": "Kanban Pilot"
+      },
+      {
         "command": "kanban-pilot.seedSampleTasks",
         "title": "Seed Sample Tasks",
         "category": "Kanban Pilot"
@@ -150,6 +155,15 @@
           "default": "manual",
           "description": "auto accepts a new Backlog task and launches its refine run automatically, hands-off end to end. manual (default) waits for Accept, then Refine, to be clicked."
         },
+        "kanbanPilot.gates.refineToScoped": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto commits a successful Refine receipt into Scoped. manual (default) keeps the receipt and waits for Apply Pending Completion."
+        },
         "kanbanPilot.gates.scopedToApproved": {
           "type": "string",
           "enum": [
@@ -168,6 +182,15 @@
           "default": "manual",
           "description": "auto starts development on the next Approved task automatically when the shared run-capacity limit has room. manual (default) waits for Develop to be clicked."
         },
+        "kanbanPilot.gates.developToValidation": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto commits a successful Develop receipt into Validation. manual (default) keeps the receipt and waits for Apply Pending Completion."
+        },
         "kanbanPilot.gates.validationAutoStart": {
           "type": "string",
           "enum": [
@@ -176,6 +199,33 @@
           ],
           "default": "manual",
           "description": "auto launches Validate automatically the moment a task lands in Validation. manual (default) waits for Validate to be clicked."
+        },
+        "kanbanPilot.gates.validateToDone": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto commits a successful Validate receipt into Done. manual (default) keeps the receipt and waits for Apply Pending Completion."
+        },
+        "kanbanPilot.gates.validateFailedToInProgress": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto commits a failed validation verdict back to In Progress. manual (default) keeps the verdict pending for a human decision."
+        },
+        "kanbanPilot.gates.splitToDone": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "auto retires a successful Split parent after child persistence. manual (default) keeps the parent pending for explicit completion."
         },
         "kanbanPilot.chat.mode": {
           "type": "string",

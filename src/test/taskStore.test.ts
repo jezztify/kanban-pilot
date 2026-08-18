@@ -6,6 +6,8 @@ import * as vscode from 'vscode';
 import {
 	COLUMNS,
 	Column,
+	encodePendingOutcome,
+	isPendingOutcome,
 	isValidTaskPosition,
 	normalizeTaskType,
 	STATUSES,
@@ -18,7 +20,7 @@ import {
 } from '../model/task';
 import { sessionIdForTask } from '../chat/sessionUri';
 import { DEFAULT_TASK_SET_ID, TaskSetError, TaskSetRegistry } from '../model/taskSets';
-import { TaskStore } from '../model/taskStore';
+import { TaskMutationConflictError, TaskStore } from '../model/taskStore';
 import { invokeBoardAction, primaryAction, shouldDockTaskChat } from '../board/boardPanel';
 import { TaskAction } from '../board/stateMachine';
 import { parseAuditEvents } from '../model/taskLog';
@@ -201,11 +203,20 @@ suite('M1 task schema', () => {
 
 	test('newTaskFile records an origin when a run filed the task itself (§6.12)', () => {
 		const raw = newTaskFile('TASK-002', 'Add retry backoff', {
-			origin: { taskId: 'TASK-142', runId: 'r19', note: 'Delivery can still fail silently under load.' },
+			origin: {
+				taskId: 'TASK-142',
+				runId: 'r19',
+				note: 'Delivery can still fail silently under load.',
+				proposalKey: 'proposal-key-1',
+			},
 		});
 		const task = taskFromRaw(raw);
 
 		assert.strictEqual(task?.originTask, 'TASK-142');
+		assert.strictEqual(task?.originRunId, 'r19');
+		assert.strictEqual(task?.originProposalKey, 'proposal-key-1');
+		assert.match(raw, /origin_run: r19/);
+		assert.match(raw, /origin_proposal: proposal-key-1/);
 		assert.ok(task!.sections['Request'].includes('Delivery can still fail silently under load.'));
 		assert.ok(task!.sections['Request'].includes("Filed automatically by TASK-142's run r19"));
 	});
@@ -224,6 +235,31 @@ suite('M1 task schema', () => {
 		const raw = newTaskFile('TASK-003', 'Human-typed title');
 		assert.ok(!raw.includes('origin_task'));
 		assert.strictEqual(taskFromRaw(raw)?.originTask, undefined);
+	});
+
+	test('round-trips valid pending completion metadata and ignores invalid payloads', () => {
+		const pending = {
+			gate: 'refineToScoped' as const,
+			stage: 'refine' as const,
+			result: 'ok' as const,
+			runId: 'r-pending',
+			scopeHash: 'abc1234',
+		};
+		assert.strictEqual(isPendingOutcome(pending), true);
+		const raw = updateFrontmatter(SAMPLE, { pending_outcome: encodePendingOutcome(pending) });
+		const body = raw.slice(raw.indexOf('\n## Request'));
+		assert.strictEqual(body, SAMPLE.slice(SAMPLE.indexOf('\n## Request')));
+		assert.deepStrictEqual(taskFromRaw(raw)?.pendingOutcome, pending);
+		assert.strictEqual(
+			taskFromRaw(updateFrontmatter(raw, {
+				pending_outcome: JSON.stringify({ ...pending, gate: 'validateToDone' }),
+			}))?.pendingOutcome,
+			undefined,
+		);
+		assert.strictEqual(
+			taskFromRaw(updateFrontmatter(raw, { pending_outcome: '{not-json' }))?.id,
+			'TASK-142',
+		);
 	});
 });
 
@@ -278,6 +314,54 @@ suite('M1 task store', () => {
 		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(created.id))).toString('utf8');
 		assert.match(raw, /type: bug/);
 		assert.strictEqual((await store.readAll()).tasks[0].type, 'bug');
+	});
+
+	test('persists pending outcomes, preserves the body, and clears them on ordinary mutations', async () => {
+		const task = await store.create('Pending task');
+		const pending = encodePendingOutcome({
+			gate: 'refineToScoped',
+			stage: 'refine',
+			result: 'ok',
+			runId: 'r-store',
+			scopeHash: 'abc1234',
+		});
+		const uri = store.fileFor(task.id);
+		const beforeBody = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8').split('---\n').slice(2).join('---\n');
+
+		await store.patch(task.id, { pending_outcome: pending });
+		assert.deepStrictEqual((await store.readAll()).tasks[0].pendingOutcome, {
+			gate: 'refineToScoped', stage: 'refine', result: 'ok', runId: 'r-store', scopeHash: 'abc1234',
+		});
+		const afterPending = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		assert.strictEqual(afterPending.split('---\n').slice(2).join('---\n'), beforeBody);
+
+		await store.patch(task.id, { state: 'scoped' });
+		assert.strictEqual((await store.readAll()).tasks[0].pendingOutcome, undefined);
+		await store.patch(task.id, { pending_outcome: pending });
+		await store.edit(task.id, { title: 'Edited pending task', request: 'request', refined: 'refined', scope: 'scope' });
+		assert.strictEqual((await store.readAll()).tasks[0].pendingOutcome, undefined);
+	});
+
+	test('rejects invalid generic pending writes and stale compare-and-set mutations', async () => {
+		const task = await store.create('Guard pending writes');
+		await assert.rejects(
+			store.patch(task.id, { pending_outcome: JSON.stringify({ gate: 'not-a-gate' }) }),
+			/Invalid pending outcome/,
+		);
+		const pending = {
+			gate: 'refineToScoped' as const,
+			stage: 'refine' as const,
+			result: 'ok' as const,
+			runId: 'r-cas',
+			scopeHash: 'abc1234',
+		};
+		await store.patch(task.id, { state: 'refine', pending_outcome: encodePendingOutcome(pending) });
+		await assert.rejects(
+			store.auditedPatch(task.id, { state: 'scoped', pending_outcome: undefined }, {
+				expected: { state: 'refine', status: 'running', pendingOutcome: pending },
+			}),
+			(error: unknown) => error instanceof TaskMutationConflictError,
+		);
 	});
 
 	test('backfills missing and invalid legacy types without dropping the cards', async () => {
@@ -671,11 +755,14 @@ suite('M1 task store', () => {
 	test('create() with an origin lands the task in Backlog carrying originTask (§6.12)', async () => {
 		const filer = await store.create('Set up billing webhook');
 		const filed = await store.create('Add retry backoff', {
-			origin: { taskId: filer.id, runId: 'r19', note: 'Discovered while implementing.' },
+			origin: { taskId: filer.id, runId: 'r19', note: 'Discovered while implementing.', proposalKey: 'key-r19' },
 		});
 
 		assert.strictEqual(filed.state, 'backlog');
 		assert.strictEqual(filed.originTask, filer.id);
+		assert.strictEqual(filed.originRunId, 'r19');
+		assert.strictEqual(filed.originProposalKey, 'key-r19');
+		assert.strictEqual(filed.setId, store.setId);
 	});
 
 	test('non-task files in the folder are ignored', async () => {

@@ -2,8 +2,10 @@ import * as vscode from 'vscode';
 import { COLUMNS, Column } from '../model/task';
 import type { AuditEventInput, AuditOutcome, AuditStage } from '../model/taskLog';
 import { parseAuditEvents } from '../model/taskLog';
-import { ReorderTarget, TaskStore } from '../model/taskStore';
-import { applyAction, TaskAction } from './stateMachine';
+import { ReorderTarget, TaskMutationConflictError, TaskStore } from '../model/taskStore';
+import { applyAction, applyPendingTransition, TaskAction } from './stateMachine';
+import type { GateId } from '../model/gates';
+import { parseReceipts } from '../chat/receipt';
 
 /**
  * Single entry point for turning a card action into a **pure** disk write —
@@ -23,6 +25,12 @@ export type InvokeOutcome =
 	| { kind: 'applied'; needsAgent: boolean }
 	| { kind: 'illegal' }
 	| { kind: 'not-found' };
+
+export type PendingOutcomeResult =
+	| { kind: 'applied'; gate: GateId }
+	| { kind: 'no-pending' }
+	| { kind: 'not-found' }
+	| { kind: 'stale' };
 
 export type MoveOutcome =
 	| { kind: 'applied' }
@@ -135,7 +143,11 @@ export async function invokeTaskAction(
 		return { kind: 'illegal' };
 	}
 
-	const updates: Record<string, string | undefined> = { state: result.state, status: result.status };
+	const updates: Record<string, string | undefined> = {
+		state: result.state,
+		status: result.status,
+		pending_outcome: undefined,
+	};
 	if (action === 'stop') {
 		updates.run = undefined;
 	}
@@ -149,6 +161,75 @@ export async function invokeTaskAction(
 		events,
 	});
 	return { kind: 'applied', needsAgent: result.needsAgent };
+}
+
+/**
+ * Commits one durable receipt outcome. Both automatic policies and the
+ * explicit human pending action call this function, so stale and duplicate
+ * promotion behavior cannot diverge between the two paths.
+ */
+export async function applyPendingOutcome(
+	store: TaskStore,
+	taskId: unknown,
+): Promise<PendingOutcomeResult> {
+	if (typeof taskId !== 'string' || !/^TASK-\d+$/.test(taskId)) {
+		return { kind: 'stale' };
+	}
+
+	const { tasks } = await store.readAll();
+	const task = tasks.find((candidate) => candidate.id === taskId);
+	if (!task) {
+		return { kind: 'not-found' };
+	}
+	const pending = task.pendingOutcome;
+	if (!pending) {
+		return { kind: 'no-pending' };
+	}
+
+	const transition = applyPendingTransition(task, pending);
+	if (!transition) {
+		return { kind: 'stale' };
+	}
+
+	// A pending payload is only actionable while its receipt remains durable in
+	// the append-only log. This rejects hand-edited, stale, or superseded data.
+	const receipt = [...parseReceipts(task.sections['Log'] ?? '')].reverse().find((candidate) =>
+		candidate.runId === pending.runId &&
+		candidate.taskId === task.id &&
+		candidate.stage === pending.stage &&
+		candidate.result === pending.result,
+	);
+	if (!receipt) {
+		return { kind: 'stale' };
+	}
+
+	const updates: Record<string, string | undefined> = {
+		state: transition.state,
+		status: transition.status,
+		pending_outcome: undefined,
+	};
+	if (pending.gate === 'refineToScoped') {
+		updates.scope_hash = pending.scopeHash;
+	}
+
+	try {
+		await store.auditedPatch(task.id, updates, {
+			action: 'apply-pending',
+			runId: pending.runId,
+			outcome: pending.result,
+			expected: {
+				state: task.state,
+				status: task.status,
+				pendingOutcome: pending,
+			},
+		});
+	} catch (error) {
+		if (error instanceof TaskMutationConflictError) {
+			return { kind: 'stale' };
+		}
+		throw error;
+	}
+	return { kind: 'applied', gate: transition.gate };
 }
 
 function stageForRunningTask(task: { state: Column; sections: Record<string, string> }, runId: string): AuditStage {

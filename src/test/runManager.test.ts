@@ -6,10 +6,12 @@ import * as vscode from 'vscode';
 import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { Executor, ExecutorResult, RunOptions } from '../chat/executor';
-import { normalizeMaxParallelTasks, RunManager } from '../chat/runManager';
+import { closeTaskChatTabs, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 import { parseAuditEvents } from '../model/taskLog';
+import { sessionUriForTask } from '../chat/sessionUri';
+import { RECEIPT_COMPLETION_GATES } from '../model/gates';
 
 /**
  * M3 — RunManager orchestration (PRD §6.4, §6.9). Uses a stub `Executor` so
@@ -42,7 +44,7 @@ async function waitUntilSettled(store: TaskStore, taskId: string): Promise<Task>
 	let task: Task | undefined;
 	await waitUntil(async () => {
 		task = (await store.readAll()).tasks.find((t) => t.id === taskId);
-		return !!task && task.status !== 'running';
+		return !!task && task.status !== 'running' && !task.pendingOutcome;
 	});
 	return task!;
 }
@@ -93,6 +95,18 @@ function okReceipt(store: TaskStore, stage: 'refine' | 'develop' | 'validate' | 
 	};
 }
 
+function receiptWithResult(
+	store: TaskStore,
+	stage: 'refine' | 'develop' | 'validate' | 'split',
+	result: 'ok' | 'blocked' | 'failed',
+) {
+	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
+		const runId = runIdFromPrompt(prompt);
+		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result, note: 'done' }));
+		return { ok: true, sessionId: 's1' };
+	};
+}
+
 /** Appends the stage's own receipt plus one propose-task line per title given. */
 function okReceiptWithProposals(
 	store: TaskStore,
@@ -123,9 +137,20 @@ suite('M3 RunManager', () => {
 		store = new TaskStore(dir);
 		await store.ensureDirectory();
 		folder = { uri: dir, name: 'test', index: 0 };
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		for (const gate of RECEIPT_COMPLETION_GATES) {
+			await cfg.update(gate.settingKey, 'auto', vscode.ConfigurationTarget.Global);
+		}
+		await waitUntil(() => RECEIPT_COMPLETION_GATES.every((gate) =>
+			vscode.workspace.getConfiguration('kanbanPilot').get(gate.settingKey) === 'auto',
+		));
 	});
 
 	teardown(async () => {
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		for (const gate of RECEIPT_COMPLETION_GATES) {
+			await cfg.update(gate.settingKey, undefined, vscode.ConfigurationTarget.Global);
+		}
 		try {
 			await vscode.workspace.fs.delete(dir, { recursive: true });
 		} catch {
@@ -161,6 +186,26 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.run, undefined);
 			assert.strictEqual(executor.calls.length, 0, 'a manual move must not invoke the executor');
 			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'state-change' && event.to === 'done'));
+		});
+
+		test('manual move into Done closes only the matching task chat tab', async () => {
+			const task = await store.create('Close chat on manual completion');
+			const target = sessionUriForTask(task.id);
+			const other = sessionUriForTask('TASK-004');
+			const matchingTab = { input: { uri: target } } as unknown as vscode.Tab;
+			const otherTab = { input: { uri: other } } as unknown as vscode.Tab;
+			let closed: readonly vscode.Tab[] | undefined;
+			const runManager = new RunManager(store, new StubExecutor(() => 'hang'), folder, {
+				all: [{ tabs: [matchingTab, otherTab] } as unknown as vscode.TabGroup],
+				async close(tabs, preserveFocus) {
+					assert.strictEqual(preserveFocus, true);
+					closed = Array.isArray(tabs) ? tabs : [tabs];
+					return true;
+				},
+			});
+
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'done'), { kind: 'applied' });
+			assert.deepStrictEqual(closed, [matchingTab]);
 		});
 
 		test('reorderTask changes only order and keeps an active run reservation', async () => {
@@ -430,7 +475,15 @@ suite('M3 RunManager', () => {
 		test('a receipt written just before the missing-receipt marker still wins the race', async () => {
 			const task = await store.create('Recover a receipt-marker race');
 			const runId = 'r-marker-race';
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('gates.developToValidation', 'auto', vscode.ConfigurationTarget.Global);
+			await waitUntil(() => vscode.workspace.getConfiguration('kanbanPilot').get('gates.developToValidation') === 'auto');
 			await store.patch(task.id, { state: 'in-progress', status: 'blocked' });
+			await store.auditedPatch(task.id, { state: 'in-progress', status: 'blocked' }, {
+				action: 'develop',
+				runId,
+				events: [{ kind: 'activity-start', stage: 'develop', action: 'develop', runId }],
+			});
 			await store.appendLog(
 				task.id,
 				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'late completion' }),
@@ -643,10 +696,288 @@ suite('M3 RunManager', () => {
 
 				assert.strictEqual(after.status, 'failed');
 				assert.ok(after.sections['Log'].includes('timed out'));
+				assert.ok(after.sections['Log'].includes('awaiting late receipt'));
+				assert.strictEqual(parseReceipts(after.sections['Log']).find((receipt) => receipt.stage === 'refine')?.result, 'failed');
 				assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'timeout'));
 			} finally {
 				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
 			}
+		});
+
+		test('timeout rechecks a receipt written before the fallback is finalized', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Receipt before timeout fallback');
+				await store.patch(task.id, { state: 'refine', status: 'idle' });
+				const executor = new StubExecutor(async (t, prompt) => {
+					const runId = runIdFromPrompt(prompt);
+					await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'written before timeout' }));
+					return new Promise<ExecutorResult>(() => {
+						/* the receipt is durable even though the chat turn remains open */
+					});
+				});
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'refine');
+				const after = await waitUntilSettled(store, task.id);
+
+				assert.strictEqual(after.state, 'scoped');
+				assert.strictEqual(after.status, 'idle');
+				assert.strictEqual(parseReceipts(after.sections['Log']).filter((receipt) => receipt.stage === 'refine').length, 1);
+				assert.ok(!after.sections['Log'].includes('awaiting late receipt'));
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a matching receipt after timeout is recovered by the bounded backstop', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Recover a late timeout completion');
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+				let runId = '';
+				const executor = new StubExecutor(async (t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					setTimeout(() => {
+						void store.appendLog(
+							t.id,
+							formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'written after timeout' }),
+						);
+					}, 900);
+					return new Promise<ExecutorResult>(() => {
+						/* the chat turn outlives the extension timeout */
+					});
+				});
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'develop');
+				const failed = await waitUntilSettled(store, task.id);
+				assert.strictEqual(failed.state, 'in-progress');
+				assert.strictEqual(failed.status, 'failed');
+				assert.ok(failed.sections['Log'].includes('timed out; awaiting late receipt'));
+
+				await waitUntil(async () => {
+					const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+					return after?.state === 'validation' && after.status === 'idle';
+				});
+
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.strictEqual(after.run, undefined);
+				assert.strictEqual(parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === runId).length, 2);
+				const audit = parseAuditEvents(after.sections['Log']);
+				assert.strictEqual(audit.filter((event) => event.kind === 'activity-finish').length, 2);
+				assert.ok(audit.some((event) => event.kind === 'activity-finish' && event.outcome === 'timeout'));
+				assert.ok(audit.some((event) => event.kind === 'activity-finish' && event.correction && event.outcome === 'ok'));
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a late blocked receipt after timeout keeps the stage retryable', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Recover a blocked timeout completion');
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+				let runId = '';
+				const executor = new StubExecutor(async (t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					setTimeout(() => {
+						void store.appendLog(
+							t.id,
+							formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'blocked', note: 'needs a decision after timeout' }),
+						);
+					}, 900);
+					return new Promise<ExecutorResult>(() => {
+						/* the chat turn outlives the extension timeout */
+					});
+				});
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'develop');
+				await waitUntilSettled(store, task.id);
+				await waitUntil(async () => {
+					const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+					return after?.state === 'in-progress' && after.status === 'blocked';
+				});
+
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.strictEqual(parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === runId).length, 2);
+				assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.correction && event.outcome === 'blocked'));
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a late timeout receipt with proposals files each child once', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Recover late develop proposals');
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+				let runId = '';
+				const executor = new StubExecutor(async (t, prompt) => {
+					runId = runIdFromPrompt(prompt);
+					setTimeout(() => {
+						void (async () => {
+							await store.appendLog(t.id, `- propose-task run:${runId} title:"Late follow-up" note:"written after timeout"`);
+							await store.appendLog(
+								t.id,
+								formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'late completion with proposal' }),
+							);
+						})();
+					}, 900);
+					return new Promise<ExecutorResult>(() => {
+						/* the chat turn outlives the extension timeout */
+					});
+				});
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'develop');
+				await waitUntilSettled(store, task.id);
+				await waitUntil(async () => {
+					const after = (await store.readAll()).tasks;
+					return after.some((candidate) => candidate.id === task.id && candidate.state === 'validation' && candidate.status === 'idle');
+				});
+
+				const { tasks } = await store.readAll();
+				assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Late follow-up').length, 1);
+				assert.strictEqual(parseReceipts(tasks.find((candidate) => candidate.id === task.id)!.sections['Log']).filter((receipt) => receipt.runId === runId).length, 2);
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a late executor rejection after timeout is consumed without changing the failed outcome', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Consume a late executor rejection');
+				await store.patch(task.id, { state: 'refine', status: 'idle' });
+				const executor = new StubExecutor(() => new Promise<ExecutorResult>((_resolve, reject) => {
+					setTimeout(() => reject(new Error('late executor failure')), 100);
+				}));
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'refine');
+				const after = await waitUntilSettled(store, task.id);
+				assert.strictEqual(after.status, 'failed');
+				await waitUntil(() => executor.calls.length === 1 && Date.now() > 0, 500);
+				await new Promise((resolve) => setTimeout(resolve, 150));
+
+				const settled = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.strictEqual(settled.status, 'failed');
+				assert.strictEqual(parseReceipts(settled.sections['Log']).filter((receipt) => receipt.stage === 'refine').length, 1);
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a timed-out receipt cannot reclaim a task after a newer retry succeeds', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.timeoutMinutes', 0.0005, vscode.ConfigurationTarget.Global); // ~30ms
+			try {
+				const task = await store.create('Ignore a stale timeout receipt');
+				await store.patch(task.id, { state: 'refine', status: 'idle' });
+				let firstRunId = '';
+				let calls = 0;
+				const executor = new StubExecutor(async (t, prompt) => {
+					calls++;
+					const runId = runIdFromPrompt(prompt);
+					if (calls === 1) {
+						firstRunId = runId;
+						return new Promise<ExecutorResult>(() => {
+							/* first chat turn remains open past timeout and retry */
+						});
+					}
+					await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'newer retry completed' }));
+					return { ok: true };
+				});
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntilSettled(store, task.id);
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(async () => {
+					const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+					return after?.state === 'scoped' && after.status === 'idle';
+				});
+
+				await store.appendLog(
+					task.id,
+					formatReceipt({ runId: firstRunId, taskId: task.id, stage: 'refine', result: 'ok', note: 'stale completion' }),
+				);
+				await runManager.reconcileTaskChange(task.id);
+
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.strictEqual(after.state, 'scoped');
+				assert.strictEqual(after.status, 'idle');
+				assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish').length, 2);
+			} finally {
+				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a late timeout receipt cannot reclaim the same column after a newer retry starts', async () => {
+			const task = await store.create('Ignore a superseded timeout receipt');
+			const oldRunId = 'r-old-timeout';
+			const newRunId = 'r-new-retry';
+			await store.auditedPatch(
+				task.id,
+				{ state: 'refine', status: 'running', run: oldRunId },
+				{
+					action: 'refine',
+					runId: oldRunId,
+					events: [{ kind: 'activity-start', stage: 'refine', action: 'refine', runId: oldRunId }],
+				},
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId: oldRunId, taskId: task.id, stage: 'refine', result: 'failed', note: 'timed out; awaiting late receipt' }),
+			);
+			await store.auditedPatch(
+				task.id,
+				{ status: 'failed', run: undefined },
+				{
+					action: 'timeout',
+					runId: oldRunId,
+					outcome: 'timeout',
+					events: [{ kind: 'activity-finish', stage: 'refine', runId: oldRunId, outcome: 'timeout', provisional: true }],
+				},
+			);
+			await store.auditedPatch(
+				task.id,
+				{ status: 'running', run: newRunId },
+				{
+					action: 'refine',
+					runId: newRunId,
+					events: [{ kind: 'activity-start', stage: 'refine', action: 'refine', runId: newRunId }],
+				},
+			);
+			await store.auditedPatch(
+				task.id,
+				{ status: 'failed', run: undefined },
+				{
+					action: 'executor-error',
+					runId: newRunId,
+					outcome: 'error',
+					events: [{ kind: 'activity-finish', stage: 'refine', runId: newRunId, outcome: 'error' }],
+				},
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId: oldRunId, taskId: task.id, stage: 'refine', result: 'ok', note: 'stale completion' }),
+			);
+
+			const runManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await runManager.reconcileTaskChange(task.id);
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.status, 'failed');
+			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish').length, 2);
 		});
 
 		test('the rendered refine prompt carries the misroute-visibility banner and this stage\'s agent name', async () => {
@@ -662,6 +993,31 @@ suite('M3 RunManager', () => {
 			assert.ok(executor.calls[0].prompt.includes(`## [${folder.name} ${task.id}]`), 'missing the [project task] banner (§6.9)');
 			assert.ok(executor.calls[0].prompt.startsWith('@Bro Refiner\n'), '@agentName must open the message');
 		});
+	});
+
+	test('normalizes invalid timeout values while preserving positive fractional minutes', () => {
+		assert.strictEqual(normalizeTimeoutMinutes(undefined), 20);
+		assert.strictEqual(normalizeTimeoutMinutes(0), 20);
+		assert.strictEqual(normalizeTimeoutMinutes(-1), 20);
+		assert.strictEqual(normalizeTimeoutMinutes(Number.NaN), 20);
+		assert.strictEqual(normalizeTimeoutMinutes(0.0005), 0.0005);
+	});
+
+	test('closes only the matching task chat tab when Done finalization requests cleanup', async () => {
+		const target = sessionUriForTask('TASK-003');
+		const other = sessionUriForTask('TASK-004');
+		const matchingTab = { input: { uri: target } } as unknown as vscode.Tab;
+		const otherTab = { input: { uri: other } } as unknown as vscode.Tab;
+		let closed: readonly vscode.Tab[] | undefined;
+		await closeTaskChatTabs(target, {
+			all: [{ tabs: [matchingTab, otherTab] } as unknown as vscode.TabGroup],
+			async close(tabs, preserveFocus) {
+				assert.strictEqual(preserveFocus, true);
+				closed = Array.isArray(tabs) ? tabs : [tabs];
+				return true;
+			},
+		});
+		assert.deepStrictEqual(closed, [matchingTab]);
 	});
 
 	suite('agent name overrides (§6.17)', () => {
@@ -950,6 +1306,167 @@ suite('M3 RunManager', () => {
 			);
 		});
 
+		test('split children use the active named task-set directory and snapshot', async () => {
+			const namedDir = vscode.Uri.joinPath(dir, 'task-sets', 'set-mobile', 'tasks');
+			const namedStore = new TaskStore(namedDir, 'set-mobile');
+			await namedStore.ensureDirectory();
+			const task = await namedStore.create('Rebuild the mobile onboarding flow');
+			const runManager = new RunManager(
+				namedStore,
+				new StubExecutor(okReceiptWithProposals(namedStore, 'split', ['Mobile welcome', 'Mobile progress'])),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'split');
+			const after = await waitUntilSettled(namedStore, task.id);
+			const { tasks } = await namedStore.readAll();
+			const children = tasks.filter((candidate) => candidate.originTask === task.id);
+
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(children.length, 2);
+			assert.ok(children.every((child) => child.setId === 'set-mobile'));
+			assert.ok(children.every((child) => child.originRunId));
+			assert.ok(children.every((child) => child.originProposalKey));
+			assert.strictEqual((await store.readAll()).tasks.length, 0, 'the default task folder must remain untouched');
+			assert.deepStrictEqual(
+				(await namedStore.snapshot()).columns.find((column) => column.id === 'backlog')?.tasks.map((candidate) => candidate.title),
+				['Mobile welcome', 'Mobile progress'],
+			);
+		});
+
+		test('receipt observed before proposals waits for the separate proposal write', async () => {
+			const task = await store.create('Reconcile split write ordering');
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'split', result: 'ok', note: 'receipt first' }));
+				setTimeout(() => {
+					void store.appendLog(t.id, `- propose-task run:${runId} title:"Written after receipt" note:"separate watcher event"`);
+				}, 25);
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'split');
+			const after = await waitUntilSettled(store, task.id);
+			const { tasks } = await store.readAll();
+
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+		});
+
+		test('a successful split with no usable proposals remains retryably blocked', async () => {
+			const task = await store.create('Do not retire without children');
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'split', result: 'ok', note: 'missing proposals' }));
+				return { ok: true };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'split');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.status, 'blocked');
+			assert.ok(after.sections['Log'].includes('no usable proposals'));
+			assert.ok(after.sections['Log'].includes('awaiting late receipt'));
+			assert.strictEqual((await store.readAll()).tasks.length, 1);
+		});
+
+		test('blocked and failed split receipts never create children', async () => {
+			const task = await store.create('Keep blocked split intact');
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, `- propose-task run:${runId} title:"Must not be filed" note:"blocked split"`);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'split', result: 'failed', note: 'split failed' }));
+				return { ok: true };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'split');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.status, 'failed');
+			assert.strictEqual((await store.readAll()).tasks.length, 1);
+		});
+
+		test('split creation failure leaves a retryable parent and a retry creates no duplicates', async () => {
+			const task = await store.create('Recover a partial split');
+			const failingRename: vscode.FileSystem['rename'] = async (source, target, options) => {
+				if (target.path.endsWith('/TASK-003.md')) {
+					throw new Error('injected child write failure');
+				}
+				return vscode.workspace.fs.rename(source, target, options);
+			};
+			const failingStore = new TaskStore(dir, 'default', failingRename);
+			const firstRun = new RunManager(
+				failingStore,
+				new StubExecutor(okReceiptWithProposals(failingStore, 'split', ['First child', 'Second child'])),
+				folder,
+			);
+
+			await firstRun.handleAction(task.id, 'split');
+			const blocked = await waitUntilSettled(store, task.id);
+			assert.strictEqual(blocked.state, 'refine');
+			assert.strictEqual(blocked.status, 'blocked');
+			assert.strictEqual((await store.readAll()).tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+
+			const retry = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await retry.reconcileTaskChange(task.id);
+			await retry.reconcileTaskChange(task.id);
+			const after = (await store.readAll()).tasks;
+
+			assert.strictEqual(after.find((candidate) => candidate.id === task.id)?.state, 'done');
+			assert.strictEqual(after.filter((candidate) => candidate.originTask === task.id).length, 2);
+		});
+
+		test('activation reconciliation completes a persisted split run', async () => {
+			const task = await store.create('Recover split after reload');
+			const runId = 'r-activation-split';
+			await store.auditedPatch(
+				task.id,
+				{ state: 'refine', status: 'running', run: runId },
+				{
+					action: 'split',
+					runId,
+					events: [{ kind: 'activity-start', stage: 'split', action: 'split', runId }],
+				},
+			);
+			await store.appendLog(task.id, `- propose-task run:${runId} title:"Recovered child" note:"written before reload"`);
+			await store.appendLog(task.id, formatReceipt({ runId, taskId: task.id, stage: 'split', result: 'ok', note: 'reload recovery' }));
+
+			const reloadedManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await reloadedManager.reconcileOnActivation();
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual((await store.readAll()).tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+		});
+
+		test('a late split receipt after the blocked marker recovers once proposals arrive', async () => {
+			const task = await store.create('Recover a late split completion');
+			const runManager = new RunManager(store, new StubExecutor(async () => ({ ok: true })), folder);
+
+			await runManager.handleAction(task.id, 'split');
+			const blocked = await waitUntilSettled(store, task.id);
+			const marker = parseReceipts(blocked.sections['Log']).find(
+				(receipt) => receipt.stage === 'split' && receipt.result === 'blocked',
+			);
+			assert.ok(marker, 'the missing-receipt fallback must leave a split marker');
+
+			await store.appendLog(task.id, `- propose-task run:${marker!.runId} title:"Late child" note:"arrived after fallback"`);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId: marker!.runId, taskId: task.id, stage: 'split', result: 'ok', note: 'late split completion' }),
+			);
+			await runManager.reconcileTaskChange(task.id);
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual((await store.readAll()).tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+		});
+
 		test('split proposals are filed even when kanbanPilot.chat.allowTaskProposals is off', async () => {
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 			await cfg.update('chat.allowTaskProposals', false, vscode.ConfigurationTarget.Global);
@@ -1007,6 +1524,44 @@ suite('M3 RunManager', () => {
 
 			const { tasks } = await store.readAll();
 			assert.strictEqual(tasks.filter((t) => t.title.startsWith('Piece')).length, 5);
+		});
+
+		test('split preserves explicit types and inherits the parent type', async () => {
+			const task = await store.create('Split a delivery bug', { type: 'bug' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptWithProposals(
+					store,
+					'split',
+					['Typed feature', 'Inherited bug', 'Invalid type'],
+					['feature', undefined, 'regression'],
+				)),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'split');
+			await waitUntilSettled(store, task.id);
+
+			const { tasks } = await store.readAll();
+			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Typed feature')?.type, 'feature');
+			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Inherited bug')?.type, 'bug');
+			assert.strictEqual(tasks.some((candidate) => candidate.title === 'Invalid type'), false);
+		});
+
+		test('equivalent explicit and inherited split proposals are filed once', async () => {
+			const task = await store.create('Avoid duplicate split work', { type: 'bug' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptWithProposals(store, 'split', ['One child', 'One child'], [undefined, 'bug'])),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'split');
+			const after = await waitUntilSettled(store, task.id);
+			const { tasks } = await store.readAll();
+
+			assert.strictEqual(after.state, 'done');
+			assert.strictEqual(tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
 		});
 	});
 
@@ -1474,13 +2029,54 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'scoped');
 			assert.strictEqual(after.status, 'idle');
 		});
+
+		test('reconciles a late timeout receipt when the extension activates', async () => {
+			const task = await store.create('Recover timeout after reload');
+			const runId = 'r-timeout-reload';
+			await store.auditedPatch(
+				task.id,
+				{ state: 'in-progress', status: 'running', run: runId },
+				{
+					action: 'develop',
+					runId,
+					events: [{ kind: 'activity-start', stage: 'develop', action: 'develop', runId }],
+				},
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'failed', note: 'timed out; awaiting late receipt' }),
+			);
+			await store.auditedPatch(
+				task.id,
+				{ status: 'failed', run: undefined },
+				{
+					action: 'timeout',
+					runId,
+					outcome: 'timeout',
+					events: [{ kind: 'activity-finish', stage: 'develop', runId, outcome: 'timeout', provisional: true }],
+				},
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'written before activation' }),
+			);
+
+			const runManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await runManager.reconcileOnActivation();
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
+		});
 	});
 
 	suite('gate policies (§6.15)', () => {
-		async function withGates(gates: Partial<Record<
-			'gates.backlogToRefine' | 'gates.scopedToApproved' | 'gates.approvedToInProgress' | 'gates.validationAutoStart',
-			'manual' | 'auto'
-		>>, fn: () => Promise<void>): Promise<void> {
+		type GateSettingKey =
+			'gates.backlogToRefine' | 'gates.refineToScoped' | 'gates.scopedToApproved' |
+			'gates.approvedToInProgress' | 'gates.developToValidation' | 'gates.validationAutoStart' |
+			'gates.validateToDone' | 'gates.validateFailedToInProgress' | 'gates.splitToDone';
+
+		async function withGates(gates: Partial<Record<GateSettingKey, 'manual' | 'auto'>>, fn: () => Promise<void>): Promise<void> {
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 			const keys = Object.keys(gates) as (keyof typeof gates)[];
 			try {
@@ -1494,6 +2090,54 @@ suite('M3 RunManager', () => {
 				}
 			}
 		}
+
+		const receiptCompletionCases = [
+			{
+				gate: 'refineToScoped',
+				startState: 'refine',
+				pendingState: 'refine',
+				action: 'refine',
+				stage: 'refine',
+				result: 'ok',
+				target: 'scoped',
+			},
+			{
+				gate: 'developToValidation',
+				startState: 'approved',
+				pendingState: 'in-progress',
+				action: 'develop',
+				stage: 'develop',
+				result: 'ok',
+				target: 'validation',
+			},
+			{
+				gate: 'validateToDone',
+				startState: 'validation',
+				pendingState: 'validation',
+				action: 'validate',
+				stage: 'validate',
+				result: 'ok',
+				target: 'done',
+			},
+			{
+				gate: 'validateFailedToInProgress',
+				startState: 'validation',
+				pendingState: 'validation',
+				action: 'validate',
+				stage: 'validate',
+				result: 'failed',
+				target: 'in-progress',
+			},
+			{
+				gate: 'splitToDone',
+				startState: 'refine',
+				pendingState: 'refine',
+				action: 'split',
+				stage: 'split',
+				result: 'ok',
+				target: 'done',
+			},
+		] as const;
 
 		test('defaults are all manual — a sweep over eligible tasks does nothing', async () => {
 			const task = await store.create('Set up billing webhook');
@@ -1626,6 +2270,96 @@ suite('M3 RunManager', () => {
 					assert.strictEqual(after.status, 'blocked', 'a retry state must wait for a human, auto or not');
 				},
 			);
+		});
+
+		test('receipt completion gates default to pending and auto policies promote them', async () => {
+			const task = await store.create('Pending completion');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const runManager = new RunManager(store, new StubExecutor(okReceipt(store, 'refine')), folder);
+			let pending!: Task;
+			await withGates({ 'gates.refineToScoped': 'manual' }, async () => {
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(async () => {
+					const current = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+					if (!current) {
+						return false;
+					}
+					pending = current;
+					return current.status === 'idle' && !!current.pendingOutcome;
+				});
+			});
+			assert.strictEqual(pending.state, 'refine');
+			assert.strictEqual(pending.pendingOutcome?.gate, 'refineToScoped');
+
+			await withGates({ 'gates.refineToScoped': 'auto' }, async () => {
+				await runManager.applyGatePolicies();
+			});
+			const promoted = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(promoted.state, 'scoped');
+			assert.strictEqual(promoted.pendingOutcome, undefined);
+		});
+
+		for (const scenario of receiptCompletionCases) {
+			test(`${scenario.gate}: manual promotion applies the durable pending outcome`, async () => {
+				const setting = `gates.${scenario.gate}` as GateSettingKey;
+				await withGates({ [setting]: 'manual' }, async () => {
+					const task = await store.create(`Manual ${scenario.gate}`);
+					await store.patch(task.id, { state: scenario.startState, status: 'idle' });
+					const executor = scenario.gate === 'splitToDone'
+						? new StubExecutor(okReceiptWithProposals(store, 'split', ['Split child']))
+						: new StubExecutor(receiptWithResult(store, scenario.stage, scenario.result));
+					const runManager = new RunManager(store, executor, folder);
+
+					await runManager.handleAction(task.id, scenario.action);
+					let pending!: Task;
+					await waitUntil(async () => {
+						const current = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+						if (!current) {
+							return false;
+						}
+						pending = current;
+						return current.status === 'idle' && current.pendingOutcome?.gate === scenario.gate;
+					});
+
+					assert.strictEqual(pending.state, scenario.pendingState);
+					assert.strictEqual(pending.pendingOutcome?.stage, scenario.stage);
+					assert.strictEqual(pending.pendingOutcome?.result, scenario.result);
+					const reloadedManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+					await reloadedManager.reconcileOnActivation();
+					const afterReload = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+					assert.strictEqual(afterReload.state, scenario.pendingState);
+					assert.strictEqual(afterReload.pendingOutcome?.gate, scenario.gate);
+					assert.strictEqual((await reloadedManager.applyPendingOutcome(task.id)).kind, 'applied');
+
+					const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+					assert.strictEqual(after.state, scenario.target);
+					assert.strictEqual(after.status, 'idle');
+					assert.strictEqual(after.pendingOutcome, undefined);
+					if (scenario.gate === 'splitToDone') {
+						assert.strictEqual((await store.readAll()).tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+					}
+				});
+			});
+		}
+
+		test('every receipt-completion gate auto-promotes through the same path', async () => {
+			for (const scenario of receiptCompletionCases) {
+				const setting = `gates.${scenario.gate}` as GateSettingKey;
+				await withGates({ [setting]: 'auto' }, async () => {
+					const task = await store.create(`Automatic ${scenario.gate}`);
+					await store.patch(task.id, { state: scenario.startState, status: 'idle' });
+					const executor = scenario.gate === 'splitToDone'
+						? new StubExecutor(okReceiptWithProposals(store, 'split', ['Automatic split child']))
+						: new StubExecutor(receiptWithResult(store, scenario.stage, scenario.result));
+					const runManager = new RunManager(store, executor, folder);
+
+					await runManager.handleAction(task.id, scenario.action);
+					const after = await waitUntilSettled(store, task.id);
+					assert.strictEqual(after.state, scenario.target, scenario.gate);
+					assert.strictEqual(after.status, 'idle');
+					assert.strictEqual(after.pendingOutcome, undefined);
+				});
+			}
 		});
 	});
 });

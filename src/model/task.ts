@@ -1,3 +1,7 @@
+import type { ReceiptResult, Stage } from '../chat/receipt';
+import { gateForId } from './gates';
+import type { GateId } from './gates';
+
 /**
  * Task file schema (PRD §6.3).
  *
@@ -51,6 +55,19 @@ export type Status = (typeof STATUSES)[number];
 export const TASK_TYPES = ['feature', 'bug'] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 
+/**
+ * A receipt outcome waiting for its configured completion gate. The payload is
+ * deliberately extension-owned and lives in one flat frontmatter scalar so it
+ * survives reloads without changing the agent-facing receipt grammar.
+ */
+export interface PendingOutcome {
+	gate: GateId;
+	stage: Stage;
+	result: ReceiptResult;
+	runId: string;
+	scopeHash?: string;
+}
+
 export const TASK_TYPE_LABELS: Record<TaskType, string> = {
 	feature: 'Feature',
 	bug: 'Bug',
@@ -77,6 +94,8 @@ export interface Task {
 	updated?: string;
 	/** Active run id, or undefined when idle. */
 	run?: string;
+	/** Receipt outcome waiting for a manual or automatic completion gate. */
+	pendingOutcome?: PendingOutcome;
 	/** Optional within-column ordering position owned by the extension. */
 	position?: number;
 	/** Derived chat session id (§6.7). */
@@ -95,6 +114,10 @@ export interface Task {
 	checkpoint?: string;
 	/** Set when an agent run filed this task itself, rather than a human typing it (§6.12). */
 	originTask?: string;
+	/** Run that filed this task; used to make proposal reconciliation durable. */
+	originRunId?: string;
+	/** Stable proposal identity used to make one split child idempotent across reloads. */
+	originProposalKey?: string;
 	/** Body sections, keyed by heading text: 'Request', 'Refined', 'Scope', 'Log'. */
 	sections: Record<string, string>;
 	/** Everything after the frontmatter block, verbatim. */
@@ -199,6 +222,80 @@ function parseTaskPosition(value: string | undefined): number | undefined {
 	return isValidTaskPosition(parsed) ? parsed : undefined;
 }
 
+function isReceiptResult(value: unknown): value is ReceiptResult {
+	return value === 'ok' || value === 'blocked' || value === 'failed';
+}
+
+function isStage(value: unknown): value is Stage {
+	return value === 'refine' || value === 'develop' || value === 'validate' || value === 'split';
+}
+
+/** Validates a pending payload against the current gate catalog. */
+export function isPendingOutcome(value: unknown): value is PendingOutcome {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return false;
+	}
+
+	const candidate = value as Record<string, unknown>;
+	const gate = gateForId(candidate.gate);
+	if (
+		!gate ||
+		gate.kind !== 'receipt-completion' ||
+		!isStage(candidate.stage) ||
+		!isReceiptResult(candidate.result) ||
+		candidate.stage !== gate.stage ||
+		candidate.result !== gate.result ||
+		typeof candidate.runId !== 'string' ||
+		!candidate.runId.trim() ||
+		candidate.runId.length > 200 ||
+		/\s/.test(candidate.runId)
+	) {
+		return false;
+	}
+
+	const keys = Object.keys(candidate);
+	const allowedKeys = new Set(['gate', 'stage', 'result', 'runId', 'scopeHash']);
+	if (keys.some((key) => !allowedKeys.has(key))) {
+		return false;
+	}
+
+	if (candidate.scopeHash !== undefined && (
+		typeof candidate.scopeHash !== 'string' ||
+		!/^[0-9a-f]{7}$/.test(candidate.scopeHash)
+	)) {
+		return false;
+	}
+	if (gate.id === 'refineToScoped' && typeof candidate.scopeHash !== 'string') {
+		return false;
+	}
+	if (gate.id !== 'refineToScoped' && candidate.scopeHash !== undefined) {
+		return false;
+	}
+
+	return true;
+}
+
+/** Parses the extension-owned pending scalar, degrading invalid data safely. */
+export function parsePendingOutcome(value: string | undefined): PendingOutcome | undefined {
+	if (!value || value === 'null') {
+		return undefined;
+	}
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return isPendingOutcome(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Encodes a validated pending payload for the flat frontmatter format. */
+export function encodePendingOutcome(value: PendingOutcome): string {
+	if (!isPendingOutcome(value)) {
+		throw new Error('Invalid pending outcome.');
+	}
+	return JSON.stringify(value);
+}
+
 /**
  * Builds a Task from raw file content. Returns undefined only when the file has
  * no frontmatter or no id — anything else degrades to a sensible default rather
@@ -229,6 +326,7 @@ export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default')
 		created: frontmatter.created || undefined,
 		updated: frontmatter.updated || undefined,
 		run: frontmatter.run && frontmatter.run !== 'null' ? frontmatter.run : undefined,
+		pendingOutcome: parsePendingOutcome(frontmatter.pending_outcome),
 		position: parseTaskPosition(frontmatter.position),
 		chat: frontmatter.chat || undefined,
 		copilotSessionId: frontmatter.copilot_session_id || undefined,
@@ -236,6 +334,8 @@ export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default')
 		chatResetRequired: frontmatter.chat_reset_required === 'true',
 		checkpoint: frontmatter.checkpoint || undefined,
 		originTask: frontmatter.origin_task || undefined,
+		originRunId: frontmatter.origin_run || undefined,
+		originProposalKey: frontmatter.origin_proposal || undefined,
 		sections: parseSections(body),
 		body,
 	};
@@ -252,12 +352,15 @@ const KEY_ORDER = [
 	'created',
 	'updated',
 	'run',
+	'pending_outcome',
 	'chat',
 	'copilot_session_id',
 	'scope_hash',
 	'chat_reset_required',
 	'checkpoint',
 	'origin_task',
+	'origin_run',
+	'origin_proposal',
 ];
 
 function serializeFrontmatter(frontmatter: Record<string, string>): string {
@@ -435,6 +538,8 @@ export interface TaskOrigin {
 	taskId: string;
 	runId: string;
 	note: string;
+	/** Stable identity of the source propose-task line, when available. */
+	proposalKey?: string;
 }
 
 export interface NewTaskOptions {
@@ -472,7 +577,13 @@ export function newTaskFile(
 		created: stamp,
 		updated: stamp,
 		chat_reset_required: 'false',
-		...(origin ? { origin_task: origin.taskId } : {}),
+		...(origin
+			? {
+					origin_task: origin.taskId,
+					origin_run: origin.runId,
+					...(origin.proposalKey ? { origin_proposal: origin.proposalKey } : {}),
+				}
+			: {}),
 	});
 
 	const requestBody = origin

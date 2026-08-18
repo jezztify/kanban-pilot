@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 
-import { parseProposals, proposalsForRun } from '../chat/proposals';
+import { parseProposals, proposalFingerprint, proposalsForRun } from '../chat/proposals';
 
 /** M3.5 — task-proposal grammar (PRD §6.12). */
 
@@ -54,5 +54,16 @@ suite('M3.5 proposal grammar', () => {
 	test('a line missing a required field is not parsed', () => {
 		const log = '- propose-task run:r19 title:"Missing note"';
 		assert.strictEqual(parseProposals(log).length, 0);
+	});
+
+	test('proposal fingerprints are stable and include the accepted type', () => {
+		const [proposal] = parseProposals('- propose-task run:r19 title:"Child" note:"reason"');
+
+		assert.strictEqual(proposalFingerprint(proposal, 'bug'), proposalFingerprint(proposal, 'bug'));
+		assert.notStrictEqual(proposalFingerprint(proposal, 'bug'), proposalFingerprint(proposal, 'feature'));
+		assert.notStrictEqual(
+			proposalFingerprint(proposal, 'bug'),
+			proposalFingerprint({ ...proposal, note: 'different reason' }, 'bug'),
+		);
 	});
 });

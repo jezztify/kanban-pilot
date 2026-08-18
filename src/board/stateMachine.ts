@@ -1,4 +1,5 @@
-import { Column, Status } from '../model/task';
+import { Column, isPendingOutcome, PendingOutcome, Status } from '../model/task';
+import { gateForId, GateId } from '../model/gates';
 
 /**
  * The human-side transition rules for §5.2's action matrix and the §5 state
@@ -33,6 +34,12 @@ export interface TransitionResult {
 	status: Status;
 	/** True when `RunManager` should launch a real run for this action. */
 	needsAgent: boolean;
+}
+
+export interface PendingTransitionResult {
+	state: Column;
+	status: 'idle';
+	gate: GateId;
 }
 
 type Predicate = (state: Column, status: Status) => boolean;
@@ -139,4 +146,29 @@ export function applyAction(
 		return { state: 'approved', status: 'idle', needsAgent: false }; // in-progress: "Stop + reset"
 	}
 	return rule.to;
+}
+
+/**
+ * Applies one validated receipt completion to its expected source state.
+ * Pending outcomes are deliberately separate from `TASK_ACTIONS`: they are
+ * durable decisions, not ordinary human escape controls or retry actions.
+ */
+export function applyPendingTransition(
+	current: { state: Column; status: Status },
+	pending: PendingOutcome,
+): PendingTransitionResult | undefined {
+	if (!isPendingOutcome(pending) || current.status !== 'idle') {
+		return undefined;
+	}
+
+	const gate = gateForId(pending.gate);
+	if (!gate || gate.kind !== 'receipt-completion' || current.state !== gate.source) {
+		return undefined;
+	}
+
+	return {
+		state: gate.target,
+		status: gate.targetStatus,
+		gate: gate.id,
+	};
 }

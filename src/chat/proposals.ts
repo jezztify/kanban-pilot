@@ -16,6 +16,7 @@
  * that run's own receipt.
  */
 
+import { createHash } from 'crypto';
 import { isTaskType, TaskType } from '../model/task';
 
 export interface Proposal {
@@ -23,6 +24,14 @@ export interface Proposal {
 	title: string;
 	note: string;
 	type?: TaskType;
+}
+
+/** Stable identity for one accepted proposal, used to make retries reload-safe. */
+export function proposalFingerprint(proposal: Proposal, type: TaskType): string {
+	return createHash('sha256')
+		.update(JSON.stringify([proposal.runId, type, proposal.title, proposal.note]))
+		.digest('hex')
+		.slice(0, 24);
 }
 
 const PROPOSAL_LINE = /^-\s*propose-task\s+run:(\S+)(?:\s+type:(\S+))?\s+title:"([^"]*)"\s+note:"([^"]*)"\s*$/;

@@ -4,6 +4,8 @@ import {
 	COLUMNS,
 	Column,
 	EditableTaskContent,
+	PendingOutcome,
+	Status,
 	isTaskType,
 	isValidTaskPosition,
 	NewTaskOptions,
@@ -12,6 +14,7 @@ import {
 	normalizeEditableTaskContent,
 	newTaskFile,
 	parseFile,
+	parsePendingOutcome,
 	taskFromRaw,
 	updateEditableTaskContent,
 	updateFrontmatter,
@@ -79,6 +82,19 @@ export interface AuditedPatchOptions {
 	events?: AuditEventInput[];
 	/** Shared timestamp for automatically generated transition events. */
 	now?: Date;
+	/** Optional compare-and-set values used by one-time pending promotion. */
+	expected?: {
+		state?: Column;
+		status?: Status;
+		pendingOutcome?: PendingOutcome;
+	};
+}
+
+export class TaskMutationConflictError extends Error {
+	constructor(message = 'The task changed before the requested mutation could be applied.') {
+		super(message);
+		this.name = 'TaskMutationConflictError';
+	}
 }
 
 const TASK_FILE = /^(TASK-\d+)\.md$/;
@@ -118,6 +134,19 @@ function taskIdFromUri(uri: vscode.Uri): string | undefined {
 
 function isColumn(value: unknown): value is Column {
 	return typeof value === 'string' && (COLUMNS as readonly string[]).includes(value);
+}
+
+function pendingOutcomesEqual(left: PendingOutcome | undefined, right: PendingOutcome | undefined): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function validatePendingUpdate(updates: Record<string, string | undefined>): void {
+	if (!Object.prototype.hasOwnProperty.call(updates, 'pending_outcome') || updates.pending_outcome === undefined) {
+		return;
+	}
+	if (!parsePendingOutcome(updates.pending_outcome)) {
+		throw new Error('Invalid pending outcome metadata.');
+	}
 }
 
 export class TaskStore {
@@ -591,6 +620,7 @@ export class TaskStore {
 			}
 			const updated = updateFrontmatter(edited, {
 				updated: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),
+				pending_outcome: undefined,
 			});
 			await this.writeAtomic(uri, updated);
 
@@ -608,11 +638,18 @@ export class TaskStore {
 	 */
 	async patch(id: string, updates: Record<string, string | undefined>): Promise<void> {
 		await this.serialize(async () => {
+			validatePendingUpdate(updates);
 			const uri = this.fileFor(id);
 			const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+			const invalidatesPending = ['state', 'status', 'run'].some((key) =>
+				Object.prototype.hasOwnProperty.call(updates, key),
+			);
 
 			const next = updateFrontmatter(raw, {
 				...updates,
+				...(invalidatesPending && !Object.prototype.hasOwnProperty.call(updates, 'pending_outcome')
+					? { pending_outcome: undefined }
+					: {}),
 				updated: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
 			});
 
@@ -632,14 +669,29 @@ export class TaskStore {
 		options: AuditedPatchOptions = {},
 	): Promise<AuditEvent[]> {
 		return this.serialize(async () => {
+			validatePendingUpdate(updates);
 			const uri = this.fileFor(id);
 			const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
 			const before = taskFromRaw(raw, id, this.setId);
 			if (!before) {
 				throw new Error(`Cannot audit an unparseable task: ${id}`);
 			}
+			if (
+				options.expected?.state !== undefined && before.state !== options.expected.state ||
+				options.expected?.status !== undefined && before.status !== options.expected.status ||
+				options.expected?.pendingOutcome !== undefined &&
+				!pendingOutcomesEqual(before.pendingOutcome, options.expected.pendingOutcome)
+			) {
+				throw new TaskMutationConflictError();
+			}
 
 			const nextUpdates = { ...updates };
+			const invalidatesPending = ['state', 'status', 'run'].some((key) =>
+				Object.prototype.hasOwnProperty.call(updates, key),
+			);
+			if (invalidatesPending && !Object.prototype.hasOwnProperty.call(updates, 'pending_outcome')) {
+				nextUpdates.pending_outcome = undefined;
+			}
 			let orderingWrites: AtomicWrite[] = [];
 			if (isColumn(updates.state) && updates.state !== before.state) {
 				const { tasks } = await this.readAllInternal(false);
