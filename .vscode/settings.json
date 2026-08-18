@@ -12,5 +12,8 @@
 		"develop": "Bro Rapid Coder",
 		"validate": "Bro Rapid QA",
 		"refine": "Bro Rapid Architect"
-	}
+	},
+	"kanbanPilot.gates.validationAutoStart": "manual",
+	"kanbanPilot.gates.approvedToInProgress": "manual",
+	"kanbanPilot.gates.backlogToRefine": "manual"
 }

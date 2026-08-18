@@ -3,12 +3,26 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { COLUMNS, Column, STATUSES, Status, newTaskFile, parseSections, taskFromRaw, updateFrontmatter } from '../model/task';
+import {
+	COLUMNS,
+	Column,
+	isValidTaskPosition,
+	normalizeTaskType,
+	STATUSES,
+	Status,
+	newTaskFile,
+	parseSections,
+	taskFromRaw,
+	updateEditableTaskContent,
+	updateFrontmatter,
+} from '../model/task';
 import { sessionIdForTask } from '../chat/sessionUri';
 import { DEFAULT_TASK_SET_ID, TaskSetError, TaskSetRegistry } from '../model/taskSets';
 import { TaskStore } from '../model/taskStore';
 import { invokeBoardAction, primaryAction, shouldDockTaskChat } from '../board/boardPanel';
 import { TaskAction } from '../board/stateMachine';
+import { parseAuditEvents } from '../model/taskLog';
+import { formatReceipt, parseReceipts } from '../chat/receipt';
 
 /** M1 — task schema and store (PRD §6.3, §8.1). */
 
@@ -47,6 +61,7 @@ suite('M1 task schema', () => {
 
 		assert.strictEqual(task.id, 'TASK-142');
 		assert.strictEqual(task.title, 'Set up billing webhook');
+		assert.strictEqual(task.type, 'feature', 'legacy files default to Feature in memory');
 		assert.strictEqual(task.state, 'scoped');
 		assert.strictEqual(task.status, 'idle');
 		assert.strictEqual(task.chat, 'kanban-pilot-TASK-142');
@@ -69,6 +84,25 @@ suite('M1 task schema', () => {
 		assert.strictEqual(taskFromRaw(withComment)?.scopeHash, '4e91a0c');
 	});
 
+	test('parses valid positions and falls back for malformed positions', () => {
+		assert.strictEqual(taskFromRaw(SAMPLE.replace('state: scoped', 'state: scoped\nposition: 4.5'))?.position, 4.5);
+		assert.strictEqual(taskFromRaw(SAMPLE.replace('state: scoped', 'state: scoped\nposition: -1'))?.position, undefined);
+		assert.strictEqual(taskFromRaw(SAMPLE.replace('state: scoped', 'state: scoped\nposition: Infinity'))?.position, undefined);
+		assert.strictEqual(taskFromRaw(SAMPLE.replace('state: scoped', 'state: scoped\nposition: malformed'))?.position, undefined);
+		assert.strictEqual(isValidTaskPosition(0), true);
+		assert.strictEqual(isValidTaskPosition(Number.POSITIVE_INFINITY), false);
+		assert.strictEqual(isValidTaskPosition(-1), false);
+	});
+
+	test('serializes position in the extension-owned frontmatter order', () => {
+		const next = updateFrontmatter(SAMPLE, { position: '2' });
+		assert.ok(next.indexOf('state: scoped') < next.indexOf('status: idle'));
+		assert.ok(next.indexOf('status: idle') < next.indexOf('position: 2'));
+		assert.ok(next.indexOf('position: 2') < next.indexOf('created:'));
+		assert.strictEqual(taskFromRaw(newTaskFile('TASK-006', 'Positioned', { position: 3 }))?.position, 3);
+		assert.ok(newTaskFile('TASK-007', 'Invalid position', { position: -1 }).indexOf('position:') === -1);
+	});
+
 	test('updateFrontmatter leaves the body byte-for-byte intact', () => {
 		const next = updateFrontmatter(SAMPLE, { state: 'approved', status: 'running', run: 'r8' });
 
@@ -85,6 +119,45 @@ suite('M1 task schema', () => {
 		const next = updateFrontmatter(SAMPLE, { checkpoint: undefined });
 		assert.strictEqual(taskFromRaw(next)?.checkpoint, undefined);
 		assert.ok(!next.includes('checkpoint:'));
+	});
+
+	test('updateEditableTaskContent replaces editable sections and preserves other body content', () => {
+		const raw = `${SAMPLE.replace('title: Set up billing webhook', 'title: Original title').replace(
+			'## Log\n',
+			'## Notes\nKeep this unrelated section byte-for-byte.\n\n## Log\n',
+		)}- existing receipt\n`;
+		const next = updateEditableTaskContent(raw, {
+			title: '  Corrected title  ',
+			request: 'First line\n\n- **multiline** request',
+			refined: 'A refined paragraph\nwith a second line.',
+			scope: '- [ ] Keep the scope hash unchanged\n- [ ] Preserve Markdown',
+		});
+		const task = taskFromRaw(next);
+
+		assert.ok(task);
+		assert.strictEqual(task.title, 'Corrected title');
+		assert.strictEqual(task.sections['Request'], 'First line\n\n- **multiline** request');
+		assert.strictEqual(task.sections['Refined'], 'A refined paragraph\nwith a second line.');
+		assert.strictEqual(task.sections['Scope'], '- [ ] Keep the scope hash unchanged\n- [ ] Preserve Markdown');
+		assert.ok(next.includes('scope_hash: 4e91a0c'));
+		assert.ok(next.includes('## Notes\nKeep this unrelated section byte-for-byte.'));
+		assert.ok(next.includes('- existing receipt\n'));
+	});
+
+	test('updateEditableTaskContent rejects invalid titles before changing content', () => {
+		assert.throws(
+			() => updateEditableTaskContent(SAMPLE, { title: '   ', request: '', refined: '', scope: '' }),
+			/Task title cannot be blank/,
+		);
+		assert.throws(
+			() => updateEditableTaskContent(SAMPLE, {
+				title: 'x'.repeat(201),
+				request: '',
+				refined: '',
+				scope: '',
+			}),
+			/200 characters or fewer/,
+		);
 	});
 
 	test('unknown state or status degrades instead of dropping the card (R4)', () => {
@@ -110,7 +183,16 @@ suite('M1 task schema', () => {
 		assert.strictEqual(task?.id, 'TASK-001');
 		assert.strictEqual(task?.state, 'backlog');
 		assert.strictEqual(task?.status, 'idle');
+		assert.strictEqual(task?.type, 'feature');
 		assert.deepStrictEqual(Object.keys(task!.sections), ['Request', 'Refined', 'Scope', 'Log']);
+	});
+
+	test('supports the canonical Bug type and normalizes invalid values', () => {
+		const raw = newTaskFile('TASK-008', 'Fix webhook retry', { type: 'bug' });
+		assert.strictEqual(taskFromRaw(raw)?.type, 'bug');
+		assert.strictEqual(normalizeTaskType('feature'), 'feature');
+		assert.strictEqual(normalizeTaskType('invalid'), 'feature');
+		assert.strictEqual(normalizeTaskType(undefined), 'feature');
 	});
 
 	test('parseSections tolerates an empty body', () => {
@@ -190,6 +272,184 @@ suite('M1 task store', () => {
 		assert.strictEqual(await store.nextId(), 'TASK-143');
 	});
 
+	test('creates and persists an explicitly typed task', async () => {
+		const created = await store.create('Fix retry handling', { type: 'bug' });
+		assert.strictEqual(created.type, 'bug');
+		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(created.id))).toString('utf8');
+		assert.match(raw, /type: bug/);
+		assert.strictEqual((await store.readAll()).tasks[0].type, 'bug');
+	});
+
+	test('backfills missing and invalid legacy types without dropping the cards', async () => {
+		const missing = newTaskFile('TASK-101', 'Legacy missing type').replace('type: feature\n', '');
+		const invalid = missing.replace('title: Legacy missing type', 'title: Legacy invalid type').replace('id: TASK-101', 'id: TASK-102')
+			.replace('state: backlog', 'type: regression\nstate: backlog');
+		await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(dir, 'TASK-101.md'), Buffer.from(missing, 'utf8'));
+		await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(dir, 'TASK-102.md'), Buffer.from(invalid, 'utf8'));
+
+		const result = await store.readAll();
+		assert.deepStrictEqual(result.malformed, []);
+		assert.deepStrictEqual(result.tasks.map((task) => task.type), ['feature', 'feature']);
+		const migratedMissing = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, 'TASK-101.md'))).toString('utf8');
+		const migratedInvalid = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, 'TASK-102.md'))).toString('utf8');
+		assert.match(migratedMissing, /type: feature/);
+		assert.match(migratedInvalid, /type: feature/);
+		assert.doesNotMatch(migratedInvalid, /type: regression/);
+	});
+
+	test('creates backlog tasks with append positions and orders legacy files deterministically', async () => {
+		const first = await store.create('First');
+		const second = await store.create('Second');
+		assert.strictEqual(first.position, 0);
+		assert.strictEqual(second.position, 1);
+
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-010.md'),
+			Buffer.from(newTaskFile('TASK-010', 'Legacy ten'), 'utf8'),
+		);
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-020.md'),
+			Buffer.from(newTaskFile('TASK-020', 'Legacy twenty'), 'utf8'),
+		);
+		const snapshot = await store.snapshot();
+		assert.deepStrictEqual(
+			snapshot.columns.find((column) => column.id === 'backlog')?.tasks.map((task) => task.id),
+			['TASK-001', 'TASK-002', 'TASK-010', 'TASK-020'],
+		);
+	});
+
+	test('uses task id as a deterministic tie-breaker for duplicate positions', async () => {
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-010.md'),
+			Buffer.from(newTaskFile('TASK-010', 'Ten', { position: 2 }), 'utf8'),
+		);
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-002.md'),
+			Buffer.from(newTaskFile('TASK-002', 'Two', { position: 2 }), 'utf8'),
+		);
+		const tasks = (await store.snapshot()).columns.find((column) => column.id === 'backlog')?.tasks ?? [];
+		assert.deepStrictEqual(tasks.map((task) => task.id), ['TASK-002', 'TASK-010']);
+	});
+
+	test('appends a new task after a column containing only legacy files', async () => {
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-010.md'),
+			Buffer.from(newTaskFile('TASK-010', 'Legacy ten'), 'utf8'),
+		);
+		await vscode.workspace.fs.writeFile(
+			vscode.Uri.joinPath(dir, 'TASK-020.md'),
+			Buffer.from(newTaskFile('TASK-020', 'Legacy twenty'), 'utf8'),
+		);
+		const created = await store.create('New last task');
+		const backlog = (await store.snapshot()).columns[0].tasks;
+		assert.deepStrictEqual(backlog.map((task) => task.id), ['TASK-010', 'TASK-020', created.id]);
+		assert.deepStrictEqual(backlog.map((task) => task.position), [0, 1, 2]);
+	});
+
+	test('reorders top, middle, and end, persists positions, and survives a fresh store', async () => {
+		await store.create('One');
+		await store.create('Two');
+		await store.create('Three');
+		await store.create('Four');
+
+		assert.deepStrictEqual(await store.reorder('TASK-004', 'backlog', { beforeTaskId: 'TASK-001' }), { kind: 'applied' });
+		assert.deepStrictEqual(await store.reorder('TASK-004', 'backlog', { beforeTaskId: 'TASK-003' }), { kind: 'applied' });
+		assert.deepStrictEqual(await store.reorder('TASK-004', 'backlog', { beforeTaskId: null }), { kind: 'applied' });
+
+		const expected = ['TASK-001', 'TASK-002', 'TASK-003', 'TASK-004'];
+		const snapshot = await store.snapshot();
+		assert.deepStrictEqual(snapshot.columns[0].tasks.map((task) => task.id), expected);
+		assert.deepStrictEqual(
+			snapshot.columns[0].tasks.map((task) => task.position),
+			[0, 1, 2, 3],
+		);
+		const reloaded = new TaskStore(dir).snapshot();
+		assert.deepStrictEqual((await reloaded).columns[0].tasks.map((task) => task.id), expected);
+	});
+
+	test('targetIndex inserts into the remaining sequence and rejects invalid or stale targets', async () => {
+		await store.create('One');
+		await store.create('Two');
+		await store.create('Three');
+		assert.deepStrictEqual(await store.reorder('TASK-003', 'backlog', { targetIndex: 0 }), { kind: 'applied' });
+		assert.deepStrictEqual(
+			(await store.snapshot()).columns[0].tasks.map((task) => task.id),
+			['TASK-003', 'TASK-001', 'TASK-002'],
+		);
+		assert.deepStrictEqual(await store.reorder('TASK-003', 'backlog', { targetIndex: 3 }), { kind: 'invalid' });
+		assert.deepStrictEqual(await store.reorder('TASK-003', 'backlog', { beforeTaskId: 'TASK-999' }), { kind: 'stale' });
+		assert.deepStrictEqual(await store.reorder('TASK-003', 'done', { beforeTaskId: null }), { kind: 'stale' });
+		assert.deepStrictEqual(await store.reorder('TASK-999', 'backlog', { beforeTaskId: null }), { kind: 'not-found' });
+	});
+
+	test('same-position reorder is a byte-for-byte no-op and preserves body and metadata on apply', async () => {
+		const first = await store.create('First');
+		const second = await store.create('Second');
+		const firstUri = store.fileFor(first.id);
+		const secondUri = store.fileFor(second.id);
+		const firstRaw = Buffer.from(await vscode.workspace.fs.readFile(firstUri)).toString('utf8');
+		const secondRaw = Buffer.from(await vscode.workspace.fs.readFile(secondUri)).toString('utf8');
+		const enriched = updateFrontmatter(firstRaw, {
+			status: 'running',
+			run: 'r-active',
+			chat: 'kanban-pilot-TASK-001',
+			copilot_session_id: 'session-1',
+			scope_hash: 'hash-1',
+			checkpoint: 'deadbee',
+			origin_task: 'TASK-009',
+		}).replace('## Request\n', '## Notes\nUnrelated body.\n\n## Request\n');
+		await vscode.workspace.fs.writeFile(firstUri, Buffer.from(enriched, 'utf8'));
+		const noOpBefore = Buffer.from(await vscode.workspace.fs.readFile(secondUri)).toString('utf8');
+		assert.deepStrictEqual(await store.reorder(second.id, 'backlog', { beforeTaskId: first.id }), { kind: 'applied' });
+		const unchangedBefore = Buffer.from(await vscode.workspace.fs.readFile(secondUri)).toString('utf8');
+		assert.deepStrictEqual(await store.reorder(second.id, 'backlog', { beforeTaskId: first.id }), { kind: 'no-op' });
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(secondUri)).toString('utf8'), unchangedBefore);
+		assert.notStrictEqual(noOpBefore, unchangedBefore, 'the first reorder should normalise positions');
+
+		assert.deepStrictEqual(await store.reorder(first.id, 'backlog', { beforeTaskId: second.id }), { kind: 'applied' });
+		const after = (await store.readAll()).tasks.find((task) => task.id === first.id)!;
+		assert.strictEqual(after.status, 'running');
+		assert.strictEqual(after.run, 'r-active');
+		assert.strictEqual(after.chat, 'kanban-pilot-TASK-001');
+		assert.strictEqual(after.copilotSessionId, 'session-1');
+		assert.strictEqual(after.scopeHash, 'hash-1');
+		assert.strictEqual(after.checkpoint, 'deadbee');
+		assert.strictEqual(after.originTask, 'TASK-009');
+		assert.strictEqual(after.sections['Notes'], 'Unrelated body.');
+	});
+
+	test('a failed batch replacement restores every task file', async () => {
+		await store.create('First');
+		await store.create('Second');
+		await store.create('Third');
+		const before = new Map<string, string>();
+		for (const id of ['TASK-001', 'TASK-002', 'TASK-003']) {
+			before.set(id, Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(id))).toString('utf8'));
+		}
+
+		let renameCount = 0;
+		const renameWithFailure: vscode.FileSystem['rename'] = async (source, target, options) => {
+			if (++renameCount === 2) {
+				throw new Error('injected rename failure');
+			}
+			return vscode.workspace.fs.rename(source, target, options);
+		};
+		const failingStore = new TaskStore(dir, 'default', renameWithFailure);
+
+		await assert.rejects(
+			() => failingStore.reorder('TASK-003', 'backlog', { beforeTaskId: 'TASK-001' }),
+			/injected rename failure/,
+		);
+
+		for (const [id, raw] of before) {
+			assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(id))).toString('utf8'), raw);
+		}
+		assert.deepStrictEqual(
+			(await vscode.workspace.fs.readDirectory(dir)).filter(([name]) => /\.reorder\./.test(name)),
+			[],
+		);
+	});
+
 	test('create then patch moves the card between columns', async () => {
 		const task = await store.create('Set up billing webhook');
 		assert.strictEqual(task.state, 'backlog');
@@ -218,6 +478,182 @@ suite('M1 task store', () => {
 		const after = (await store.readAll()).tasks[0];
 		assert.strictEqual(after.state, 'scoped');
 		assert.ok(after.sections['Scope'].includes('a human typed'));
+	});
+
+	test('edit updates title and editable sections while preserving protected metadata, log, and body content', async () => {
+		const task = await store.create('Original title');
+		const uri = store.fileFor(task.id);
+		const original = updateFrontmatter(
+			Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'),
+			{
+				state: 'scoped',
+				status: 'idle',
+				run: 'r-preserve',
+				chat: 'kanban-pilot-TASK-001',
+				copilot_session_id: 'copilot-session',
+				scope_hash: 'abc1234',
+				checkpoint: 'deadbee',
+				origin_task: 'TASK-009',
+				updated: '2026-01-01T00:00:00Z',
+			},
+		).replace('## Log\n', '## Notes\nUnrelated body content.\n\n## Log\n- old log line\n');
+		await vscode.workspace.fs.writeFile(uri, Buffer.from(original, 'utf8'));
+
+		const edited = await store.edit(task.id, {
+			title: '  Edited title #123 ',
+			request: 'Request line 1\nRequest line 2\n\n- item',
+			refined: 'Refined **Markdown**',
+			scope: '- [ ] Edited scope',
+		});
+		const afterRaw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		const after = taskFromRaw(afterRaw);
+
+		assert.strictEqual(edited.title, 'Edited title #123');
+		assert.strictEqual(after?.title, 'Edited title #123');
+		assert.match(afterRaw, /^title: "Edited title #123"$/m);
+		assert.strictEqual(after?.state, 'scoped');
+		assert.strictEqual(after?.status, 'idle');
+		assert.strictEqual(after?.run, 'r-preserve');
+		assert.strictEqual(after?.chat, 'kanban-pilot-TASK-001');
+		assert.strictEqual(after?.copilotSessionId, 'copilot-session');
+		assert.strictEqual(after?.scopeHash, 'abc1234');
+		assert.strictEqual(after?.checkpoint, 'deadbee');
+		assert.strictEqual(after?.originTask, 'TASK-009');
+		assert.strictEqual(after?.sections['Log'], '- old log line');
+		assert.strictEqual(after?.sections['Notes'], 'Unrelated body content.');
+		assert.strictEqual(after?.sections['Request'], 'Request line 1\nRequest line 2\n\n- item');
+		assert.strictEqual(after?.sections['Refined'], 'Refined **Markdown**');
+		assert.strictEqual(after?.sections['Scope'], '- [ ] Edited scope');
+		assert.notStrictEqual(after?.updated, '2026-01-01T00:00:00Z');
+		assert.ok(afterRaw.includes('- old log line\n'));
+		assert.ok(!afterRaw.includes('audit:'));
+	});
+
+	test('edit validates before writing and rejects missing or running tasks', async () => {
+		const task = await store.create('Do not change');
+		const uri = store.fileFor(task.id);
+		const before = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+
+		await assert.rejects(
+			() => store.edit(task.id, { title: '   ', request: '', refined: '', scope: '' }),
+			/Task title cannot be blank/,
+		);
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'), before);
+
+		await assert.rejects(
+			() => store.edit(task.id, {
+				title: 'x'.repeat(201),
+				request: '',
+				refined: '',
+				scope: '',
+			}),
+			/200 characters or fewer/,
+		);
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'), before);
+
+		await store.patch(task.id, { status: 'running', run: 'r-running' });
+		const running = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		await assert.rejects(
+			() => store.edit(task.id, { title: 'Rejected', request: '', refined: '', scope: '' }),
+			/running and cannot be edited/,
+		);
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'), running);
+
+		await assert.rejects(
+			() => store.edit('TASK-999', { title: 'Missing', request: '', refined: '', scope: '' }),
+			/was not found/,
+		);
+	});
+
+	test('edit rejects a file whose frontmatter id does not match its filename', async () => {
+		const task = await store.create('Mismatched task');
+		const uri = store.fileFor(task.id);
+		const before = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		const mismatched = before.replace(`id: ${task.id}`, 'id: TASK-999');
+		await vscode.workspace.fs.writeFile(uri, Buffer.from(mismatched, 'utf8'));
+
+		await assert.rejects(
+			() => store.edit(task.id, { title: 'Rejected', request: '', refined: '', scope: '' }),
+			/invalid task file/,
+		);
+		assert.strictEqual(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8'), mismatched);
+	});
+
+	test('auditedPatch records actual state/status changes in stable order', async () => {
+		const task = await store.create('Audit this transition');
+		await store.auditedPatch(
+			task.id,
+			{ state: 'refine', status: 'running', run: 'r-audit' },
+			{
+				action: 'refine',
+				now: new Date('2026-08-17T10:00:00Z'),
+				events: [{ kind: 'activity-start', stage: 'refine', action: 'refine', runId: 'r-audit' }],
+			},
+		);
+
+		const after = (await store.readAll()).tasks[0];
+		assert.deepStrictEqual(
+			parseAuditEvents(after.sections['Log']).map((event) => event.kind),
+			['state-change', 'status-change', 'activity-start'],
+		);
+		assert.strictEqual(parseAuditEvents(after.sections['Log'])[0].from, 'backlog');
+		assert.strictEqual(parseAuditEvents(after.sections['Log'])[1].to, 'running');
+	});
+
+	test('auditedPatch filters no-op transitions and de-duplicates lifecycle events', async () => {
+		const task = await store.create('Audit idempotency');
+		const now = new Date('2026-08-17T10:00:00Z');
+		const start = { kind: 'activity-start' as const, stage: 'refine' as const, action: 'refine', runId: 'r1' };
+		await store.auditedPatch(task.id, { state: 'backlog', status: 'idle' }, { action: 'noop', now });
+		await store.auditedPatch(task.id, { state: 'refine', status: 'running', run: 'r1' }, { action: 'refine', now, events: [start] });
+		await store.auditedPatch(
+			task.id,
+			{ status: 'blocked', run: undefined },
+			{
+				action: 'missing-receipt',
+				now,
+				events: [{
+					kind: 'activity-finish',
+					stage: 'refine',
+					runId: 'r1',
+					outcome: 'missing-receipt',
+					provisional: true,
+				}],
+			},
+		);
+		await store.auditedPatch(
+			task.id,
+			{ status: 'blocked' },
+			{
+				action: 'missing-receipt',
+				now: new Date('2026-08-17T10:00:01Z'),
+				events: [{
+					kind: 'activity-finish',
+					stage: 'refine',
+					runId: 'r1',
+					outcome: 'missing-receipt',
+					provisional: true,
+				}],
+			},
+		);
+
+		const events = parseAuditEvents((await store.readAll()).tasks[0].sections['Log']);
+		assert.deepStrictEqual(events.map((event) => event.kind), ['state-change', 'status-change', 'activity-start', 'status-change', 'activity-finish']);
+		assert.strictEqual(events.filter((event) => event.kind === 'activity-start').length, 1);
+		assert.strictEqual(events.filter((event) => event.kind === 'activity-finish').length, 1);
+	});
+
+	test('audit lines interleave with receipts and proposals without changing receipt parsing', async () => {
+		const task = await store.create('Preserve receipt grammar');
+		await store.appendLog(task.id, formatReceipt({ runId: 'r1', taskId: task.id, stage: 'refine', result: 'ok', note: 'done' }));
+		await store.auditedPatch(task.id, { state: 'refine' }, { action: 'accept' });
+		await store.appendLog(task.id, `- propose-task run:r1 title:"Follow-up" note:"found"`);
+		await store.appendLog(task.id, formatReceipt({ runId: 'r2', taskId: task.id, stage: 'develop', result: 'blocked', note: 'needs review' }));
+
+		const log = (await store.readAll()).tasks[0].sections['Log'];
+		assert.strictEqual(parseReceipts(log).length, 2);
+		assert.strictEqual(parseAuditEvents(log).length, 1);
+		assert.ok(log.includes('propose-task'));
 	});
 
 	test('unparseable files are reported, not silently dropped (R4)', async () => {
@@ -346,13 +782,18 @@ suite('task sets', () => {
 		await first.ensureDirectory();
 		await second.ensureDirectory();
 		const firstTask = await first.create('First');
+		await first.create('First second');
 		const secondTask = await second.create('Second');
+		await second.create('Second second');
 
 		assert.strictEqual(firstTask.id, secondTask.id);
 		assert.strictEqual(firstTask.setId, 'set-one');
 		assert.strictEqual(secondTask.setId, 'set-two');
 		assert.notStrictEqual(sessionIdForTask(firstTask.id, 'kanban-pilot-', first.setId), sessionIdForTask(secondTask.id, 'kanban-pilot-', second.setId));
 		assert.strictEqual(sessionIdForTask('TASK-001'), 'kanban-pilot-TASK-001', 'Default sessions stay backward compatible');
+		assert.deepStrictEqual(await first.reorder('TASK-002', 'backlog', { beforeTaskId: 'TASK-001' }), { kind: 'applied' });
+		assert.deepStrictEqual((await first.snapshot()).columns[0].tasks.map((task) => task.id), ['TASK-002', 'TASK-001']);
+		assert.deepStrictEqual((await second.snapshot()).columns[0].tasks.map((task) => task.id), ['TASK-001', 'TASK-002']);
 	});
 });
 

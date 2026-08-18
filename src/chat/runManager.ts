@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
-import { invokeTaskAction, moveTask as moveTaskToColumn } from '../board/actions';
-import type { MoveOutcome } from '../board/actions';
+import { invokeTaskAction, moveTask as moveTaskToColumn, reorderTask as reorderTaskInColumn } from '../board/actions';
+import type { MoveOutcome, ReorderOutcome } from '../board/actions';
 import { TaskAction } from '../board/stateMachine';
-import { Column, Status, Task } from '../model/task';
+import { Column, isTaskType, Status, Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
+import { parseAuditEvents } from '../model/taskLog';
+import type { AuditEventInput, AuditOutcome, AuditStage } from '../model/taskLog';
 import { AgentNameOverrides, resolveAgentName } from './agentNames';
 import { Executor, ExecutorResult } from './executor';
 import { loadPromptTemplate, renderTemplate } from './promptTemplates';
@@ -244,6 +246,13 @@ function stageForColumn(state: Column): Stage {
 	return 'refine';
 }
 
+function stageForRun(task: Task, runId: string, fallback: Stage): Stage {
+	const start = parseAuditEvents(task.sections['Log'] ?? '')
+		.reverse()
+		.find((event) => event.kind === 'activity-start' && event.runId === runId);
+	return (start?.stage as AuditStage | undefined) ?? fallback;
+}
+
 function columnForStage(stage: Stage): Column {
 	if (stage === 'validate') {
 		return 'validation';
@@ -332,13 +341,24 @@ export class RunManager {
 			case 'stop': {
 				await this.concurrency.runExclusive(async () => {
 					const { tasks } = await this.store.readAll();
-					const runId = tasks.find((task) => task.id === taskId)?.run;
-					const outcome = await invokeTaskAction(this.store, taskId, action);
+					const task = tasks.find((candidate) => candidate.id === taskId);
+					const runId = task?.run;
+					const outcome = await invokeTaskAction(
+						this.store,
+						taskId,
+						action,
+						runId
+							? {
+									activityFinish: {
+										runId,
+										stage: stageForRun(task, runId, stageForColumn(task.state)),
+										outcome: 'stopped',
+										note: 'Activity stopped by the user.',
+									},
+								}
+							: undefined,
+					);
 					if (outcome.kind === 'applied') {
-						// Closes a real gap: without this, a run that resolves *after*
-						// Stop would still see its own runId on the task and clobber the
-						// stop (§6.9's staleness guard keys off `run`, not `status`).
-						await this.store.patch(taskId, { run: undefined });
 						if (runId) {
 							this.concurrency.release(taskId, runId);
 						}
@@ -364,6 +384,15 @@ export class RunManager {
 			}
 			return outcome;
 		});
+	}
+
+	/**
+	 * Reorders a card without touching its state or run. Admission serialization
+	 * prevents a stale board intent from racing a stage transition, while the
+	 * reorder path itself never releases an active run.
+	 */
+	async reorderTask(taskId: unknown, column: unknown, target: unknown): Promise<ReorderOutcome> {
+		return this.concurrency.runExclusive(() => reorderTaskInColumn(this.store, taskId, column, target));
 	}
 
 	/** §6.10: open the task's session beside the board. */
@@ -393,11 +422,11 @@ export class RunManager {
 				return;
 			}
 			const runId = task.run;
-			const stage = stageForColumn(task.state);
+			const stage = stageForRun(task, runId, stageForColumn(task.state));
 
 			try {
 				await this.store.appendLog(taskId, formatReceipt({ runId, taskId, stage, result, note }));
-				await this.applyOutcome(taskId, stage, result);
+				await this.applyOutcome(taskId, runId, stage, result, undefined, { note, action: 'manual-complete' });
 			} finally {
 				this.concurrency.release(taskId, runId);
 			}
@@ -416,7 +445,7 @@ export class RunManager {
 				continue;
 			}
 			const runId = task.run;
-			const stage = stageForColumn(task.state);
+			const stage = stageForRun(task, runId, stageForColumn(task.state));
 			try {
 				const receipt = findReceipt(task.sections['Log'] ?? '', runId, task.id);
 
@@ -509,11 +538,25 @@ export class RunManager {
 			const sessionId = this.store.setId === DEFAULT_TASK_SET_ID
 				? task.chat ?? sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId)
 				: sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId);
-			await this.store.patch(taskId, {
-				status: 'running',
-				run: runId,
-				chat: sessionId,
-			});
+			await this.store.auditedPatch(
+				taskId,
+				{
+					status: 'running',
+					run: runId,
+					chat: sessionId,
+				},
+				{
+					action,
+					runId,
+					events: [{
+						kind: 'activity-start',
+						stage,
+						runId,
+						action,
+						note: `Started ${stage} activity.`,
+					}],
+				},
+			);
 			return true;
 		});
 		if (!started) {
@@ -671,7 +714,7 @@ export class RunManager {
 			const shouldProcessProposals =
 				stage === 'split' || (STAGES_THAT_MAY_PROPOSE.has(stage) && readConfig().allowTaskProposals);
 			if (shouldProcessProposals) {
-				await this.processProposals(taskId, runId, initial.sections['Log'] ?? '');
+				await this.processProposals(initial, runId, initial.sections['Log'] ?? '');
 			}
 
 			const fresh = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
@@ -679,7 +722,18 @@ export class RunManager {
 				return;
 			}
 
-			await this.applyOutcome(taskId, stage, receipt.result, fresh.sections['Scope']);
+			await this.applyOutcome(
+				taskId,
+				runId,
+				stage,
+				receipt.result,
+				fresh.sections['Scope'],
+				{
+					correction: !initial.run,
+					note: receipt.note,
+					action: initial.run ? 'receipt' : 'late-receipt',
+				},
+			);
 			appliedReceiptKeys.add(key);
 		} finally {
 			inFlightReceiptKeys.delete(key);
@@ -775,7 +829,23 @@ export class RunManager {
 			return;
 		}
 
-		await this.store.patch(taskId, { status: 'blocked', run: undefined });
+		await this.store.auditedPatch(
+			taskId,
+			{ status: 'blocked', run: undefined },
+			{
+				action: 'missing-receipt',
+				runId,
+				outcome: 'missing-receipt',
+				events: [{
+					kind: 'activity-finish',
+					runId,
+					stage,
+					outcome: 'missing-receipt',
+					provisional: true,
+					note: `${note}; ${LATE_RECEIPT_MARKER}`,
+				}],
+			},
+		);
 		void this.reconcileLateReceiptUntilDeadline(taskId, runId, stage);
 	}
 
@@ -794,7 +864,22 @@ export class RunManager {
 
 		if (outcome.kind === 'timeout') {
 			await this.store.appendLog(taskId, formatReceipt({ runId, taskId, stage, result: 'failed', note: 'timed out' }));
-			await this.store.patch(taskId, { status: 'failed', run: undefined });
+			await this.store.auditedPatch(
+				taskId,
+				{ status: 'failed', run: undefined },
+				{
+					action: 'timeout',
+					runId,
+					outcome: 'timeout',
+					events: [{
+						kind: 'activity-finish',
+						runId,
+						stage,
+						outcome: 'timeout',
+						note: 'Activity timed out.',
+					}],
+				},
+			);
 			return;
 		}
 
@@ -814,7 +899,22 @@ export class RunManager {
 				taskId,
 				formatReceipt({ runId, taskId, stage, result: 'failed', note: result.error ?? 'executor error' }),
 			);
-			await this.store.patch(taskId, { status: 'failed', run: undefined });
+			await this.store.auditedPatch(
+				taskId,
+				{ status: 'failed', run: undefined },
+				{
+					action: 'executor-error',
+					runId,
+					outcome: 'error',
+					events: [{
+						kind: 'activity-finish',
+						runId,
+						stage,
+						outcome: 'error',
+						note: result.error ?? 'Executor error.',
+					}],
+				},
+			);
 			return;
 		}
 
@@ -840,10 +940,17 @@ export class RunManager {
 	 * sequentially (not `Promise.all`) so each `create`'s `nextId()` scan sees
 	 * the previous one already on disk.
 	 */
-	private async processProposals(taskId: string, runId: string, logSection: string): Promise<void> {
+	private async processProposals(task: Task, runId: string, logSection: string): Promise<void> {
 		const proposals = proposalsForRun(logSection, runId).slice(0, MAX_PROPOSALS_PER_RUN);
 		for (const proposal of proposals) {
-			await this.store.create(proposal.title, { origin: { taskId, runId, note: proposal.note } });
+			const type = proposal.type ?? task.type;
+			if (!isTaskType(type)) {
+				continue;
+			}
+			await this.store.create(proposal.title, {
+				type,
+				origin: { taskId: task.id, runId, note: proposal.note },
+			});
 		}
 	}
 
@@ -854,7 +961,32 @@ export class RunManager {
 	 * real verdict, not an error, so it moves the card *backward* to In
 	 * Progress rather than leaving it stuck (see receipt.ts's doc on why).
 	 */
-	private async applyOutcome(taskId: string, stage: Stage, result: ReceiptResult, scope?: string): Promise<void> {
+	private async applyOutcome(
+		taskId: string,
+		runId: string,
+		stage: Stage,
+		result: ReceiptResult,
+		scope?: string,
+		activity: { correction?: boolean; note?: string; action?: string } = {},
+	): Promise<void> {
+		const finishEvent: AuditEventInput = {
+			kind: 'activity-finish',
+			runId,
+			stage,
+			outcome: result as AuditOutcome,
+			correction: activity.correction,
+			action: activity.action ?? 'receipt',
+			note: activity.note ?? `Activity finished with receipt result ${result}.`,
+		};
+		const patchOutcome = async (updates: Record<string, string | undefined>, action: string): Promise<void> => {
+			await this.store.auditedPatch(taskId, updates, {
+				action,
+				runId,
+				outcome: result as AuditOutcome,
+				events: [finishEvent],
+			});
+		};
+
 		if (stage === 'validate') {
 			const next: { state: Column; status: Status } =
 				result === 'ok'
@@ -862,7 +994,7 @@ export class RunManager {
 					: result === 'failed'
 						? { state: 'in-progress', status: 'idle' } // criteria not met — another development pass
 						: { state: 'validation', status: 'blocked' }; // ambiguous — stays for a follow-up
-			await this.store.patch(taskId, { ...next, run: undefined });
+			await patchOutcome({ ...next, run: undefined }, activity.action ?? 'receipt');
 			return;
 		}
 
@@ -873,12 +1005,12 @@ export class RunManager {
 		// as tracking-only — the real advancement already happened when its
 		// children were filed as proposals, upstream of this call.
 		if (stage === 'split' && result === 'ok') {
-			await this.store.patch(taskId, { state: 'done', status: 'idle', run: undefined });
+			await patchOutcome({ state: 'done', status: 'idle', run: undefined }, activity.action ?? 'receipt');
 			return;
 		}
 
 		if (result !== 'ok') {
-			await this.store.patch(taskId, { status: result, run: undefined });
+			await patchOutcome({ status: result, run: undefined }, activity.action ?? 'receipt');
 			return;
 		}
 
@@ -887,7 +1019,7 @@ export class RunManager {
 		if (stage === 'refine') {
 			patch.scope_hash = hashScope(scope ?? '');
 		}
-		await this.store.patch(taskId, patch);
+		await patchOutcome(patch, activity.action ?? 'receipt');
 	}
 
 	private async resetSession(taskId: string): Promise<void> {

@@ -9,6 +9,7 @@ import { Executor, ExecutorResult, RunOptions } from '../chat/executor';
 import { normalizeMaxParallelTasks, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
+import { parseAuditEvents } from '../model/taskLog';
 
 /**
  * M3 — RunManager orchestration (PRD §6.4, §6.9). Uses a stub `Executor` so
@@ -93,11 +94,17 @@ function okReceipt(store: TaskStore, stage: 'refine' | 'develop' | 'validate' | 
 }
 
 /** Appends the stage's own receipt plus one propose-task line per title given. */
-function okReceiptWithProposals(store: TaskStore, stage: 'refine' | 'develop' | 'validate' | 'split', titles: string[]) {
+function okReceiptWithProposals(
+	store: TaskStore,
+	stage: 'refine' | 'develop' | 'validate' | 'split',
+	titles: string[],
+	types: (string | undefined)[] = [],
+) {
 	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
 		const runId = runIdFromPrompt(prompt);
-		for (const title of titles) {
-			await store.appendLog(t.id, `- propose-task run:${runId} title:"${title}" note:"found while working"`);
+		for (const [index, title] of titles.entries()) {
+			const type = types[index];
+			await store.appendLog(t.id, `- propose-task run:${runId}${type ? ` type:${type}` : ''} title:"${title}" note:"found while working"`);
 		}
 		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result: 'ok', note: 'done' }));
 		return { ok: true, sessionId: 's1' };
@@ -153,7 +160,44 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.status, 'idle');
 			assert.strictEqual(after.run, undefined);
 			assert.strictEqual(executor.calls.length, 0, 'a manual move must not invoke the executor');
-			assert.strictEqual(after.sections['Log'], '');
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'state-change' && event.to === 'done'));
+		});
+
+		test('reorderTask changes only order and keeps an active run reservation', async () => {
+			const first = await store.create('First in progress');
+			const second = await store.create('Active second in progress');
+			await store.patch(first.id, { state: 'in-progress' });
+			await store.patch(second.id, { state: 'in-progress' });
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(second.id, 'continue');
+			await waitUntil(() => executor.calls.length === 1);
+			const before = (await store.readAll()).tasks.find((task) => task.id === second.id)!;
+			assert.strictEqual(before.status, 'running');
+			assert.ok(before.run);
+
+			assert.deepStrictEqual(
+				await runManager.reorderTask(second.id, 'in-progress', { beforeTaskId: first.id }),
+				{ kind: 'applied' },
+			);
+			const after = (await store.readAll()).tasks.find((task) => task.id === second.id)!;
+			assert.strictEqual(after.state, 'in-progress');
+			assert.strictEqual(after.status, 'running');
+			assert.strictEqual(after.run, before.run);
+			assert.strictEqual(after.chat, before.chat);
+			assert.strictEqual(executor.calls.length, 1, 'reordering must not invoke the executor');
+			assert.deepStrictEqual(
+				(await store.snapshot()).columns.find((column) => column.id === 'in-progress')?.tasks.map((task) => task.id),
+				[second.id, first.id],
+			);
+
+			// With the default one-run capacity, a preserved active reservation keeps
+			// another Continue request from launching while the reordered run hangs.
+			await runManager.handleAction(first.id, 'continue');
+			assert.strictEqual(executor.calls.length, 1, 'reorder must not release the active reservation');
+			assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === first.id)?.status, 'idle');
+			await runManager.handleAction(second.id, 'stop');
 		});
 
 		test('clicking Refine after Accept is what actually launches the run', async () => {
@@ -269,6 +313,11 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.run, undefined);
 			assert.strictEqual(after.copilotSessionId, 's1');
 			assert.ok(after.scopeHash, 'refine success must record scope_hash for §6.8 layer 2');
+			const audit = parseAuditEvents(after.sections['Log']);
+			assert.strictEqual(audit.filter((event) => event.kind === 'activity-start' && event.runId).length, 1);
+			assert.strictEqual(audit.filter((event) => event.kind === 'activity-finish' && event.outcome === 'ok').length, 1);
+			assert.ok(audit.some((event) => event.kind === 'state-change' && event.to === 'scoped'));
+			assert.ok(audit.some((event) => event.kind === 'status-change' && event.from === 'running' && event.to === 'idle'));
 		});
 
 		test('awaited but no receipt written → blocked, not stuck running forever (§6.4)', async () => {
@@ -283,6 +332,9 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'refine');
 			assert.strictEqual(after.status, 'blocked');
 			assert.ok(after.sections['Log'].includes('awaiting late receipt'));
+			const finish = parseAuditEvents(after.sections['Log']).find((event) => event.kind === 'activity-finish');
+			assert.strictEqual(finish?.outcome, 'missing-receipt');
+			assert.strictEqual(finish?.provisional, true);
 		});
 
 		test('a receipt appended after executor completion is picked up during the reconciliation grace period', async () => {
@@ -368,6 +420,11 @@ suite('M3 RunManager', () => {
 				2,
 				'a repeated file-change pass must not append or apply the late receipt again',
 			);
+			const audit = parseAuditEvents(after.sections['Log']);
+			assert.strictEqual(audit.filter((event) => event.kind === 'activity-start').length, 1);
+			assert.strictEqual(audit.filter((event) => event.kind === 'activity-finish').length, 2);
+			assert.ok(audit.some((event) => event.kind === 'activity-finish' && event.provisional));
+			assert.ok(audit.some((event) => event.kind === 'activity-finish' && event.correction && event.outcome === 'ok'));
 		});
 
 		test('a receipt written just before the missing-receipt marker still wins the race', async () => {
@@ -467,6 +524,7 @@ suite('M3 RunManager', () => {
 
 			assert.strictEqual(after.state, 'refine', 'blocked stays in the working column, not moved');
 			assert.strictEqual(after.status, 'blocked');
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'blocked'));
 		});
 
 		test('the executor throwing or reporting failure marks the run failed', async () => {
@@ -480,6 +538,7 @@ suite('M3 RunManager', () => {
 
 			assert.strictEqual(after.status, 'failed');
 			assert.ok(after.sections['Log'].includes('boom'));
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'error'));
 		});
 
 		test('a receipt whose task id does not match this task is rejected, not accepted (§6.9)', async () => {
@@ -568,7 +627,7 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'done');
 			assert.strictEqual(after.status, 'idle');
 			assert.strictEqual(after.run, undefined);
-			assert.strictEqual(after.sections['Log'], '');
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'superseded'));
 		});
 
 		test('timeout marks the run failed and records it in the log', async () => {
@@ -584,6 +643,7 @@ suite('M3 RunManager', () => {
 
 				assert.strictEqual(after.status, 'failed');
 				assert.ok(after.sections['Log'].includes('timed out'));
+				assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'timeout'));
 			} finally {
 				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
 			}
@@ -639,14 +699,59 @@ suite('M3 RunManager', () => {
 				await cfg.update('chat.agentNames', undefined, vscode.ConfigurationTarget.Global);
 			}
 		});
+
+		test('column assignments reach the actual prompts for every runnable stage', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update(
+				'chat.agentNames',
+				{ refine: 'Scope Wizard', 'in-progress': 'Ship It Steve', validation: 'Quality Pilot' },
+				vscode.ConfigurationTarget.Global,
+			);
+			try {
+				const refineTask = await store.create('Column assignment refine');
+				await store.patch(refineTask.id, { state: 'refine', status: 'idle' });
+				const refineExecutor = new StubExecutor(okReceipt(store, 'refine'));
+				const refineManager = new RunManager(store, refineExecutor, folder);
+				await refineManager.handleAction(refineTask.id, 'refine');
+				await waitUntilSettled(store, refineTask.id);
+				assert.ok(refineExecutor.calls[0].prompt.startsWith('@Scope Wizard\n'));
+
+				const splitTask = await store.create('Column assignment split');
+				const splitExecutor = new StubExecutor(okReceipt(store, 'split'));
+				const splitManager = new RunManager(store, splitExecutor, folder);
+				await splitManager.handleAction(splitTask.id, 'split');
+				await waitUntilSettled(store, splitTask.id);
+				assert.ok(splitExecutor.calls[0].prompt.startsWith('@Scope Wizard\n'));
+
+				const developTask = await store.create('Column assignment develop');
+				await store.patch(developTask.id, { state: 'approved', status: 'idle' });
+				const developExecutor = new StubExecutor(okReceipt(store, 'develop'));
+				const developManager = new RunManager(store, developExecutor, folder);
+				await developManager.handleAction(developTask.id, 'develop');
+				await waitUntilSettled(store, developTask.id);
+				assert.ok(developExecutor.calls[0].prompt.startsWith('@Ship It Steve\n'));
+
+				const validateTask = await store.create('Column assignment validate');
+				await store.patch(validateTask.id, { state: 'validation', status: 'idle' });
+				const validateExecutor = new StubExecutor(okReceipt(store, 'validate'));
+				const validateManager = new RunManager(store, validateExecutor, folder);
+				await validateManager.handleAction(validateTask.id, 'validate');
+				await waitUntilSettled(store, validateTask.id);
+				assert.ok(validateExecutor.calls[0].prompt.startsWith('@Quality Pilot\n'));
+			} finally {
+				await cfg.update('chat.agentNames', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
 	});
 
 	suite('develop stage', () => {
 		test('a successful develop run advances In Progress → Validation', async () => {
+			const existing = await store.create('Already in validation');
+			await store.patch(existing.id, { state: 'validation' });
 			const task = await store.create('Set up billing webhook');
 			// 'develop' is only legal from Approved — it's the single click that
 			// both moves the card into In Progress and launches the run.
-			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			await store.patch(task.id, { state: 'approved', status: 'idle', position: '99' });
 			const runManager = new RunManager(store, new StubExecutor(okReceipt(store, 'develop')), folder);
 
 			await runManager.handleAction(task.id, 'develop');
@@ -654,6 +759,9 @@ suite('M3 RunManager', () => {
 
 			assert.strictEqual(after.state, 'validation');
 			assert.strictEqual(after.status, 'idle');
+			const validation = (await store.snapshot()).columns.find((column) => column.id === 'validation')!;
+			assert.deepStrictEqual(validation.tasks.map((candidate) => candidate.id), [existing.id, task.id]);
+			assert.deepStrictEqual(validation.tasks.map((candidate) => candidate.position), [0, 1]);
 		});
 
 		test('Continue retries a develop run from blocked/failed', async () => {
@@ -723,6 +831,29 @@ suite('M3 RunManager', () => {
 
 			const { tasks } = await store.readAll();
 			assert.ok(tasks.some((t) => t.title === 'Document retry behavior'));
+		});
+
+		test('typed proposals override the parent, omitted types inherit it, and invalid types are ignored', async () => {
+			const task = await store.create('Retry delivery failures', { type: 'bug' });
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptWithProposals(
+					store,
+					'develop',
+					['Add retry metrics', 'Fix timeout handling', 'Invalid child'],
+					['feature', undefined, 'regression'],
+				)),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			await waitUntilSettled(store, task.id);
+
+			const { tasks } = await store.readAll();
+			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Add retry metrics')?.type, 'feature');
+			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Fix timeout handling')?.type, 'bug');
+			assert.strictEqual(tasks.some((candidate) => candidate.title === 'Invalid child'), false);
 		});
 
 		test('refine ignores propose-task lines even if an agent writes one — scoping only, not filing', async () => {
@@ -963,6 +1094,8 @@ suite('M3 RunManager', () => {
 
 			const after = (await store.readAll()).tasks[0];
 			assert.strictEqual(after.status, 'idle', 'the late resolution must find no matching run and do nothing');
+			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish').length, 1);
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'stopped'));
 		});
 
 		test('stop on In Progress bounces to Approved (Stop + reset)', async () => {
@@ -989,6 +1122,7 @@ suite('M3 RunManager', () => {
 		assert.strictEqual(after.state, 'scoped');
 		assert.strictEqual(after.status, 'idle');
 		assert.ok(after.sections['Log'].includes('finished by hand'));
+		assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.action === 'manual-complete'));
 	});
 
 	suite('configurable run capacity', () => {
@@ -1289,6 +1423,27 @@ suite('M3 RunManager', () => {
 
 			const after = (await store.readAll()).tasks[0];
 			assert.strictEqual(after.state, 'validation');
+		});
+
+		test('uses the persisted activity stage when reconciling a lost split run', async () => {
+			const task = await store.create('Recover split after reload');
+			await store.auditedPatch(
+				task.id,
+				{ state: 'refine', status: 'running', run: 'r-split' },
+				{
+					action: 'split',
+					runId: 'r-split',
+					events: [{ kind: 'activity-start', stage: 'split', action: 'split', runId: 'r-split' }],
+				},
+			);
+
+			const runManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await runManager.reconcileOnActivation();
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.status, 'blocked');
+			assert.ok(parseReceipts(after.sections['Log']).some((receipt) => receipt.stage === 'split'));
+			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.stage === 'split'));
 		});
 
 		test('reconciles a late receipt after a fallback when the extension activates', async () => {

@@ -1,7 +1,20 @@
 import * as vscode from 'vscode';
-import { AgentNameOverrides, NameableStage, resolveAgentName } from '../chat/agentNames';
+import {
+  AgentNameOverrides,
+  resolveAgentNameForColumn,
+  stageForColumn,
+} from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
-import { COLUMNS, COLUMN_LABELS, Column, Status, Task } from '../model/task';
+import {
+  COLUMNS,
+  COLUMN_LABELS,
+  Column,
+  isTaskType,
+  Status,
+  Task,
+  TASK_TYPE_LABELS,
+  normalizeEditableTaskContent,
+} from '../model/task';
 import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
@@ -21,22 +34,32 @@ import { TASK_ACTIONS, TaskAction } from './stateMachine';
  * live site's computed styles. Surface colors are re-derived from `--vscode-*`
  * tokens rather than the prototype's literal light-mode hexes, per §6.11's
  * requirement that the board track the user's theme — a literal color copy
- * would look broken in dark mode. Accent colors (column dots, primary button)
- * are the prototype's exact values, since those read as brand identity rather
- * than editor chrome.
+ * would look broken in dark mode.
+ *
+ * The color layer on top of that shape language is this board's own, and is
+ * deliberately loud: the prototype's near-grey accents carried almost no
+ * information, so the seven columns now own seven saturated hues walked around
+ * the wheel in pipeline order (`COLUMN_ACCENT`), and a card keeps its stage's
+ * hue on its left rail wherever it goes. Only the hue itself is a literal hex.
+ * Everything derived from it — fills, borders, glows, and especially text —
+ * is `color-mix`ed against a `--vscode-*` token at render time, so one palette
+ * serves every theme instead of needing a light and a dark copy. See the
+ * `--col-*` role block in the stylesheet for the four derivations, and the
+ * `body.vscode-dark` override below it for the one role (text) that genuinely
+ * cannot be expressed once for both. Every text role was measured against its
+ * real composited background in both themes and clears WCAG AA 4.5:1; the
+ * comments at each exception record what the measurement was, so keep them
+ * honest if the palette moves.
  *
  * Re-inspected 2026-08-13 for exact replication (§12 Q10, §13): the prototype
  * had moved on from 6 columns to 7 (a "Validation" gate before Done) and
  * gained a static per-column `Agent` badge. Both are adopted here — see
- * `task.ts`'s `COLUMNS` comment and `COLUMN_STAGE`/`toView` below. As of the
- * M3 stage-wiring pass, the badge for refine/in-progress/validation is no
- * longer just cosmetic: it's `resolveAgentName`'s result for that column's
- * stage — the same call `RunManager` makes to open every prompt with
- * `@{{agentName}}` — so the board always shows exactly who's about to be
- * asked to do the work. §12 Q10's per-column *configurability* now exists
- * too: the edit icon opens `agentNameBackdrop`, writing straight to
- * `kanbanPilot.chat.agentNames` (still just persona framing, not a real
- * `contributes.chatParticipants` mention — see `agentNames.ts`'s doc).
+ * task.ts`'s `COLUMNS` comment and the shared stage/column resolution below.
+ * As of the M3 stage-wiring pass, the badge for refine/in-progress/validation
+ * is no longer just cosmetic: it is the same column-aware resolution that
+ * `RunManager` uses to open every prompt with `@{{agentName}}`. The Settings
+ * surface now allows assignments for all seven columns; resting-column labels
+ * remain display-only because those columns have no runnable stage.
  *
  * Also confirmed on re-inspection: the prototype renders exactly one button
  * per card. §5.2's "secondary" actions (Scoped's redo-scope Refine, Done's
@@ -47,39 +70,47 @@ import { TASK_ACTIONS, TaskAction } from './stateMachine';
  * The task detail modal itself (opened on card click) was re-inspected via
  * Chrome DevTools on 2026-08-13 and rebuilt to match: a centered dialog over
  * a dimming backdrop, not the docked sidebar it started as. Shape, spacing,
- * and type scale are the prototype's exact computed values; the indigo
- * accent on status text and the close glyph is kept literal for the same
- * reason the column dots are (brand identity, not editor chrome). The
+ * and type scale are the prototype's exact computed values; its color comes
+ * from the state the task is currently in — `renderDetail` paints the opened
+ * task's stage hue onto the backdrop and the modal inherits it — so opening a
+ * card carries the board's color coding through instead of dropping it. The
  * prototype's own modal content is a generic Markdown+Mermaid renderer
  * (fallback placeholder text, not real task data); this board's modal
  * carries the same chrome but real content — Request/Refined/Scope/Log.
  */
 
-/** Column accent dots, exact values from the prototype (not theme-derived — see module doc). */
-const COLUMN_DOT: Record<Column, string> = {
-	backlog: '#9a9aa0',
-	refine: '#9a9aa0',
-	scoped: '#c99a2e',
-	approved: '#4f6fe0',
-	'in-progress': '#8b5cf6',
-	validation: '#c99a2e',
-	done: '#34a853',
+/**
+ * Per-column accent hues, and the second stop each one gradients into.
+ *
+ * A deliberate walk around the color wheel in pipeline order (sky → indigo →
+ * purple → pink → orange → yellow → green) so a column is identifiable by hue
+ * alone at a glance, and so a card carries its stage's color with it as it
+ * crosses the board. Saturation is held high on purpose — these are the one
+ * place the board departs from editor chrome (see module doc); everything
+ * derived from them (tints, borders, glows, text) is mixed against a
+ * `--vscode-*` token at render time, so the same hex reads correctly in both
+ * light and dark themes rather than needing two palettes.
+ */
+const COLUMN_ACCENT: Record<Column, { from: string; to: string }> = {
+	backlog: { from: '#38bdf8', to: '#0284c7' },
+	refine: { from: '#6366f1', to: '#4f46e5' },
+	scoped: { from: '#a855f7', to: '#9333ea' },
+	approved: { from: '#ec4899', to: '#db2777' },
+	'in-progress': { from: '#fb923c', to: '#ea580c' },
+	validation: { from: '#facc15', to: '#d97706' },
+	done: { from: '#4ade80', to: '#16a34a' },
 };
 
 /**
- * Which stage — if any — runs in each column, and so which columns' Agent
- * badge is real (vs. the static `None` shown elsewhere) and editable.
+ * Which stage — if any — runs in each column. The shared agent-name module owns
+ * the same mapping for resolution; this local alias keeps the board payload's
+ * stage field explicit for the webview.
  */
-const COLUMN_STAGE: Partial<Record<Column, NameableStage>> = {
-	refine: 'refine',
-	'in-progress': 'develop',
-	validation: 'validate',
-};
+const COLUMN_STAGE = stageForColumn;
 
-/** Per-column agent badge, resolved against the current `chat.agentNames` overrides (§12 Q10). */
+/** Per-column agent badge, resolved against current `chat.agentNames` overrides (§12 Q10). */
 function agentLabelFor(column: Column, overrides: AgentNameOverrides): string {
-	const stage = COLUMN_STAGE[column];
-	return stage ? resolveAgentName(stage, overrides) : 'None';
+  return resolveAgentNameForColumn(column, overrides) ?? 'None';
 }
 
 /**
@@ -176,12 +207,16 @@ interface InMessage {
 	taskId?: string;
   taskSetId?: string;
   destination?: unknown;
+  beforeTaskId?: unknown;
+  targetIndex?: unknown;
 	action?: string;
 	title?: string;
 	description?: string;
+  taskType?: unknown;
 	key?: string;
 	value?: string;
-	stage?: string;
+  column?: unknown;
+  content?: unknown;
 }
 
 /** Operations the webview needs from the workspace's active-set controller. */
@@ -199,13 +234,13 @@ export interface BoardTaskSetHost {
 }
 
 /**
- * §6.15's four gate settings, surfaced as switches in the board header rather
- * than left settings.json-only. `key` is the short id used over the wire and
+ * §6.15's four gate settings, surfaced with all seven column assignments in
+ * the board's Settings editor. `key` is the short id used over the wire and
  * in the UI; `setting` is the actual `kanbanPilot.*` id `RunManager.readConfig`
  * reads. Labels/descriptions are trimmed restatements of the package.json
  * descriptions — kept in sync by hand since there's no shared source.
  */
-const GATES: { key: string; setting: string; label: string; description: string }[] = [
+export const GATES: { key: string; setting: string; label: string; description: string }[] = [
 	{
 		key: 'backlogToRefine',
 		setting: 'gates.backlogToRefine',
@@ -232,12 +267,88 @@ const GATES: { key: string; setting: string; label: string; description: string 
 	},
 ];
 
-function isGateKey(value: unknown): value is string {
+export const SETTINGS_COLUMNS: readonly { id: Column; label: string }[] = COLUMNS.map((id) => ({
+  id,
+  label: COLUMN_LABELS[id],
+}));
+
+export interface SettingsState {
+  gates: Record<string, string>;
+  agents: Record<Column, string>;
+}
+
+export function isGateKey(value: unknown): value is string {
 	return typeof value === 'string' && GATES.some((g) => g.key === value);
 }
 
-function isNameableStage(value: unknown): value is NameableStage {
-	return value === 'refine' || value === 'develop' || value === 'validate';
+export function isAgentColumn(value: unknown): value is Column {
+  return typeof value === 'string' && (COLUMNS as readonly string[]).includes(value);
+}
+
+export function isAgentNameValue(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 60 && !/[\r\n]/.test(value);
+}
+
+export function updateAgentNameOverrides(
+  configured: unknown,
+  column: Column,
+  rawValue: string,
+): AgentNameOverrides {
+  const overrides: AgentNameOverrides = configured && typeof configured === 'object' && !Array.isArray(configured)
+    ? { ...(configured as AgentNameOverrides) }
+    : {};
+  const value = rawValue.trim();
+  const legacyStage = stageForColumn(column);
+  if (value) {
+    overrides[column] = value;
+    if (legacyStage && legacyStage !== column) {
+      delete overrides[legacyStage];
+    }
+  } else {
+    delete overrides[column];
+    if (legacyStage) {
+      delete overrides[legacyStage];
+    }
+  }
+  return overrides;
+}
+
+export async function persistAgentNameOverride(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
+  configured: unknown,
+  column: Column,
+  rawValue: string,
+): Promise<void> {
+  await configuration.update(
+    'chat.agentNames',
+    updateAgentNameOverrides(configured, column, rawValue),
+    vscode.ConfigurationTarget.Workspace,
+  );
+}
+
+export async function persistGateSetting(
+  configuration: Pick<vscode.WorkspaceConfiguration, 'update'>,
+  key: string,
+  value: 'manual' | 'auto',
+): Promise<boolean> {
+  const gate = GATES.find((candidate) => candidate.key === key);
+  if (!gate) {
+    return false;
+  }
+  await configuration.update(gate.setting, value, vscode.ConfigurationTarget.Workspace);
+  return true;
+}
+
+export function settingsStateFor(
+  gates: Record<string, string>,
+  agentNames: AgentNameOverrides,
+): SettingsState {
+  return {
+    gates: { ...gates },
+    agents: Object.fromEntries(
+      COLUMNS.map((column) => [column, agentLabelFor(column, agentNames)]),
+    ) as Record<Column, string>,
+  };
 }
 
 export class BoardPanel {
@@ -265,12 +376,14 @@ export class BoardPanel {
       }),
 			// Picks up a hand-edited settings.json too, not just the board's own toggle.
 			vscode.workspace.onDidChangeConfiguration((e) => {
-				if (e.affectsConfiguration('kanbanPilot.gates')) {
-					void this.pushGates();
-				}
-				if (e.affectsConfiguration('kanbanPilot.chat.agentNames')) {
-					void this.pushBoard();
-				}
+        const gatesChanged = e.affectsConfiguration('kanbanPilot.gates');
+        const agentsChanged = e.affectsConfiguration('kanbanPilot.chat.agentNames');
+        if (gatesChanged || agentsChanged) {
+          void this.pushAll();
+          if (gatesChanged) {
+            void this.runManager.applyGatePolicies();
+          }
+        }
 			}),
 			this.panel.onDidDispose(() => this.dispose()),
 		);
@@ -317,11 +430,13 @@ export class BoardPanel {
 	}
 
 	private async onMessage(message: InMessage): Promise<void> {
+    if (!message || typeof message !== 'object') {
+      return;
+    }
 		switch (message.type) {
 			case 'board/ready':
         await this.host.ready;
 				await this.pushAll();
-				await this.pushGates();
 				return;
 
       case 'taskSet/select':
@@ -401,6 +516,25 @@ export class BoardPanel {
         }
         return;
 
+      case 'task/reorder': {
+        const target = Object.prototype.hasOwnProperty.call(message, 'beforeTaskId')
+          ? { beforeTaskId: message.beforeTaskId }
+          : { targetIndex: message.targetIndex };
+        const outcome = await this.runManager.reorderTask(message.taskId, message.column, target);
+        const snapshot = await this.store.snapshot();
+        await this.pushAll();
+        const column = snapshot.columns.find((candidate) => candidate.id === message.column);
+        const index = column?.tasks.findIndex((task) => task.id === message.taskId) ?? -1;
+        await this.panel.webview.postMessage({
+          type: 'task/reorderResult',
+          taskId: message.taskId,
+          result: outcome.kind,
+          index,
+          count: column?.tasks.length ?? 0,
+        });
+        return;
+      }
+
 			case 'task/select':
 				this.selectedTaskId = message.taskId;
 				await this.pushDetail();
@@ -426,16 +560,39 @@ export class BoardPanel {
 
 			case 'task/create': {
 				const title = message.title?.trim();
-				if (!title) {
+        if (!title || !isTaskType(message.taskType)) {
 					return;
 				}
-				const task = await this.store.create(title, { request: message.description?.trim() });
+        const task = await this.store.create(title, {
+          type: message.taskType,
+          request: message.description?.trim(),
+        });
 				this.selectedTaskId = task.id;
 				// The watcher fires from this same write, but selection changed
 				// independently of disk state, so push explicitly rather than wait.
 				await this.pushAll();
 				return;
 			}
+
+      case 'task/edit': {
+        if (typeof message.taskId !== 'string' || !message.taskId.trim()) {
+          await this.reportEditError(undefined, 'A task id is required to save an edit.');
+          return;
+        }
+        try {
+          const content = normalizeEditableTaskContent(message.content);
+          await this.store.edit(message.taskId, content);
+          // The edit mutation is authoritative on disk. Push immediately so
+          // the card and detail are fresh even before the watcher callback.
+          await this.pushAll();
+        } catch (error) {
+          await this.reportEditError(
+            message.taskId,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        return;
+      }
 
 			case 'task/delete': {
 				if (!message.taskId) {
@@ -466,11 +623,12 @@ export class BoardPanel {
 				if (!isGateKey(message.key) || (message.value !== 'manual' && message.value !== 'auto')) {
 					return;
 				}
-				const gate = GATES.find((g) => g.key === message.key)!;
-				await vscode.workspace
-					.getConfiguration('kanbanPilot')
-					.update(gate.setting, message.value, vscode.ConfigurationTarget.Workspace);
-				// onDidChangeConfiguration already re-pushes gate state; applying
+        await persistGateSetting(
+          vscode.workspace.getConfiguration('kanbanPilot'),
+          message.key,
+          message.value,
+        );
+        // onDidChangeConfiguration already refreshes Settings; applying
 				// immediately (rather than waiting for the next store change) means
 				// flipping a gate to auto acts on whatever's already sitting idle.
 				await this.runManager.applyGatePolicies();
@@ -478,19 +636,13 @@ export class BoardPanel {
 			}
 
 			case 'agentName/set': {
-				if (!isNameableStage(message.stage) || typeof message.value !== 'string') {
+        if (!isAgentColumn(message.column) || !isAgentNameValue(message.value)) {
 					return;
 				}
 				const cfg = vscode.workspace.getConfiguration('kanbanPilot');
-				const overrides = { ...cfg.get<AgentNameOverrides>('chat.agentNames', {}) };
-				const value = message.value.trim();
-				if (value) {
-					overrides[message.stage] = value;
-				} else {
-					delete overrides[message.stage];
-				}
-				await cfg.update('chat.agentNames', overrides, vscode.ConfigurationTarget.Workspace);
-				// onDidChangeConfiguration re-pushes the board with the new label.
+        const configured = cfg.get<unknown>('chat.agentNames', {});
+        await persistAgentNameOverride(cfg, configured, message.column, message.value);
+        // onDidChangeConfiguration re-pushes the board and Settings with the new label.
 				return;
 			}
 		}
@@ -499,14 +651,22 @@ export class BoardPanel {
 	private async pushAll(): Promise<void> {
 		await this.pushBoard();
 		await this.pushDetail();
+    await this.pushSettings();
 	}
+
+  private configuredAgentNames(): AgentNameOverrides {
+    const configured = vscode.workspace
+      .getConfiguration('kanbanPilot')
+      .get<unknown>('chat.agentNames', {});
+    return configured && typeof configured === 'object' && !Array.isArray(configured)
+      ? configured as AgentNameOverrides
+      : {};
+  }
 
 	private async pushBoard(): Promise<void> {
 		const snapshot = await this.store.snapshot();
     const taskSets = await this.host.listTaskSets();
-		const agentNames = vscode.workspace
-			.getConfiguration('kanbanPilot')
-			.get<AgentNameOverrides>('chat.agentNames', {});
+    const agentNames = this.configuredAgentNames();
 		await this.panel.webview.postMessage({
 			type: 'board/state',
       snapshot: this.toView(snapshot, agentNames, taskSets),
@@ -535,9 +695,12 @@ export class BoardPanel {
 			task: {
 				id: task.id,
 				title: task.title,
+        type: task.type,
+        typeLabel: TASK_TYPE_LABELS[task.type],
 				state: task.state,
 				stateLabel: COLUMN_LABELS[task.state],
 				status: task.status,
+        canEdit: task.status !== 'running',
 				request: task.sections['Request'] ?? '',
 				refined: task.sections['Refined'] ?? '',
 				scope: task.sections['Scope'] ?? '',
@@ -551,10 +714,16 @@ export class BoardPanel {
 		});
 	}
 
-	private async pushGates(): Promise<void> {
+  private async reportEditError(taskId: string | undefined, error: string): Promise<void> {
+    void vscode.window.showErrorMessage(error);
+    await this.panel.webview.postMessage({ type: 'task/editError', taskId, error });
+  }
+
+  private async pushSettings(): Promise<void> {
 		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 		const gates = Object.fromEntries(GATES.map((g) => [g.key, cfg.get<string>(g.setting, 'manual')]));
-		await this.panel.webview.postMessage({ type: 'gates/state', gates });
+    const agentNames = this.configuredAgentNames();
+    await this.panel.webview.postMessage({ type: 'settings/state', ...settingsStateFor(gates, agentNames) });
 	}
 
   private toView(snapshot: BoardSnapshot, agentNames: AgentNameOverrides, taskSets: TaskSet[]) {
@@ -566,13 +735,14 @@ export class BoardPanel {
 			columns: snapshot.columns.map((column) => ({
 				id: column.id,
 				label: COLUMN_LABELS[column.id],
-				dot: COLUMN_DOT[column.id],
 				agent: agentLabelFor(column.id, agentNames),
-				stage: COLUMN_STAGE[column.id] ?? null,
+        stage: COLUMN_STAGE(column.id) ?? null,
 				count: column.tasks.length,
 				cards: column.tasks.map((task: Task) => ({
 					id: task.id,
 					title: task.title,
+          type: task.type,
+          typeLabel: TASK_TYPE_LABELS[task.type],
 					status: task.status,
 					primary: primaryAction(task.state, task.status),
 					originTask: task.originTask,
@@ -607,6 +777,10 @@ export class BoardPanel {
 
     const actionLabelsJson = JSON.stringify(ACTION_LABELS);
 		const gatesJson = JSON.stringify(GATES);
+    const columnsJson = JSON.stringify(SETTINGS_COLUMNS);
+		// The detail modal is rendered from a task payload, not a column, so it
+		// needs its own state → hue lookup to stay color-consistent with the board.
+		const accentsJson = JSON.stringify(COLUMN_ACCENT);
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -620,25 +794,96 @@ export class BoardPanel {
    * spacing scale, type scale) verbatim; surface colors route through
    * --vscode-* so the board matches the editor's theme rather than the
    * prototype's fixed light palette. See module doc for the split.
+   *
+   * The color layer on top of that is built from one per-column hue (--col,
+   * set inline from COLUMN_ACCENT) plus the four derived roles below. Every
+   * role mixes --col against a theme token rather than a literal hex, which
+   * is what lets a single saturated palette stay legible in both light and
+   * dark themes:
+   *   --col-tint    a wash of the hue over the current surface (fills)
+   *   --col-line    the same hue held back to a border weight
+   *   --col-text    the hue pulled toward --vscode-foreground until it has
+   *                 text contrast — darkens on light themes, lightens on dark
+   *   --col-glow    the hue at shadow strength, for hover lift
+   * Components read the roles, never --col directly (except pure-chroma marks
+   * like the dot and rail), so re-theming is a one-line change here.
    */
   :root {
     --kp-radius-column: 14px;
     --kp-radius-card: 12px;
     --kp-radius-button: 7px;
     --kp-radius-primary-button: 10px;
-    --kp-shadow-card: 0 2px 8px rgba(0, 0, 0, 0.16);
+    --kp-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.14);
     --kp-radius-modal: 16px;
     --kp-radius-chip: 6px;
     --kp-radius-modal-close: 8px;
-    --kp-shadow-modal: 0 20px 48px rgba(0, 0, 0, 0.16);
+    --kp-shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.34);
+    /* The brand pair. Deep on purpose: these are the only fills that carry
+       white text (Proposed badge, modal primary, gate switch), and the
+       brighter indigo/fuchsia they started as put white at ~3.5:1. */
     --kp-modal-accent: #4f46e5;
+    --kp-modal-accent-2: #a21caf;
     --kp-gap-board: 10px;
     --kp-pad-page: 16px;
-    --kp-pad-header: 16px 24px;
+    --kp-pad-header: 14px 24px;
     --kp-pad-column: 12px;
     --kp-pad-card: 10px;
     --kp-gap-card: 8px;
-    --kp-column-width: 220px;
+    --kp-column-width: 234px;
+
+    /* Fallback hue for anything rendered outside a column (modals, header). */
+    --col: var(--kp-modal-accent);
+    --col-to: var(--kp-modal-accent-2);
+  }
+
+  /*
+   * Scoped to [style*="--col"] so it re-resolves per column: each of the four
+   * roles is recomputed against whatever hue that column set inline.
+   */
+  .column, .modal, .card {
+    --col-tint: color-mix(in srgb, var(--col) 12%, transparent);
+    --col-line: color-mix(in srgb, var(--col) 42%, transparent);
+    --col-glow: color-mix(in srgb, var(--col) 34%, transparent);
+    /*
+     * Text is the one role that can't take a stop straight: on a white editor
+     * background the light end of this palette (sky, yellow) falls under 3:1,
+     * so the label text is mixed from the *dark* stop toward the foreground.
+     * See the dark-theme override below for why one expression can't serve
+     * both.
+     */
+    --col-text: color-mix(in srgb, var(--col-to, var(--col)) 56%, var(--vscode-foreground));
+  }
+
+  /*
+   * VS Code stamps vscode-light / vscode-dark / vscode-high-contrast on the
+   * webview's body, which is what lets the text roles be tuned per theme
+   * rather than compromised across both. It matters most for the darker hues:
+   * even at full chroma, indigo #6366f1 only reaches 3.6:1 on a dark editor
+   * background, so on dark the readable direction is the *bright* stop pulled
+   * toward the foreground — the opposite of the light-theme rule above.
+   *
+   * The block above is the light-tuned default on purpose: if the class ever
+   * goes away, the board degrades to slightly-low contrast on dark themes
+   * rather than to something unreadable.
+   */
+  body.vscode-dark :is(.column, .modal, .card),
+  body.vscode-high-contrast :is(.column, .modal, .card) {
+    --col-text: color-mix(in srgb, var(--col) 56%, var(--vscode-foreground));
+  }
+  /* On dark surfaces a tinted chip *raises* the background luminance toward
+     its own label, so the fills that sit under accent text are held back.
+     :not(:hover) keeps this from out-specifying the solid hover fill below,
+     which has white text and wants the full-chroma gradient. */
+  body.vscode-dark :is(.count, button.action:not(:hover)),
+  body.vscode-high-contrast :is(.count, button.action:not(:hover)) {
+    background: color-mix(in srgb, var(--col) 10%, transparent);
+  }
+  /* Held back for the same reason, and it still reads as a step up from the
+     10% resting fill above — on light themes it has to climb from 16%, so the
+     base rule uses 30% there. */
+  body.vscode-dark button.action:hover,
+  body.vscode-high-contrast button.action:hover {
+    background: color-mix(in srgb, var(--col) 18%, transparent);
   }
 
   * { box-sizing: border-box; }
@@ -662,14 +907,40 @@ export class BoardPanel {
     background: var(--vscode-editor-background);
   }
 
+  /*
+   * The spectrum rail across the top is the board's legend: the seven column
+   * hues in pipeline order, so the color coding is stated once at full
+   * chroma before it appears diluted as tints further down.
+   */
   header {
+    position: relative;
     flex: none;
     display: flex; align-items: center; justify-content: space-between;
     padding: var(--kp-pad-header);
-    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    background:
+      linear-gradient(120deg,
+        color-mix(in srgb, #6366f1 10%, transparent),
+        color-mix(in srgb, #d946ef 8%, transparent) 46%,
+        color-mix(in srgb, #22c55e 9%, transparent)),
+      var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
     border-bottom: 1px solid var(--vscode-panel-border);
   }
-  h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+  header::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 3px;
+    background: linear-gradient(90deg,
+      #38bdf8, #6366f1 16%, #a855f7 33%, #ec4899 50%, #fb923c 66%, #facc15 83%, #22c55e);
+  }
+  h1 {
+    font-size: 15px; font-weight: 800; margin: 0; letter-spacing: -0.01em;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  /* Small gradient chip standing in for a logo, so the brand color is present
+     even where the h1 text has to stay theme-colored for contrast. */
+  h1::before {
+    content: ''; width: 14px; height: 14px; border-radius: 5px; flex: none;
+    background: linear-gradient(135deg, #38bdf8, #a855f7 50%, #ec4899);
+    box-shadow: 0 0 10px color-mix(in srgb, #a855f7 55%, transparent);
+  }
   .header-actions { display: flex; align-items: center; gap: 8px; }
   .task-set-controls { display: inline-flex; align-items: center; gap: 6px; }
   .task-set-label { font-size: 12px; color: var(--vscode-descriptionForeground); }
@@ -687,25 +958,38 @@ export class BoardPanel {
   .task-set-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15)); }
   .task-set-btn:disabled, .task-set-select:disabled { opacity: .55; cursor: not-allowed; }
 
+  /* The one solid-gradient control on the board — it is the primary action,
+     and nothing else competes with it at this chroma. */
   .new-task-btn {
     display: inline-flex; align-items: center; gap: 6px;
-    background: var(--vscode-button-background);
-    color: var(--vscode-button-foreground);
+    background: linear-gradient(135deg, #4f46e5, #9333ea 55%, #db2777);
+    color: #fff;
     border: none; border-radius: var(--kp-radius-primary-button);
-    padding: 8px 14px; font-size: 13px; font-weight: 600; font-family: inherit;
+    padding: 8px 14px; font-size: 13px; font-weight: 700; font-family: inherit;
     cursor: pointer;
+    box-shadow: 0 2px 12px color-mix(in srgb, #9333ea 42%, transparent);
+    transition: box-shadow .15s, transform .15s, filter .15s;
   }
-  .new-task-btn:hover { background: var(--vscode-button-hoverBackground); }
+  .new-task-btn:hover {
+    filter: saturate(1.15) brightness(1.06);
+    box-shadow: 0 4px 18px color-mix(in srgb, #9333ea 58%, transparent);
+    transform: translateY(-1px);
+  }
+  .new-task-btn:active { transform: translateY(0); }
 
-  .gates-btn {
+  .settings-btn {
     display: inline-flex; align-items: center; gap: 6px;
-    background: var(--vscode-editorWidget-background);
-    color: var(--vscode-foreground);
-    border: 1px solid var(--vscode-panel-border); border-radius: var(--kp-radius-primary-button);
+    background: color-mix(in srgb, #6366f1 12%, var(--vscode-editorWidget-background));
+    color: color-mix(in srgb, #6366f1 70%, var(--vscode-foreground));
+    border: 1px solid color-mix(in srgb, #6366f1 38%, transparent);
+    border-radius: var(--kp-radius-primary-button);
     padding: 8px 14px; font-size: 13px; font-weight: 600; font-family: inherit;
-    cursor: pointer;
+    cursor: pointer; transition: background .15s, border-color .15s;
   }
-  .gates-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15)); }
+  .settings-btn:hover {
+    background: color-mix(in srgb, #6366f1 22%, var(--vscode-editorWidget-background));
+    border-color: color-mix(in srgb, #6366f1 60%, transparent);
+  }
 
   /* §6.15's four gate settings, toggled here instead of settings.json-only. */
   .gates-list { display: flex; flex-direction: column; }
@@ -729,9 +1013,86 @@ export class BoardPanel {
     position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
     background: var(--vscode-foreground); border-radius: 50%; transition: transform .15s;
   }
-  .switch input:checked + .switch-track { background: var(--kp-modal-accent); border-color: var(--kp-modal-accent); }
+  .switch input:checked + .switch-track {
+    background: linear-gradient(135deg, var(--kp-modal-accent), var(--kp-modal-accent-2));
+    border-color: transparent;
+    box-shadow: 0 0 10px color-mix(in srgb, var(--kp-modal-accent-2) 50%, transparent);
+  }
   .switch input:checked + .switch-track .switch-thumb { transform: translateX(14px); background: #fff; }
   .switch input:focus-visible + .switch-track { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+
+  .settings-modal { width: min(760px, 100vw - 32px); }
+  .settings-head { align-items: flex-start; }
+  .settings-body {
+    display: grid; grid-template-columns: minmax(160px, .32fr) minmax(0, 1fr);
+    min-height: 0; overflow: hidden; padding: 0;
+  }
+  .settings-sidebar {
+    min-width: 0; padding: 18px 12px;
+    background: color-mix(in srgb, var(--vscode-sideBar-background) 70%, transparent);
+    border-right: 1px solid var(--vscode-panel-border);
+  }
+  .settings-sidebar-title {
+    padding: 0 8px 8px; color: var(--vscode-descriptionForeground);
+    font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .settings-category-list { display: flex; flex-direction: column; gap: 4px; }
+  .settings-category {
+    width: 100%; padding: 9px 10px; border: 1px solid transparent;
+    border-radius: var(--kp-radius-button); background: transparent;
+    color: var(--vscode-foreground); font: inherit; font-size: 12px;
+    text-align: left; cursor: pointer; overflow-wrap: anywhere;
+    transition: background .13s, border-color .13s, color .13s;
+  }
+  .settings-category:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15));
+  }
+  .settings-category:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px;
+  }
+  .settings-category[aria-selected="true"] {
+    background: color-mix(in srgb, var(--kp-modal-accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--kp-modal-accent) 48%, transparent);
+    color: color-mix(in srgb, var(--kp-modal-accent) 70%, var(--vscode-foreground));
+    font-weight: 700;
+    box-shadow: inset 3px 0 var(--kp-modal-accent);
+  }
+  .settings-main { min-width: 0; min-height: 0; overflow-y: auto; }
+  .settings-panel[hidden] { display: none; }
+  .settings-panel { padding: 18px; }
+  .settings-section { display: flex; flex-direction: column; gap: 8px; }
+  .settings-section-title { font-size: 13px; font-weight: 700; }
+  .settings-section-desc { color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.4; }
+  .agent-settings-list { display: flex; flex-direction: column; }
+  .agent-setting-row {
+    display: grid; grid-template-columns: minmax(130px, 1fr) minmax(150px, 1.4fr) auto;
+    align-items: center; gap: 10px; padding: 10px 0;
+    border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .agent-setting-row:last-child { border-bottom: none; }
+  .agent-setting-label { font-size: 13px; font-weight: 600; }
+  .agent-setting-input {
+    min-width: 0; font-family: inherit; font-size: 13px; color: var(--vscode-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: var(--kp-radius-button); padding: 7px 8px;
+  }
+  .agent-setting-actions { display: inline-flex; gap: 6px; }
+  .agent-setting-actions .btn-chip { padding: 7px 9px; }
+  .agent-setting-input:focus-visible, .agent-setting-actions button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px;
+  }
+  @media (max-width: 620px) {
+    .settings-body { grid-template-columns: 1fr; }
+    .settings-sidebar {
+      padding: 12px; border-right: none; border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .settings-category-list { flex-direction: row; flex-wrap: wrap; }
+    .settings-category { flex: 1 1 180px; }
+    .settings-panel { padding: 14px; }
+    .agent-setting-row { grid-template-columns: 1fr; gap: 6px; }
+    .agent-setting-actions { justify-content: flex-end; }
+  }
 
   /*
    * New Task modal (§6.16) — Chrome DevTools inspection of the prototype's
@@ -760,6 +1121,19 @@ export class BoardPanel {
   .field-textarea { resize: vertical; min-height: 90px; }
   .field-input::placeholder, .field-textarea::placeholder { color: var(--vscode-descriptionForeground); }
   .new-task-actions { display: flex; justify-content: flex-end; gap: 12px; }
+  .task-edit-form { display: flex; flex-direction: column; gap: 14px; }
+  .task-edit-form .field-textarea { min-height: 120px; }
+  .task-edit-actions { display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
+  .edit-error {
+    color: var(--vscode-errorForeground);
+    background: color-mix(in srgb, var(--vscode-errorForeground) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--vscode-errorForeground) 45%, transparent);
+    border-radius: 8px; padding: 9px 10px; font-size: 12px; line-height: 1.4;
+  }
+  .field-input:focus-visible, .field-textarea:focus-visible,
+  .btn-chip:focus-visible, .btn-modal-primary:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px;
+  }
   .btn-chip {
     font-family: inherit; font-size: 12px; border-radius: 10px; padding: 10px 14px;
     border: 1px solid var(--vscode-panel-border);
@@ -768,20 +1142,28 @@ export class BoardPanel {
   }
   .btn-chip:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15)); }
   .btn-modal-primary {
-    font-family: inherit; font-size: 12px; font-weight: 600; border-radius: 10px; padding: 10px 16px;
-    border: none; background: var(--kp-modal-accent); color: #fff; cursor: pointer;
+    font-family: inherit; font-size: 12px; font-weight: 700; border-radius: 10px; padding: 10px 16px;
+    border: none; color: #fff; cursor: pointer;
+    background: linear-gradient(135deg, var(--kp-modal-accent), var(--kp-modal-accent-2));
+    box-shadow: 0 2px 12px color-mix(in srgb, var(--kp-modal-accent-2) 40%, transparent);
   }
-  .btn-modal-primary:hover { filter: brightness(1.08); }
+  .btn-modal-primary:hover { filter: saturate(1.15) brightness(1.07); }
 
   #warn {
     flex: none;
     margin: var(--kp-pad-page) var(--kp-pad-page) 0;
   }
   .warn-banner {
-    padding: 8px 10px; border-radius: 4px;
-    background: var(--vscode-inputValidation-warningBackground);
-    border: 1px solid var(--vscode-inputValidation-warningBorder);
-    font-size: 0.8rem;
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-radius: 10px;
+    background: color-mix(in srgb, #fbbf24 15%, var(--vscode-editor-background));
+    border: 1px solid color-mix(in srgb, #fbbf24 55%, transparent);
+    color: color-mix(in srgb, #f59e0b 72%, var(--vscode-foreground));
+    font-size: 0.8rem; font-weight: 600;
+  }
+  .warn-banner::before {
+    content: ''; width: 8px; height: 8px; border-radius: 100px; flex: none;
+    background: #fbbf24; box-shadow: 0 0 10px #fbbf24;
   }
 
   .layout {
@@ -795,36 +1177,68 @@ export class BoardPanel {
     flex: 1 1 auto; min-width: 0;
   }
 
+  /*
+   * Each column is tinted with its own hue rather than sharing one surface
+   * color: a 3px full-chroma rail across the top, a vertical wash that fades
+   * out by the time it reaches the cards (so card contrast is unaffected),
+   * and a border in the same hue.
+   */
   .column {
+    position: relative;
     flex: 0 0 var(--kp-column-width);
     min-height: 120px; max-height: 100%;
     display: flex; flex-direction: column; gap: 10px;
-    background: var(--vscode-sideBar-background);
-    border: 1px solid var(--vscode-panel-border);
+    background:
+      linear-gradient(180deg, var(--col-tint), transparent 190px),
+      var(--vscode-sideBar-background);
+    border: 1px solid var(--col-line);
     border-radius: var(--kp-radius-column);
-    padding: var(--kp-pad-column);
+    padding: calc(var(--kp-pad-column) + 3px) var(--kp-pad-column) var(--kp-pad-column);
     overflow: hidden;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .column::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--col), var(--col-to, var(--col)));
   }
   .column.drag-over {
-    border-color: var(--vscode-focusBorder);
-    background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+    border-color: var(--col);
+    box-shadow: 0 0 0 1px var(--col), 0 8px 28px var(--col-glow);
   }
-  .column-head { flex: none; display: flex; flex-direction: column; gap: 3px; }
-  .column-title-row { display: flex; align-items: center; gap: 6px; }
-  .dot { width: 8px; height: 8px; border-radius: 100px; flex: none; }
-  .column-title { font-size: 13px; font-weight: 600; flex: 1; }
-  .count { font-size: 11px; font-weight: 600; color: var(--vscode-descriptionForeground); }
+  .column-head { flex: none; display: flex; flex-direction: column; gap: 4px; }
+  .column-title-row { display: flex; align-items: center; gap: 7px; }
+  .dot {
+    width: 9px; height: 9px; border-radius: 100px; flex: none;
+    background: linear-gradient(135deg, var(--col), var(--col-to, var(--col)));
+    box-shadow: 0 0 8px var(--col-glow);
+  }
+  .column-title {
+    font-size: 13px; font-weight: 700; flex: 1;
+    letter-spacing: 0.01em; color: var(--col-text);
+  }
+  /* Count reads as a chip in the column hue — the per-column density is
+     part of the color legend, not incidental metadata. */
+  .count {
+    font-size: 11px; font-weight: 700; line-height: 1;
+    color: var(--col-text);
+    background: color-mix(in srgb, var(--col) 18%, transparent);
+    border: 1px solid var(--col-line);
+    border-radius: 100px; padding: 3px 7px; min-width: 20px; text-align: center;
+  }
 
   /* Exact structure from the prototype's "Agent Metadata" row: Agent Label +
      Agent Name (monospace) + a non-interactive edit-pencil (§13). */
   .agent-meta { display: flex; align-items: center; gap: 4px; }
+  /* Deliberately left neutral: the column's identity is already carried by the
+     rail, dot, title and count chip, and tinting this one pushed it under 3:1
+     on light themes for no gain. */
   .agent-label {
-    font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
     color: var(--vscode-descriptionForeground);
   }
   .agent-name {
     font-family: "IBM Plex Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
-    font-size: 10px; font-weight: 500; color: var(--vscode-foreground);
+    font-size: 10px; font-weight: 600; color: var(--vscode-foreground);
   }
   .agent-edit-icon { color: var(--vscode-descriptionForeground); flex: none; line-height: 0; }
   .agent-edit-icon-active { cursor: pointer; border-radius: 4px; }
@@ -836,71 +1250,234 @@ export class BoardPanel {
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
     margin: 0 -4px; padding: 0 4px; /* room for the scrollbar without clipping card focus rings */
   }
+  .drop-slot {
+    position: relative;
+    flex: none;
+    height: 8px;
+    margin: -2px 0;
+    border-radius: 999px;
+    transition: height .12s, background .12s, box-shadow .12s;
+  }
+  .drop-slot.active {
+    height: 18px;
+    background: color-mix(in srgb, var(--col) 12%, transparent);
+  }
+  .drop-slot.active::before {
+    content: '';
+    position: absolute;
+    left: 2px; right: 2px; top: 50%; height: 3px;
+    transform: translateY(-50%);
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--col), var(--col-to, var(--col)));
+    box-shadow: 0 0 10px var(--col-glow);
+  }
+  .drop-slot.empty-slot {
+    min-height: 52px;
+    border: 1px dashed var(--col-line);
+    background: color-mix(in srgb, var(--col) 5%, transparent);
+  }
+  .drop-slot.empty-slot::after {
+    content: 'Drop task here';
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    color: color-mix(in srgb, var(--col) 60%, var(--vscode-descriptionForeground));
+    font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    opacity: .7;
+  }
+  .drop-slot.empty-slot.active {
+    background: color-mix(in srgb, var(--col) 15%, transparent);
+    box-shadow: inset 0 0 0 1px var(--col-line);
+  }
+  .drop-slot.empty-slot.active::before { display: none; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
 
+  /*
+   * The 3px left rail is what carries the column hue onto the card itself, so
+   * a card stays identifiable with its stage after it is dragged out of the
+   * column or seen in isolation. Painted as a background layer rather than a
+   * border so it can be a gradient and so it doesn't shift the text box.
+   */
   .card {
-    background: var(--vscode-editorWidget-background);
-    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    position: relative;
+    background:
+      linear-gradient(90deg, var(--col) 0 3px, transparent 3px),
+      linear-gradient(115deg, var(--col-tint), transparent 62%),
+      var(--vscode-editorWidget-background);
+    border: 1px solid var(--col-line);
     border-radius: var(--kp-radius-card);
     box-shadow: var(--kp-shadow-card);
-    padding: var(--kp-pad-card);
+    padding: var(--kp-pad-card) var(--kp-pad-card) var(--kp-pad-card) calc(var(--kp-pad-card) + 5px);
     display: flex; flex-direction: column; gap: var(--kp-gap-card);
     cursor: pointer;
+    transition: transform .13s, box-shadow .13s, border-color .13s;
   }
   .card[draggable="true"] { cursor: grab; }
-  .card.dragging { opacity: .55; cursor: grabbing; }
-  .card:hover { border-color: var(--vscode-focusBorder); }
-  .card.selected { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-  .card:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  .card.dragging { opacity: .5; cursor: grabbing; transform: rotate(1.5deg) scale(.98); }
+  .card:hover {
+    border-color: var(--col);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px var(--col-glow);
+  }
+  .card.selected {
+    border-color: var(--col);
+    box-shadow: 0 0 0 1px var(--col), 0 6px 20px var(--col-glow);
+  }
+  .card:focus-visible { outline: 2px solid var(--col); outline-offset: 2px; }
 
   .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
   .card-id-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .card-id { font-size: 10px; font-weight: 500; color: var(--vscode-descriptionForeground); letter-spacing: 0.02em; }
-  /* §6.12: marks a card an agent filed itself, distinct from a human's "New Task". */
+  .card-id {
+    font-family: "IBM Plex Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
+    font-size: 10px; font-weight: 600; color: var(--col-text); letter-spacing: 0.02em;
+    opacity: .9;
+  }
+  /* §6.12: marks a card an agent filed itself, distinct from a human's "New Task".
+     Gradient-filled rather than tinted — it must not be mistaken for the
+     column-hue chrome around it. */
   .badge-proposed {
-    font-size: 9px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
-    color: var(--kp-modal-accent); background: rgba(79, 70, 229, 0.14);
-    border-radius: 4px; padding: 1px 5px; flex: none;
+    font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: #fff;
+    background: linear-gradient(135deg, var(--kp-modal-accent), var(--kp-modal-accent-2));
+    border-radius: 100px; padding: 2px 7px; flex: none;
+    box-shadow: 0 1px 6px color-mix(in srgb, var(--kp-modal-accent-2) 45%, transparent);
   }
+  /* Task type is always written as text; the border treatment is a secondary
+     cue so Feature/Bug remains readable without relying on color. */
+  .badge-task-type {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 5px; padding: 2px 6px; flex: none;
+    color: var(--vscode-foreground);
+    background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  }
+  .badge-task-type.bug { border-style: dashed; }
+  .badge-task-type.feature { border-style: solid; }
   .icon-btn {
-    background: none; border: none; padding: 2px; cursor: pointer;
-    color: var(--vscode-descriptionForeground); border-radius: 4px;
-    display: inline-flex; line-height: 0;
+    background: none; border: none; padding: 3px; cursor: pointer;
+    color: var(--vscode-descriptionForeground); border-radius: 6px;
+    display: inline-flex; line-height: 0; transition: color .12s, background .12s;
   }
-  .icon-btn:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.15)); }
+  .icon-btn:hover { color: var(--col-text); background: color-mix(in srgb, var(--col) 18%, transparent); }
+  /* Delete is the one destructive control on a card — it leaves the column
+     hue on hover and goes red, so it can't be hit by muscle memory. */
+  .card-top .icon-btn:hover { color: #f43f5e; background: color-mix(in srgb, #f43f5e 16%, transparent); }
+  .icon-btn:focus-visible { outline: 2px solid var(--col); outline-offset: 1px; }
 
   .card-title { font-size: 13px; font-weight: 600; line-height: 1.35; }
 
   .card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .card-foot-actions { display: flex; gap: 6px; }
-  .status-text { font-size: 10px; color: var(--vscode-descriptionForeground); }
-  .status-text.running { color: var(--vscode-charts-blue, #4daafc); }
-  .status-text.blocked, .status-text.failed { color: var(--vscode-errorForeground); }
-  .status-text.paused { color: var(--vscode-charts-yellow, #cca700); }
 
-  button.action {
-    font-family: inherit; font-size: 12px;
-    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
-    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
-    border: none; border-radius: var(--kp-radius-button); padding: 5px 10px;
-    cursor: pointer;
+  /*
+   * Status is the one thing on a card that must out-shout the column hue —
+   * a blocked card in the yellow Validation column still has to read as
+   * blocked. So these carry their own semantic color at pill strength, and
+   * running is additionally animated: motion, not just hue, marks live work.
+   */
+  /*
+   * Two colors per status, not one: --st is the vivid mark carried by the dot,
+   * the border and the fill, where contrast is irrelevant; --st-ink is a
+   * mid-tone of the same hue that the label text is mixed from. Mixing a
+   * *light* hue toward --vscode-foreground can't clear 4.5:1 in both themes at
+   * once (it lands too pale on white), so the ink base is a mid-tone and the
+   * mix is weighted toward the foreground — the pill still reads unmistakably
+   * cyan/rose/amber from its fill while the word itself stays readable.
+   */
+  .status-text {
+    --st: var(--vscode-descriptionForeground);
+    --st-ink: var(--vscode-descriptionForeground);
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+    color: color-mix(in srgb, var(--st-ink) 45%, var(--vscode-foreground));
+    background: color-mix(in srgb, var(--st) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--st) 45%, transparent);
+    border-radius: 100px; padding: 2px 8px;
   }
-  button.action:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground)); }
+  .status-text::before {
+    content: ''; width: 6px; height: 6px; border-radius: 100px; flex: none;
+    background: var(--st);
+  }
+  .status-text.running { --st: #22d3ee; --st-ink: #0891b2; }
+  .status-text.running::before { animation: kp-pulse 1.4s ease-in-out infinite; }
+  .status-text.blocked, .status-text.failed { --st: #fb7185; --st-ink: #e11d48; }
+  .status-text.paused { --st: #fbbf24; --st-ink: #d97706; }
+  /* Same light/dark split as --col-text, and a lighter fill so the darker
+     surface doesn't close the gap between pill and label. */
+  body.vscode-dark .status-text, body.vscode-high-contrast .status-text {
+    color: color-mix(in srgb, var(--st) 58%, var(--vscode-foreground));
+    background: color-mix(in srgb, var(--st) 10%, transparent);
+  }
+  @keyframes kp-pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--st) 70%, transparent); }
+    50% { opacity: .55; box-shadow: 0 0 0 4px transparent; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-text.running::before { animation: none; }
+    .card, .new-task-btn { transition: none; }
+    .card:hover, .new-task-btn:hover { transform: none; }
+  }
 
-  .empty { color: var(--vscode-descriptionForeground); font-size: 12px; font-style: italic; padding: 4px 0; }
+  /* Ghost-filled in the column hue at rest, solid on hover: the per-card
+     action inherits the stage color it will advance the task out of. */
+  button.action {
+    font-family: inherit; font-size: 12px; font-weight: 600;
+    background: color-mix(in srgb, var(--col) 16%, transparent);
+    color: var(--col-text);
+    border: 1px solid var(--col-line);
+    border-radius: var(--kp-radius-button); padding: 5px 10px;
+    cursor: pointer; transition: background .13s, color .13s, box-shadow .13s;
+  }
+  /*
+   * Hover deepens the tint rather than filling solid with white text: half
+   * this palette (yellow, sky, green) is too light to carry white — the
+   * Validation accent measures 1.5:1 against it — and the hues that could are
+   * exactly the ones that then clash with the rest.
+   *
+   * The label also steps *toward* --vscode-foreground on hover instead of
+   * further into the hue. A heavier wash raises the fill's luminance, and on
+   * dark themes --col-text is itself a lightened accent, so leaning on chroma
+   * alone closed the gap to ~3.5:1. Landing near the theme's own foreground
+   * is contrasty by construction in both directions, and the fill plus the
+   * full-chroma border still carry the color.
+   */
+  button.action:hover {
+    background: color-mix(in srgb, var(--col) 30%, transparent);
+    border-color: var(--col);
+    color: color-mix(in srgb, var(--col) 15%, var(--vscode-foreground));
+    box-shadow: 0 2px 10px var(--col-glow);
+  }
+  button.action:focus-visible { outline: 2px solid var(--col); outline-offset: 2px; }
+
+  .empty {
+    color: color-mix(in srgb, var(--col) 55%, var(--vscode-descriptionForeground));
+    font-size: 11px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase;
+    text-align: center; padding: 14px 0;
+    border: 1px dashed var(--col-line); border-radius: var(--kp-radius-card);
+    background: color-mix(in srgb, var(--col) 5%, transparent);
+  }
 
   /*
    * Task detail modal — replicated from the prototype's modal (Chrome
    * DevTools inspection, 2026-08-13): a centered dialog over a dimming
    * backdrop, not the docked sidebar this used to be. Shape/spacing/type
    * scale are the prototype's exact computed values; surface colors route
-   * through --vscode-* per the module doc's split, except the indigo accent
-   * (status text, close glyph), which reads as brand identity there the same
-   * way the column dots do, so it stays the prototype's literal hex.
+   * through --vscode-* per the module doc's split. The accent is not fixed
+   * here — renderDetail sets --col on the backdrop from the task's own state,
+   * so the rail, section markers, status chip and backdrop wash all come up in
+   * the hue of the column the card was opened from. The modals that aren't
+    * about one task (New Task, Settings) inherit :root's brand
+   * pair instead.
    */
   .modal-backdrop {
     display: none;
     position: fixed; inset: 0; z-index: 1000;
-    background: rgba(0, 0, 0, 0.5);
+    background:
+      radial-gradient(80% 60% at 50% 0%, color-mix(in srgb, var(--col) 15%, transparent), transparent 70%),
+      rgba(0, 0, 0, 0.62);
+    backdrop-filter: blur(2px);
     align-items: center; justify-content: center;
     padding: 16px;
   }
@@ -909,17 +1486,25 @@ export class BoardPanel {
     position: relative;
     width: min(720px, 100vw - 32px);
     max-height: min(86vh, 960px);
-    background: var(--vscode-editorWidget-background);
-    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    background:
+      linear-gradient(180deg, var(--col-tint), transparent 220px),
+      var(--vscode-editorWidget-background);
+    border: 1px solid var(--col-line);
     border-radius: var(--kp-radius-modal);
-    box-shadow: var(--kp-shadow-modal);
+    box-shadow: var(--kp-shadow-modal), 0 0 0 1px var(--col-glow);
     display: flex; flex-direction: column;
     overflow: hidden;
   }
+  /* Same rail as the column head, so the modal reads as an extension of the
+     column it was opened from. */
+  .modal::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--col), var(--col-to, var(--col)));
+  }
   .modal-head {
     display: flex; align-items: flex-start; justify-content: space-between;
-    padding: 16px 18px 14px;
-    border-bottom: 1px solid var(--vscode-panel-border);
+    padding: 18px 18px 14px;
+    border-bottom: 1px solid var(--col-line);
     gap: 10px;
   }
   .modal-head-left { min-width: 0; }
@@ -937,23 +1522,41 @@ export class BoardPanel {
     border: 1px solid var(--vscode-panel-border);
     border-radius: var(--kp-radius-chip); padding: 2px 7px;
   }
-  .modal-status { color: var(--kp-modal-accent); font-weight: 600; }
+  /* Detail modal takes the hue of the stage the task is currently in (set
+     inline from the task's state), so opening a card doesn't drop the color
+     context the board just established. */
+  .modal-status {
+    color: var(--col-text); font-weight: 700;
+    background: color-mix(in srgb, var(--col) 16%, transparent);
+    border: 1px solid var(--col-line);
+    border-radius: 100px; padding: 2px 9px; font-size: 12px;
+  }
   .modal-close {
     flex: none;
-    border: 1px solid var(--vscode-panel-border);
-    background: var(--vscode-editorWidget-background);
-    color: var(--kp-modal-accent);
+    border: 1px solid var(--col-line);
+    background: color-mix(in srgb, var(--col) 10%, var(--vscode-editorWidget-background));
+    color: var(--col-text);
     width: 32px; height: 32px; border-radius: var(--kp-radius-modal-close);
     cursor: pointer; font-size: 18px; line-height: 18px;
+    transition: background .13s, color .13s;
   }
-  .modal-close:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .15)); }
+  .modal-close:hover {
+    background: color-mix(in srgb, var(--col) 26%, transparent);
+    border-color: var(--col);
+    color: color-mix(in srgb, var(--col) 22%, var(--vscode-foreground));
+  }
   .modal-body {
     overflow-y: auto; padding: 18px;
     display: flex; flex-direction: column; gap: 22px;
   }
   .modal-section-label {
-    font-size: 12px; letter-spacing: 0.02em; text-transform: uppercase;
-    color: var(--vscode-descriptionForeground); margin-bottom: 8px;
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--col-text); margin-bottom: 8px;
+  }
+  .modal-section-label::before {
+    content: ''; width: 3px; height: 12px; border-radius: 100px; flex: none;
+    background: linear-gradient(180deg, var(--col), var(--col-to, var(--col)));
   }
   .modal-section-body {
     font-size: 15px; line-height: 1.65; color: var(--vscode-foreground);
@@ -977,7 +1580,7 @@ export class BoardPanel {
   .modal-section-body ul.modal-md-checklist { list-style: none; padding-left: 0; }
   .modal-section-body ul.modal-md-checklist label { display: inline-flex; align-items: center; gap: 8px; }
   .modal-section-body blockquote {
-    margin: 10px 0; border-left: 3px solid var(--kp-modal-accent);
+    margin: 10px 0; border-left: 3px solid var(--col);
     padding: 4px 0 4px 12px; color: var(--vscode-descriptionForeground);
   }
   .modal-section-body code {
@@ -1013,9 +1616,9 @@ export class BoardPanel {
       <button class="task-set-btn" id="taskSetRename" aria-label="Rename active task set">Rename</button>
       <button class="task-set-btn" id="taskSetDelete" aria-label="Delete active task set">Delete</button>
     </div>
-    <button class="gates-btn" id="gatesToggle">
+    <button class="settings-btn" id="settingsToggle" aria-haspopup="dialog" aria-controls="settingsBackdrop">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      Gates
+      Settings
     </button>
     <button class="new-task-btn" id="newTaskToggle">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -1023,38 +1626,36 @@ export class BoardPanel {
     </button>
   </div>
 </header>
-<div class="modal-backdrop" id="gatesBackdrop">
-  <div class="modal new-task-modal" id="gatesModal" role="dialog" aria-modal="true" aria-label="Automation gates">
-    <div class="new-task-head">
+<div class="modal-backdrop" id="settingsBackdrop">
+  <div class="modal settings-modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" aria-describedby="settingsSubtitle" tabindex="-1">
+    <div class="new-task-head settings-head">
       <div class="new-task-head-text">
-        <div class="modal-title">Automation gates</div>
-        <div class="new-task-subtitle">Each gate defaults to manual. Switch one to Auto to skip its click.</div>
+        <div class="modal-title" id="settingsTitle">Settings</div>
+        <div class="new-task-subtitle" id="settingsSubtitle">Configure automation gates and the agent label assigned to each workflow column.</div>
       </div>
-      <button class="modal-close" id="gatesClose" aria-label="Close automation gates dialog">×</button>
+      <button class="modal-close" id="settingsClose" aria-label="Close Settings dialog">×</button>
     </div>
-    <div class="gates-list" id="gatesList"></div>
-  </div>
-</div>
-<div class="modal-backdrop" id="agentNameBackdrop">
-  <div class="modal new-task-modal" id="agentNameModal" role="dialog" aria-modal="true" aria-label="Edit agent name">
-    <div class="new-task-head">
-      <div class="new-task-head-text">
-        <div class="modal-title">Edit agent name</div>
-        <div class="new-task-subtitle" id="agentNameSubtitle"></div>
+    <div class="settings-body">
+      <nav class="settings-sidebar" id="settingsCategoryNav" aria-label="Settings categories">
+        <div class="settings-sidebar-title">Categories</div>
+        <div class="settings-category-list" role="tablist" aria-label="Settings categories">
+          <button class="settings-category" id="settingsCategoryGates" type="button" role="tab" data-category="gates" aria-selected="true" aria-controls="settingsPanelGates" tabindex="0">Automation gates</button>
+          <button class="settings-category" id="settingsCategoryAgents" type="button" role="tab" data-category="agents" aria-selected="false" aria-controls="settingsPanelAgents" tabindex="-1">Agent assignments</button>
+        </div>
+      </nav>
+      <div class="settings-main" id="settingsMain" role="region" aria-label="Settings controls">
+        <section class="settings-panel settings-section" id="settingsPanelGates" role="tabpanel" aria-labelledby="settingsCategoryGates" aria-describedby="settingsGatesDescription" aria-hidden="false">
+          <div class="settings-section-title" id="settingsGatesTitle">Automation gates</div>
+          <div class="settings-section-desc" id="settingsGatesDescription">Each gate defaults to manual. Switch one to Auto to skip its click.</div>
+          <div class="gates-list" id="gatesList"></div>
+        </section>
+        <section class="settings-panel settings-section" id="settingsPanelAgents" role="tabpanel" aria-labelledby="settingsCategoryAgents" aria-describedby="settingsAgentsDescription" hidden aria-hidden="true">
+          <div class="settings-section-title" id="settingsAgentsTitle">Agent assignments</div>
+          <div class="settings-section-desc" id="settingsAgentsDescription">Assignments on resting columns are labels only; they never launch a chat run.</div>
+          <div class="agent-settings-list" id="agentSettingsList"></div>
+        </section>
       </div>
-      <button class="modal-close" id="agentNameClose" aria-label="Close edit agent name dialog">×</button>
     </div>
-    <form class="new-task-form" id="agentNameForm">
-      <label class="field">
-        <span class="field-label">Agent name</span>
-        <input class="field-input" id="agentNameInput" type="text" maxlength="60" required />
-      </label>
-      <div class="new-task-actions">
-        <button type="button" class="btn-chip" id="agentNameReset" style="margin-right:auto">Reset to default</button>
-        <button type="button" class="btn-chip" id="agentNameCancel">Cancel</button>
-        <button type="submit" class="btn-modal-primary" id="agentNameSubmit">Save</button>
-      </div>
-    </form>
   </div>
 </div>
 <div class="modal-backdrop" id="newTaskBackdrop">
@@ -1075,6 +1676,13 @@ export class BoardPanel {
         <span class="field-label">Description</span>
         <textarea class="field-textarea" id="newTaskDescription" placeholder="What needs to happen?" rows="4"></textarea>
       </label>
+      <label class="field">
+        <span class="field-label">Task type</span>
+        <select class="field-input" id="newTaskType" required aria-label="Task type">
+          <option value="feature">Feature</option>
+          <option value="bug">Bug</option>
+        </select>
+      </label>
       <div class="new-task-actions">
         <button type="button" class="btn-chip" id="newTaskCancel">Cancel</button>
         <button type="submit" class="btn-modal-primary" id="newTaskSubmit">Create task</button>
@@ -1083,6 +1691,7 @@ export class BoardPanel {
   </div>
 </div>
 <div id="warn"></div>
+<div id="reorderAnnouncement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 <div class="layout">
   <div class="board" id="board"></div>
 </div>
@@ -1094,13 +1703,43 @@ export class BoardPanel {
   const vscode = acquireVsCodeApi();
   const ACTION_LABELS = ${actionLabelsJson};
   const GATES = ${gatesJson};
+  const COLUMN_SETTINGS = ${columnsJson};
+  const COLUMN_ACCENT = ${accentsJson};
+  // Header-opened Settings defaults to Automation gates; a column pencil opens Agent assignments.
+  const DEFAULT_SETTINGS_CATEGORY = 'gates';
+  const SETTINGS_CATEGORIES = ['gates', 'agents'];
+
+  /** Paints a hue onto any element; children inherit and re-derive from it. */
+  function applyAccent(node, column) {
+    const accent = COLUMN_ACCENT[column];
+    if (!accent) { return; }
+    node.style.setProperty('--col', accent.from);
+    node.style.setProperty('--col-to', accent.to);
+  }
   let draggedTaskId = null;
+  let draggedTaskColumn = null;
+  let pendingFocusTaskId = null;
+  let selectedSettingsCategory = DEFAULT_SETTINGS_CATEGORY;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) { node.className = className; }
     if (text !== undefined) { node.textContent = text; }
     return node;
+  }
+
+  function announceReorder(message) {
+    const live = document.getElementById('reorderAnnouncement');
+    if (live) { live.textContent = message; }
+  }
+
+  function focusPendingCard() {
+    if (!pendingFocusTaskId) { return; }
+    const card = document.querySelector('.card[data-task-id="' + pendingFocusTaskId + '"]');
+    if (card) {
+      card.focus();
+      pendingFocusTaskId = null;
+    }
   }
 
   /*
@@ -1263,12 +1902,13 @@ export class BoardPanel {
     return b;
   }
 
-  function renderCard(card, selectedId) {
+  function renderCard(card, selectedId, column) {
     const node = el('div', 'card' + (card.id === selectedId ? ' selected' : ''));
     node.draggable = true;
     node.tabIndex = 0;
+    node.dataset.taskId = card.id;
     node.setAttribute('role', 'button');
-    node.setAttribute('aria-label', card.id + ': ' + card.title);
+    node.setAttribute('aria-label', card.id + ': ' + card.title + '. Type: ' + card.typeLabel + '. Use Arrow Up or Arrow Down to change position.');
     let suppressClick = false;
 
     node.addEventListener('dragstart', (e) => {
@@ -1277,6 +1917,7 @@ export class BoardPanel {
         return;
       }
       draggedTaskId = card.id;
+      draggedTaskColumn = column.id;
       suppressClick = false;
       node.classList.add('dragging');
       if (e.dataTransfer) {
@@ -1288,6 +1929,7 @@ export class BoardPanel {
       node.classList.remove('dragging');
       clearDropTargets();
       draggedTaskId = null;
+      draggedTaskColumn = null;
       suppressClick = true;
       setTimeout(() => { suppressClick = false; }, 0);
     });
@@ -1300,6 +1942,10 @@ export class BoardPanel {
       badge.title = 'Filed automatically by ' + card.originTask;
       idGroup.appendChild(badge);
     }
+    const typeBadge = el('span', 'badge-task-type ' + card.type, card.typeLabel);
+    typeBadge.title = 'Task type: ' + card.typeLabel;
+    typeBadge.setAttribute('aria-label', 'Task type: ' + card.typeLabel);
+    idGroup.appendChild(typeBadge);
     top.appendChild(idGroup);
     const del = el('button', 'icon-btn');
     del.innerHTML = trashIconSvg;
@@ -1358,13 +2004,51 @@ export class BoardPanel {
       select();
     });
     node.addEventListener('keydown', (e) => {
+      if (e.target !== node) { return; }
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') { return; }
+
+      e.preventDefault();
+      const index = column.cards.findIndex((candidate) => candidate.id === card.id);
+      const direction = e.key === 'ArrowUp' ? -1 : 1;
+      const targetIndex = index + direction;
+      if (index < 0 || targetIndex < 0 || targetIndex >= column.cards.length) {
+        announceReorder(card.title + ' is already at the ' + (direction < 0 ? 'first' : 'last') + ' position in ' + column.label + '.');
+        return;
+      }
+
+      const beforeTaskId = direction < 0
+        ? column.cards[index - 1].id
+        : (column.cards[index + 2] ? column.cards[index + 2].id : null);
+      pendingFocusTaskId = card.id;
+      vscode.postMessage({ type: 'task/reorder', taskId: card.id, column: column.id, beforeTaskId });
     });
     return node;
   }
 
   function clearDropTargets() {
     document.querySelectorAll('.column.drag-over').forEach((column) => column.classList.remove('drag-over'));
+    document.querySelectorAll('.drop-slot.active').forEach((slot) => slot.classList.remove('active'));
+  }
+
+  function submitDrop(taskId, column, beforeTaskId) {
+    if (!taskId) { return; }
+    if (draggedTaskColumn === column.id) {
+      vscode.postMessage({ type: 'task/reorder', taskId, column: column.id, beforeTaskId });
+    } else {
+      vscode.postMessage({ type: 'task/move', taskId, destination: column.id });
+    }
+    clearDropTargets();
+  }
+
+  function activateDropSlot(slot, columnNode, column, beforeTaskId, event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!draggedTaskId) { return; }
+    if (event.dataTransfer) { event.dataTransfer.dropEffect = 'move'; }
+    clearDropTargets();
+    slot.classList.add('active');
+    columnNode.classList.add('drag-over');
   }
 
   function renderBoard(snapshot, selectedId) {
@@ -1379,6 +2063,9 @@ export class BoardPanel {
 
     for (const column of snapshot.columns) {
       const node = el('div', 'column');
+      // Everything colored inside the column — rail, tint, dot, count chip,
+      // cards, action buttons — derives from this one call.
+      applyAccent(node, column.id);
 
       node.addEventListener('dragover', (e) => {
         if (!draggedTaskId) { return; }
@@ -1403,9 +2090,7 @@ export class BoardPanel {
 
       const head = el('div', 'column-head');
       const titleRow = el('div', 'column-title-row');
-      const dot = el('span', 'dot');
-      dot.style.background = column.dot;
-      titleRow.appendChild(dot);
+      titleRow.appendChild(el('span', 'dot'));
       titleRow.appendChild(el('span', 'column-title', column.label));
       titleRow.appendChild(el('span', 'count', String(column.count)));
       head.appendChild(titleRow);
@@ -1415,42 +2100,90 @@ export class BoardPanel {
       agentMeta.appendChild(el('span', 'agent-name', column.agent));
       const editIcon = el('span', 'agent-edit-icon');
       editIcon.innerHTML = editIconSvg;
-      if (column.stage) {
-        editIcon.classList.add('agent-edit-icon-active');
-        editIcon.tabIndex = 0;
-        editIcon.setAttribute('role', 'button');
-        editIcon.title = 'Edit agent name';
-        editIcon.setAttribute('aria-label', 'Edit agent name for ' + column.label);
-        const openEditor = (e) => {
-          e.stopPropagation();
-          openAgentNameModal(column.stage, column.label, column.agent);
-        };
-        editIcon.addEventListener('click', openEditor);
-        editIcon.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openEditor(e); }
-        });
-      } else {
-        editIcon.title = 'Per-column agent assignment is not configurable yet';
-      }
+      editIcon.classList.add('agent-edit-icon-active');
+      editIcon.tabIndex = 0;
+      editIcon.setAttribute('role', 'button');
+      editIcon.title = 'Edit agent assignment';
+      editIcon.setAttribute('aria-label', 'Edit agent assignment for ' + column.label);
+      const openEditor = (e) => {
+        e.stopPropagation();
+        openSettingsModal(column.id);
+      };
+      editIcon.addEventListener('click', openEditor);
+      editIcon.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openEditor(e); }
+      });
       agentMeta.appendChild(editIcon);
       head.appendChild(agentMeta);
 
       node.appendChild(head);
 
       const cards = el('div', 'cards');
+      const addDropSlot = (beforeTaskId, label, empty = false) => {
+        const slot = el('div', 'drop-slot' + (empty ? ' empty-slot' : ''));
+        slot.setAttribute('role', 'separator');
+        slot.setAttribute('aria-label', label);
+        slot.addEventListener('dragover', (e) => activateDropSlot(slot, node, column, beforeTaskId, e));
+        slot.addEventListener('dragleave', (e) => {
+          e.stopPropagation();
+          if (!e.relatedTarget || !slot.contains(e.relatedTarget)) {
+            slot.classList.remove('active');
+          }
+        });
+        slot.addEventListener('drop', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const taskId = draggedTaskId || (e.dataTransfer && e.dataTransfer.getData('text/plain'));
+          submitDrop(taskId, column, beforeTaskId);
+        });
+        cards.appendChild(slot);
+      };
+
       if (column.cards.length === 0) {
-        cards.appendChild(el('div', 'empty', 'empty'));
+        addDropSlot(null, 'Drop a task into ' + column.label, true);
       } else {
-        for (const card of column.cards) { cards.appendChild(renderCard(card, selectedId)); }
+        for (const card of column.cards) {
+          addDropSlot(card.id, 'Insert before ' + card.title);
+          cards.appendChild(renderCard(card, selectedId, column));
+        }
+        addDropSlot(null, 'Insert at the end of ' + column.label);
       }
       node.appendChild(cards);
       board.appendChild(node);
     }
+    focusPendingCard();
   }
 
-  function renderGates(state) {
+  function updateSettingsCategory() {
+    if (!SETTINGS_CATEGORIES.includes(selectedSettingsCategory)) {
+      selectedSettingsCategory = DEFAULT_SETTINGS_CATEGORY;
+    }
+    document.querySelectorAll('.settings-category').forEach((button) => {
+      const active = button.dataset.category === selectedSettingsCategory;
+      button.setAttribute('aria-selected', String(active));
+      button.tabIndex = active ? 0 : -1;
+      const panel = document.getElementById(button.getAttribute('aria-controls'));
+      if (panel) {
+        panel.hidden = !active;
+        panel.setAttribute('aria-hidden', String(!active));
+      }
+    });
+  }
+
+  function selectSettingsCategory(category, focus = true) {
+    if (!SETTINGS_CATEGORIES.includes(category)) { return; }
+    selectedSettingsCategory = category;
+    updateSettingsCategory();
+    if (focus) {
+      const active = document.querySelector('.settings-category[aria-selected="true"]');
+      if (active) { active.focus(); }
+    }
+  }
+
+  function renderSettings(state) {
     const list = document.getElementById('gatesList');
     list.textContent = '';
+    const gates = state.gates || {};
     for (const gate of GATES) {
       const row = el('div', 'gate-row');
 
@@ -1462,7 +2195,7 @@ export class BoardPanel {
       const switchLabel = el('label', 'switch');
       const input = document.createElement('input');
       input.type = 'checkbox';
-      input.checked = state[gate.key] === 'auto';
+      input.checked = gates[gate.key] === 'auto';
       input.setAttribute('aria-label', gate.label + ' — auto');
       input.addEventListener('change', () => {
         vscode.postMessage({ type: 'gates/set', key: gate.key, value: input.checked ? 'auto' : 'manual' });
@@ -1475,6 +2208,52 @@ export class BoardPanel {
 
       list.appendChild(row);
     }
+
+    const agents = document.getElementById('agentSettingsList');
+    agents.textContent = '';
+    const assignments = state.agents || {};
+    for (const column of COLUMN_SETTINGS) {
+      const row = el('div', 'agent-setting-row');
+      row.id = 'agent-setting-' + column.id;
+
+      const label = el('label', 'agent-setting-label', column.label);
+      label.htmlFor = 'agent-input-' + column.id;
+      row.appendChild(label);
+
+      const input = document.createElement('input');
+      input.className = 'agent-setting-input';
+      input.id = 'agent-input-' + column.id;
+      input.type = 'text';
+      input.maxLength = 60;
+      input.value = assignments[column.id] || 'None';
+      input.setAttribute('aria-label', 'Agent assignment for ' + column.label);
+      row.appendChild(input);
+
+      const actions = el('div', 'agent-setting-actions');
+      const save = el('button', 'btn-chip', 'Save');
+      save.type = 'button';
+      save.addEventListener('click', () => {
+        vscode.postMessage({ type: 'agentName/set', column: column.id, value: input.value });
+      });
+      actions.appendChild(save);
+
+      const reset = el('button', 'btn-chip', 'Reset');
+      reset.type = 'button';
+      reset.addEventListener('click', () => {
+        vscode.postMessage({ type: 'agentName/set', column: column.id, value: '' });
+      });
+      actions.appendChild(reset);
+      row.appendChild(actions);
+
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          vscode.postMessage({ type: 'agentName/set', column: column.id, value: input.value });
+        }
+      });
+      agents.appendChild(row);
+    }
+    updateSettingsCategory();
   }
 
   function renderTaskSets(snapshot) {
@@ -1495,6 +2274,8 @@ export class BoardPanel {
 
   function closeDetail() {
     document.getElementById('detailBackdrop').classList.remove('open');
+    document.getElementById('detail').textContent = '';
+    editingTaskId = null;
     vscode.postMessage({ type: 'task/deselect' });
   }
 
@@ -1505,19 +2286,27 @@ export class BoardPanel {
 
     if (!task) {
       backdrop.classList.remove('open');
+      editingTaskId = null;
       return;
     }
+    editingTaskId = null;
     backdrop.classList.add('open');
+    // Set on the backdrop, not the modal: the backdrop's radial wash reads the
+    // same hue, and .modal inherits it from here.
+    applyAccent(backdrop, task.state);
     document.getElementById('newTaskBackdrop').classList.remove('open'); // mutually exclusive with New Task
-    document.getElementById('gatesBackdrop').classList.remove('open'); // and with Gates
-    document.getElementById('agentNameBackdrop').classList.remove('open'); // and with Edit agent name
-    modal.setAttribute('aria-label', 'Task detail for ' + task.title);
+    document.getElementById('settingsBackdrop').classList.remove('open'); // and with Settings
+    modal.setAttribute('aria-label', 'Task detail for ' + task.title + ' — ' + task.typeLabel);
 
     const head = el('div', 'modal-head');
     const left = el('div', 'modal-head-left');
     left.appendChild(el('div', 'modal-title', task.title));
     const badges = el('div', 'modal-badges');
     badges.appendChild(el('span', 'modal-id', task.id));
+    const typeBadge = el('span', 'badge-task-type ' + task.type, task.typeLabel);
+    typeBadge.title = 'Task type: ' + task.typeLabel;
+    typeBadge.setAttribute('aria-label', 'Task type: ' + task.typeLabel);
+    badges.appendChild(typeBadge);
     badges.appendChild(el('span', 'modal-status', task.stateLabel + ' · ' + task.status));
     if (task.originTask) {
       const badge = el('span', 'badge-proposed', 'Proposed');
@@ -1556,6 +2345,13 @@ export class BoardPanel {
     body.appendChild(moveControl);
 
     const links = el('div', 'modal-actions');
+    const edit = el('button', 'btn-chip', task.canEdit === false ? 'Editing unavailable while running' : 'Edit task');
+    edit.type = 'button';
+    edit.disabled = task.canEdit === false;
+    edit.setAttribute('aria-label', task.canEdit === false ? 'Editing unavailable while task is running' : 'Edit task');
+    edit.title = task.canEdit === false ? 'Stop the running task before editing it' : 'Edit task details';
+    edit.addEventListener('click', () => renderEditDetail(task));
+    links.appendChild(edit);
     const openLink = el('button', 'modal-link', 'Open task file →');
     openLink.addEventListener('click', () => vscode.postMessage({ type: 'task/open', taskId: task.id }));
     links.appendChild(openLink);
@@ -1584,6 +2380,167 @@ export class BoardPanel {
     modal.appendChild(body);
   }
 
+  let editingTaskId = null;
+
+  function renderEditDetail(task) {
+    if (!task || task.canEdit === false) {
+      renderDetail(task);
+      return;
+    }
+
+    const backdrop = document.getElementById('detailBackdrop');
+    const modal = document.getElementById('detail');
+    modal.textContent = '';
+    editingTaskId = task.id;
+    backdrop.classList.add('open');
+    applyAccent(backdrop, task.state);
+    document.getElementById('newTaskBackdrop').classList.remove('open');
+    document.getElementById('settingsBackdrop').classList.remove('open');
+    modal.setAttribute('aria-label', 'Edit task ' + task.title);
+
+    const head = el('div', 'modal-head');
+    const left = el('div', 'modal-head-left');
+    left.appendChild(el('div', 'modal-title', 'Edit task'));
+    const badges = el('div', 'modal-badges');
+    badges.appendChild(el('span', 'modal-id', task.id));
+    const typeBadge = el('span', 'badge-task-type ' + task.type, task.typeLabel);
+    typeBadge.title = 'Task type: ' + task.typeLabel;
+    typeBadge.setAttribute('aria-label', 'Task type: ' + task.typeLabel);
+    badges.appendChild(typeBadge);
+    badges.appendChild(el('span', 'modal-status', task.stateLabel + ' · ' + task.status));
+    left.appendChild(badges);
+    head.appendChild(left);
+
+    const close = el('button', 'modal-close', '×');
+    close.setAttribute('aria-label', 'Close task editor');
+    close.addEventListener('click', closeDetail);
+    head.appendChild(close);
+    modal.appendChild(head);
+
+    const body = el('div', 'modal-body');
+    const form = el('form', 'task-edit-form');
+    form.id = 'taskEditForm';
+
+    const error = el('div', 'edit-error');
+    error.id = 'taskEditError';
+    error.hidden = true;
+    error.setAttribute('role', 'alert');
+    error.setAttribute('aria-live', 'assertive');
+    form.appendChild(error);
+
+    const titleField = el('label', 'field');
+    titleField.appendChild(el('span', 'field-label', 'Title'));
+    const titleInput = document.createElement('input');
+    titleInput.className = 'field-input';
+    titleInput.id = 'taskEditTitle';
+    titleInput.type = 'text';
+    titleInput.maxLength = 200;
+    titleInput.required = true;
+    titleInput.value = task.title;
+    titleInput.setAttribute('aria-label', 'Task title');
+    titleField.appendChild(titleInput);
+    form.appendChild(titleField);
+
+    for (const [label, id, value, description] of [
+      ['Request', 'taskEditRequest', task.request, 'Original task request in Markdown'],
+      ['Refined', 'taskEditRefined', task.refined, 'Refined problem statement and acceptance criteria in Markdown'],
+      ['Scope', 'taskEditScope', task.scope, 'Implementation scope in Markdown'],
+    ]) {
+      const field = el('label', 'field');
+      field.appendChild(el('span', 'field-label', label));
+      const textarea = document.createElement('textarea');
+      textarea.className = 'field-textarea';
+      textarea.id = id;
+      textarea.rows = 6;
+      textarea.value = value;
+      textarea.setAttribute('aria-label', label + ' — ' + description);
+      field.appendChild(textarea);
+      form.appendChild(field);
+    }
+
+    const actions = el('div', 'task-edit-actions');
+    const cancel = el('button', 'btn-chip', 'Cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => renderDetail(task));
+    actions.appendChild(cancel);
+    const save = el('button', 'btn-modal-primary', 'Save changes');
+    save.type = 'submit';
+    save.setAttribute('aria-label', 'Save task changes');
+    actions.appendChild(save);
+    form.appendChild(actions);
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const title = titleInput.value.trim();
+      if (!title) {
+        error.textContent = 'Task title cannot be blank.';
+        error.hidden = false;
+        titleInput.focus();
+        return;
+      }
+      if (title.length > 200) {
+        error.textContent = 'Task title must be 200 characters or fewer.';
+        error.hidden = false;
+        titleInput.focus();
+        return;
+      }
+      error.textContent = '';
+      error.hidden = true;
+      vscode.postMessage({
+        type: 'task/edit',
+        taskId: task.id,
+        content: {
+          title,
+          request: document.getElementById('taskEditRequest').value,
+          refined: document.getElementById('taskEditRefined').value,
+          scope: document.getElementById('taskEditScope').value,
+        },
+      });
+    });
+    body.appendChild(form);
+
+    const moveControl = el('label', 'field');
+    moveControl.appendChild(el('span', 'field-label', 'Move to column'));
+    const moveSelect = document.createElement('select');
+    moveSelect.className = 'field-input';
+    moveSelect.setAttribute('aria-label', 'Move task to column');
+    for (const target of task.moveTargets) {
+      const option = document.createElement('option');
+      option.value = target.id;
+      option.textContent = target.label;
+      moveSelect.appendChild(option);
+    }
+    moveSelect.value = task.state;
+    moveSelect.addEventListener('change', () => {
+      if (moveSelect.value !== task.state) {
+        vscode.postMessage({ type: 'task/move', taskId: task.id, destination: moveSelect.value });
+      }
+    });
+    moveControl.appendChild(moveSelect);
+    body.appendChild(moveControl);
+
+    const links = el('div', 'modal-actions');
+    const openLink = el('button', 'modal-link', 'Open task file →');
+    openLink.addEventListener('click', () => vscode.postMessage({ type: 'task/open', taskId: task.id }));
+    links.appendChild(openLink);
+    const openChatLink = el('button', 'modal-link', 'Open Chat →');
+    openChatLink.addEventListener('click', () => vscode.postMessage({ type: 'task/openChat', taskId: task.id }));
+    links.appendChild(openChatLink);
+    if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
+    body.appendChild(links);
+
+    if (task.lastLog) {
+      const section = el('div');
+      section.appendChild(el('div', 'modal-section-label', 'Latest log'));
+      section.appendChild(el('div', 'modal-section-body plain', task.lastLog));
+      body.appendChild(section);
+    }
+
+    modal.appendChild(body);
+    titleInput.focus();
+    titleInput.select();
+  }
+
   document.getElementById('detailBackdrop').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) { closeDetail(); }
   });
@@ -1594,7 +2551,7 @@ export class BoardPanel {
   });
 
   let lastSelectedId;
-  let lastGates;
+  let lastSettings;
   window.addEventListener('message', (event) => {
     const msg = event.data;
     if (!msg) { return; }
@@ -1602,25 +2559,48 @@ export class BoardPanel {
       lastSelectedId = msg.selectedTaskId;
       renderTaskSets(msg.snapshot);
       renderBoard(msg.snapshot, lastSelectedId);
+    } else if (msg.type === 'task/reorderResult') {
+      pendingFocusTaskId = msg.taskId;
+      if (msg.result === 'applied' || msg.result === 'no-op') {
+        const position = typeof msg.index === 'number' && msg.index >= 0 ? msg.index + 1 : undefined;
+        const count = typeof msg.count === 'number' ? msg.count : undefined;
+        announceReorder(
+          msg.result === 'no-op'
+            ? (position && count ? msg.taskId + ' is already at position ' + position + ' of ' + count + '.' : 'Task order is unchanged.')
+            : (position && count ? msg.taskId + ' moved to position ' + position + ' of ' + count + '.' : 'Task order updated.'),
+        );
+        focusPendingCard();
+      } else {
+        announceReorder('Task order was not changed because the drop target is no longer valid.');
+        pendingFocusTaskId = null;
+      }
     } else if (msg.type === 'task/detail') {
       renderDetail(msg.task);
-    } else if (msg.type === 'gates/state') {
-      lastGates = msg.gates;
-      renderGates(lastGates);
+    } else if (msg.type === 'task/editError') {
+      const error = document.getElementById('taskEditError');
+      if (error && (!msg.taskId || msg.taskId === editingTaskId)) {
+        error.textContent = msg.error || 'Could not save task changes.';
+        error.hidden = false;
+        error.focus();
+      }
+    } else if (msg.type === 'settings/state') {
+      lastSettings = msg;
+      renderSettings(lastSettings);
     }
   });
 
   const newTaskBackdrop = document.getElementById('newTaskBackdrop');
   const newTaskInput = document.getElementById('newTaskInput');
   const newTaskDescription = document.getElementById('newTaskDescription');
+  const newTaskType = document.getElementById('newTaskType');
 
   function openNewTaskModal() {
     document.getElementById('detailBackdrop').classList.remove('open'); // mutually exclusive with task detail
-    gatesBackdrop.classList.remove('open'); // and with Gates
-    document.getElementById('agentNameBackdrop').classList.remove('open'); // and with Edit agent name
+    settingsBackdrop.classList.remove('open'); // and with Settings
     newTaskBackdrop.classList.add('open');
     newTaskInput.value = '';
     newTaskDescription.value = '';
+    newTaskType.value = 'feature';
     newTaskInput.focus();
   }
   function closeNewTaskModal() {
@@ -1637,7 +2617,9 @@ export class BoardPanel {
     e.preventDefault();
     const title = newTaskInput.value.trim();
     if (!title) { return; }
-    vscode.postMessage({ type: 'task/create', title, description: newTaskDescription.value.trim() });
+    const taskType = newTaskType.value;
+    if (taskType !== 'feature' && taskType !== 'bug') { return; }
+    vscode.postMessage({ type: 'task/create', title, description: newTaskDescription.value.trim(), taskType });
     closeNewTaskModal();
   });
   window.addEventListener('keydown', (e) => {
@@ -1657,66 +2639,70 @@ export class BoardPanel {
     vscode.postMessage({ type: 'taskSet/delete' });
   });
 
-  const gatesBackdrop = document.getElementById('gatesBackdrop');
-  function openGatesModal() {
+  const settingsBackdrop = document.getElementById('settingsBackdrop');
+  const settingsModal = document.getElementById('settingsModal');
+  document.querySelectorAll('.settings-category').forEach((button) => {
+    button.addEventListener('click', () => selectSettingsCategory(button.dataset.category));
+    button.addEventListener('keydown', (event) => {
+      const current = SETTINGS_CATEGORIES.indexOf(button.dataset.category);
+      if (current < 0) { return; }
+      let next = current;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowRight') { next = (current + 1) % SETTINGS_CATEGORIES.length; }
+      if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') { next = (current - 1 + SETTINGS_CATEGORIES.length) % SETTINGS_CATEGORIES.length; }
+      if (event.key === 'Home') { next = 0; }
+      if (event.key === 'End') { next = SETTINGS_CATEGORIES.length - 1; }
+      if (next === current) { return; }
+      event.preventDefault();
+      selectSettingsCategory(SETTINGS_CATEGORIES[next]);
+    });
+  });
+  function closeSettingsModal() {
+    settingsBackdrop.classList.remove('open');
+  }
+  function openSettingsModal(focusColumn) {
     document.getElementById('detailBackdrop').classList.remove('open'); // mutually exclusive with task detail
     newTaskBackdrop.classList.remove('open'); // and with New Task
-    document.getElementById('agentNameBackdrop').classList.remove('open'); // and with Edit agent name
-    gatesBackdrop.classList.add('open');
-    if (lastGates) { renderGates(lastGates); }
+    selectSettingsCategory(focusColumn ? 'agents' : DEFAULT_SETTINGS_CATEGORY, false);
+    settingsBackdrop.classList.add('open');
+    renderSettings(lastSettings || { gates: {}, agents: {} });
+    if (focusColumn) {
+      const input = document.getElementById('agent-input-' + focusColumn);
+      if (input) {
+        input.focus();
+        input.select();
+        return;
+      }
+    }
+    settingsModal.focus();
   }
-  function closeGatesModal() {
-    gatesBackdrop.classList.remove('open');
-  }
-  document.getElementById('gatesToggle').addEventListener('click', openGatesModal);
-  document.getElementById('gatesClose').addEventListener('click', closeGatesModal);
-  gatesBackdrop.addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) { closeGatesModal(); }
+  document.getElementById('settingsToggle').addEventListener('click', () => openSettingsModal());
+  document.getElementById('settingsClose').addEventListener('click', closeSettingsModal);
+  settingsBackdrop.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) { closeSettingsModal(); }
   });
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && gatesBackdrop.classList.contains('open')) { closeGatesModal(); }
-  });
-
-  const agentNameBackdrop = document.getElementById('agentNameBackdrop');
-  const agentNameInput = document.getElementById('agentNameInput');
-  const agentNameSubtitle = document.getElementById('agentNameSubtitle');
-  let editingAgentStage;
-
-  function openAgentNameModal(stage, columnLabel, currentValue) {
-    document.getElementById('detailBackdrop').classList.remove('open'); // mutually exclusive with task detail
-    newTaskBackdrop.classList.remove('open'); // and with New Task
-    gatesBackdrop.classList.remove('open'); // and with Gates
-    editingAgentStage = stage;
-    agentNameSubtitle.textContent = 'Persona ' + columnLabel + ' prompts open with (the @name at the top).';
-    agentNameInput.value = currentValue;
-    agentNameBackdrop.classList.add('open');
-    agentNameInput.focus();
-    agentNameInput.select();
-  }
-  function closeAgentNameModal() {
-    agentNameBackdrop.classList.remove('open');
-    editingAgentStage = undefined;
-  }
-  document.getElementById('agentNameClose').addEventListener('click', closeAgentNameModal);
-  document.getElementById('agentNameCancel').addEventListener('click', closeAgentNameModal);
-  agentNameBackdrop.addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) { closeAgentNameModal(); }
-  });
-  document.getElementById('agentNameReset').addEventListener('click', () => {
-    if (!editingAgentStage) { return; }
-    vscode.postMessage({ type: 'agentName/set', stage: editingAgentStage, value: '' });
-    closeAgentNameModal();
-  });
-  document.getElementById('agentNameForm').addEventListener('submit', (e) => {
-    e.preventDefault();
-    if (!editingAgentStage) { return; }
-    const value = agentNameInput.value.trim();
-    if (!value) { return; }
-    vscode.postMessage({ type: 'agentName/set', stage: editingAgentStage, value });
-    closeAgentNameModal();
-  });
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && agentNameBackdrop.classList.contains('open')) { closeAgentNameModal(); }
+    if (!settingsBackdrop.classList.contains('open')) { return; }
+    if (e.key === 'Escape') {
+      closeSettingsModal();
+      return;
+    }
+    if (e.key !== 'Tab') { return; }
+    const activePanel = settingsModal.querySelector('.settings-panel:not([hidden])');
+    const focusable = Array.from(settingsModal.querySelectorAll('button, input')).filter((node) => {
+      if (node.disabled || node.tabIndex < 0) { return false; }
+      const panel = node.closest('.settings-panel');
+      return !panel || panel === activePanel;
+    });
+    if (!focusable.length) { return; }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!focusable.includes(document.activeElement) || (e.shiftKey && document.activeElement === first)) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
   });
 
   vscode.postMessage({ type: 'board/ready' });

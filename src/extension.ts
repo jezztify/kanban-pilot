@@ -4,6 +4,7 @@ import { BoardPanel } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
 import { ChatSessionExecutor } from './chat/executor';
 import { normalizeMaxParallelTasks, RunManager } from './chat/runManager';
+import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore } from './model/taskStore';
 
@@ -64,10 +65,10 @@ export class WorkspaceTaskSetContext {
 		this.currentStore = new TaskStore(set.directory, set.id);
 		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder);
 		const manager = this.currentRunManager;
-		this.watcher = this.currentStore.watch((taskId) => {
+		this.watcher = this.currentStore.watch((taskId, changeKind) => {
 			this.watcherQueue = this.watcherQueue
-				.then(() => manager.reconcileTaskChange(taskId))
-				.then(() => manager.applyGatePolicies())
+				.then(() => changeKind === 'position-only' ? undefined : manager.reconcileTaskChange(taskId))
+				.then(() => changeKind === 'position-only' ? undefined : manager.applyGatePolicies())
 				.catch(() => undefined);
 		});
 	}
@@ -166,6 +167,29 @@ function context(): WorkspaceTaskSetContext | undefined {
 		workspaceContexts.set(key, workspaceContext);
 	}
 	return workspaceContext;
+}
+
+export interface NewTaskCommandInput {
+	title?: unknown;
+	description?: unknown;
+	taskType?: unknown;
+}
+
+/** Applies the New Task command's final type guard before writing to the store. */
+export async function createTaskFromCommandInput(
+	store: Pick<TaskStore, 'create'>,
+	input: NewTaskCommandInput,
+): Promise<boolean> {
+	const title = typeof input.title === 'string' ? input.title.trim() : '';
+	if (!title || !isTaskType(input.taskType)) {
+		return false;
+	}
+
+	await store.create(title, {
+		type: input.taskType,
+		request: typeof input.description === 'string' ? input.description.trim() : undefined,
+	});
+	return true;
 }
 
 /**
@@ -288,7 +312,21 @@ export function activate(context_: vscode.ExtensionContext) {
 				prompt: 'Description (optional)',
 				placeHolder: 'What needs to happen?',
 			});
-			await ctx.store.create(title.trim(), { request: description?.trim() });
+			const taskType = await vscode.window.showQuickPick<{ label: string; description: string; value: TaskType }>(
+				[
+					{ label: 'Feature', description: 'A new capability or improvement.', value: 'feature' },
+					{ label: 'Bug', description: 'A defect or regression to fix.', value: 'bug' },
+				],
+				{ placeHolder: 'Task type (required)' },
+			);
+			if (!taskType) {
+				return;
+			}
+			await createTaskFromCommandInput(ctx.store, {
+				title,
+				description,
+				taskType: taskType.value,
+			});
 		}),
 
 		vscode.commands.registerCommand('kanban-pilot.createTaskSet', async () => {
@@ -467,19 +505,19 @@ export function activate(context_: vscode.ExtensionContext) {
 			}
 			await ctx.ready;
 
-			const samples: [string, string][] = [
-				['Set up billing webhook', 'backlog'],
-				['Draft onboarding email flow', 'refine'],
-				['Audit mobile empty state', 'scoped'],
-				['Document retry behavior', 'approved'],
-				['Refine task', 'in-progress'],
-				['Ship changelog entry', 'validation'],
-				['Write API docs', 'done'],
+			const samples: [string, string, TaskType][] = [
+				['Set up billing webhook', 'backlog', 'feature'],
+				['Draft onboarding email flow', 'refine', 'feature'],
+				['Audit mobile empty state', 'scoped', 'bug'],
+				['Document retry behavior', 'approved', 'feature'],
+				['Refine task', 'in-progress', 'feature'],
+				['Ship changelog entry', 'validation', 'feature'],
+				['Write API docs', 'done', 'feature'],
 			];
 
-			for (const [title, state] of samples) {
-				const task = await ctx.store.create(title);
-				await ctx.store.patch(task.id, { state });
+			for (const [title, state, type] of samples) {
+				const task = await ctx.store.create(title, { type });
+				await ctx.store.auditedPatch(task.id, { state }, { action: 'seed-sample-tasks' });
 			}
 
 			void vscode.window.showInformationMessage(`Seeded ${samples.length} tasks.`);

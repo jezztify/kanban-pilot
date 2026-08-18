@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -228,7 +228,7 @@
         "kanbanPilot.chat.agentNames": {
           "type": "object",
           "default": {},
-          "description": "Per-stage overrides for the persona name each prompt opens with (@name). Keys: refine, develop, validate — split reuses refine's. Missing/empty keys fall back to the built-in defaults (Bro Refiner / Bro Coder / Bro QA). Editable from the board via each column's Agent edit icon."
+          "description": "Per-column agent assignment labels used at the start of runnable prompts (@name). Keys: backlog, refine, scoped, approved, in-progress, validation, done. Defaults: None for resting columns, Bro Refiner for Refine, Bro Coder for In Progress, and Bro QA for Validation; split uses Refine's assignment. Missing/empty column keys fall back to these defaults. Legacy refine/develop/validate stage keys remain supported as fallbacks. Editable from the board's Settings surface."
         },
         "kanbanPilot.run.timeoutMinutes": {
           "type": "number",
@@ -280,6 +280,7 @@
     "vsix": "vsce package -o dist/"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
     "@types/vscode": "^1.125.0",
@@ -287,6 +288,7 @@
     "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.9.2",
     "eslint": "^10.5.0",
+    "jsdom": "^30.0.1",
     "ts-loader": "^9.6.2",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1",
