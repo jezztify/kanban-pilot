@@ -125,6 +125,27 @@ function okReceiptWithProposals(
 	};
 }
 
+/** Writes the receipt first, then appends proposals in a later task-file write. */
+function okReceiptThenProposals(
+	store: TaskStore,
+	stage: 'develop' | 'validate' | 'split',
+	titles: string[],
+	delayMs = 300,
+) {
+	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
+		const runId = runIdFromPrompt(prompt);
+		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result: 'ok', note: 'receipt first' }));
+		setTimeout(() => {
+			void (async () => {
+				for (const title of titles) {
+					await store.appendLog(t.id, `- propose-task run:${runId} title:"${title}" note:"written after receipt"`);
+				}
+			})();
+		}, delayMs);
+		return { ok: true, sessionId: 's1' };
+	};
+}
+
 suite('M3 RunManager', () => {
 	let store: TaskStore;
 	let dir: vscode.Uri;
@@ -993,6 +1014,44 @@ suite('M3 RunManager', () => {
 			assert.ok(executor.calls[0].prompt.includes(`## [${folder.name} ${task.id}]`), 'missing the [project task] banner (§6.9)');
 			assert.ok(executor.calls[0].prompt.startsWith('@Bro Refiner\n'), '@agentName must open the message');
 		});
+
+		test('passes only the active task images after the Markdown file and adds image guidance', async () => {
+			const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+			const task = await store.create('Inspect the supplied screenshot', {
+				request: 'Review the screenshot.',
+				attachments: {
+					add: [{ id: 'screenshot', name: 'screenshot.png', mimeType: 'image/png', data: png }],
+				},
+			});
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(() => executor.calls.length > 0);
+
+			assert.strictEqual(executor.calls[0].options.attachmentUris?.length, 1);
+			assert.ok(executor.calls[0].options.attachmentUris?.[0].path.endsWith('/TASK-001.attachments/screenshot.png'));
+			assert.ok(executor.calls[0].prompt.includes('attached after it are also task input and read-only context'));
+		});
+
+		test('appends image guidance to a user-owned custom prompt template', async () => {
+			const promptDirectory = vscode.Uri.joinPath(folder.uri, '.kanban-pilot', 'prompts');
+			await vscode.workspace.fs.createDirectory(promptDirectory);
+			await vscode.workspace.fs.writeFile(
+				vscode.Uri.joinPath(promptDirectory, 'refine.md'),
+				Buffer.from('@{{agentName}}\ncustom prompt for {{id}}', 'utf8'),
+			);
+			const task = await store.create('Custom prompt image context');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(() => executor.calls.length > 0);
+
+			assert.ok(executor.calls[0].prompt.includes('read-only context'));
+		});
 	});
 
 	test('normalizes invalid timeout values while preserving positive fractional minutes', () => {
@@ -1263,6 +1322,111 @@ suite('M3 RunManager', () => {
 				await cfg.update('chat.allowTaskProposals', undefined, vscode.ConfigurationTarget.Global);
 			}
 		});
+
+		test('a develop proposal written after its receipt is recovered by the bounded backstop', async () => {
+			const task = await store.create('Recover a late develop proposal');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptThenProposals(store, 'develop', ['Written after develop receipt'])),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			await waitUntilSettled(store, task.id);
+			await waitUntil(async () => (await store.readAll()).tasks.some((candidate) => candidate.title === 'Written after develop receipt'));
+
+			const { tasks } = await store.readAll();
+			assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Written after develop receipt').length, 1);
+			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Written after develop receipt')?.originTask, task.id);
+		});
+
+		test('a validate proposal written after its receipt is recovered during task-change reconciliation', async () => {
+			const task = await store.create('Recover a late validate proposal');
+			await store.patch(task.id, { state: 'validation', status: 'idle' });
+			let runId = '';
+			const executor = new StubExecutor(async (t, prompt) => {
+				runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'validate', result: 'ok', note: 'receipt first' }));
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'validate');
+			await waitUntilSettled(store, task.id);
+			await store.appendLog(task.id, `- propose-task run:${runId} title:"Written after validate receipt" note:"separate watcher event"`);
+			await runManager.reconcileTaskChange(task.id);
+			await runManager.reconcileTaskChange(task.id);
+
+			const { tasks } = await store.readAll();
+			assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Written after validate receipt').length, 1);
+			assert.strictEqual(tasks.find((candidate) => candidate.title === task.title)?.state, 'done');
+		});
+
+		test('activation reconciliation drains an already-settled proposal in the active task set', async () => {
+			const namedDir = vscode.Uri.joinPath(dir, 'task-sets', 'set-proposals', 'tasks');
+			const namedStore = new TaskStore(namedDir, 'set-proposals');
+			await namedStore.ensureDirectory();
+			const task = await namedStore.create('Recover proposal after reload');
+			const runId = 'r-activation-proposal';
+			await namedStore.auditedPatch(
+				task.id,
+				{ state: 'in-progress', status: 'running', run: runId },
+				{
+					action: 'develop',
+					runId,
+					events: [{ kind: 'activity-start', stage: 'develop', action: 'develop', runId }],
+				},
+			);
+			await namedStore.appendLog(task.id, formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'reload recovery' }));
+			await namedStore.auditedPatch(
+				task.id,
+				{ state: 'validation', status: 'idle', run: undefined },
+				{
+					action: 'receipt',
+					runId,
+					outcome: 'ok',
+					events: [{ kind: 'activity-finish', stage: 'develop', runId, outcome: 'ok' }],
+				},
+			);
+			await namedStore.appendLog(task.id, `- propose-task run:${runId} title:"Recovered named child" note:"written after reload"`);
+
+			const reloadedManager = new RunManager(namedStore, new StubExecutor(() => 'hang'), folder);
+			await reloadedManager.reconcileOnActivation();
+			await reloadedManager.reconcileTaskChange(task.id);
+
+			const namedTasks = (await namedStore.readAll()).tasks;
+			assert.strictEqual(namedTasks.filter((candidate) => candidate.title === 'Recovered named child').length, 1);
+			assert.strictEqual((await store.readAll()).tasks.length, 0, 'the legacy Default task folder must remain untouched');
+		});
+
+		test('a post-receipt child-write failure is recorded instead of being swallowed', async () => {
+			const task = await store.create('Surface late proposal failure');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const failingRename: vscode.FileSystem['rename'] = async (source, target, options) => {
+				if (target.path.endsWith('/TASK-002.md')) {
+					throw new Error('injected late child write failure');
+				}
+				return vscode.workspace.fs.rename(source, target, options);
+			};
+			const failingStore = new TaskStore(dir, 'default', failingRename);
+			const runManager = new RunManager(
+				failingStore,
+				new StubExecutor(okReceiptThenProposals(failingStore, 'develop', ['Cannot persist this child'])),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			await waitUntilSettled(failingStore, task.id);
+			await waitUntil(async () => {
+				const current = (await failingStore.readAll()).tasks.find((candidate) => candidate.id === task.id);
+				return current?.sections['Log'].includes('proposal-error') === true;
+			});
+
+			const current = (await failingStore.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.ok(current.sections['Log'].includes('injected late child write failure'));
+			assert.strictEqual((await failingStore.readAll()).tasks.some((candidate) => candidate.title === 'Cannot persist this child'), false);
+		});
 	});
 
 	suite('split stage (§6.14)', () => {
@@ -1336,22 +1500,33 @@ suite('M3 RunManager', () => {
 
 		test('receipt observed before proposals waits for the separate proposal write', async () => {
 			const task = await store.create('Reconcile split write ordering');
-			const executor = new StubExecutor(async (t, prompt) => {
-				const runId = runIdFromPrompt(prompt);
-				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'split', result: 'ok', note: 'receipt first' }));
-				setTimeout(() => {
-					void store.appendLog(t.id, `- propose-task run:${runId} title:"Written after receipt" note:"separate watcher event"`);
-				}, 25);
-				return { ok: true, sessionId: 's1' };
-			});
-			const runManager = new RunManager(store, executor, folder);
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptThenProposals(store, 'split', ['Written after receipt'], 300)),
+				folder,
+			);
 
 			await runManager.handleAction(task.id, 'split');
-			const after = await waitUntilSettled(store, task.id);
+			await waitUntil(async () => {
+				const current = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+				return current?.state === 'done' && current.status === 'idle' && !current.run && !current.pendingOutcome;
+			});
+
 			const { tasks } = await store.readAll();
+			const after = tasks.find((candidate) => candidate.id === task.id)!;
+			const children = tasks.filter((candidate) => candidate.originTask === task.id);
 
 			assert.strictEqual(after.state, 'done');
-			assert.strictEqual(tasks.filter((candidate) => candidate.originTask === task.id).length, 1);
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(after.pendingOutcome, undefined);
+			assert.strictEqual(children.length, 1);
+			assert.strictEqual(children[0].title, 'Written after receipt');
+
+			await runManager.reconcileTaskChange(task.id);
+			await runManager.reconcileTaskChange(task.id);
+			const afterRepeatedReconciliation = (await store.readAll()).tasks;
+			assert.strictEqual(afterRepeatedReconciliation.filter((candidate) => candidate.originTask === task.id).length, 1);
 		});
 
 		test('a successful split with no usable proposals remains retryably blocked', async () => {
@@ -1719,6 +1894,49 @@ suite('M3 RunManager', () => {
 		assert.strictEqual(secondExecutor.calls.length, 0, 'capacity denial must not invoke the executor');
 	});
 
+	test('a second Develop run uses the remaining slot, while a third waits until capacity is released', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const first = await store.create('First Develop run');
+			const second = await store.create('Second Develop run');
+			const third = await store.create('Queued Develop run');
+			for (const task of [first, second, third]) {
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+			}
+			const firstExecutor = new StubExecutor(() => 'hang');
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const thirdExecutor = new StubExecutor(() => 'hang');
+			const firstManager = new RunManager(store, firstExecutor, folder);
+			const secondManager = new RunManager(store, secondExecutor, folder);
+			const thirdManager = new RunManager(store, thirdExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'develop');
+			await waitUntil(() => firstExecutor.calls.length === 1);
+			await secondManager.handleAction(second.id, 'develop');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+
+			let after = await store.readAll();
+			const firstAfter = after.tasks.find((task) => task.id === first.id)!;
+			const secondAfter = after.tasks.find((task) => task.id === second.id)!;
+			assert.strictEqual(firstAfter.status, 'running');
+			assert.strictEqual(secondAfter.status, 'running');
+			assert.ok(firstAfter.run);
+			assert.ok(secondAfter.run);
+			assert.notStrictEqual(firstAfter.run, secondAfter.run);
+
+			await thirdManager.handleAction(third.id, 'develop');
+			after = await store.readAll();
+			const thirdAfter = after.tasks.find((task) => task.id === third.id)!;
+			assert.strictEqual(thirdAfter.state, 'approved');
+			assert.strictEqual(thirdAfter.status, 'idle');
+			assert.strictEqual(thirdAfter.run, undefined);
+			assert.strictEqual(thirdExecutor.calls.length, 0);
+
+			await firstManager.handleAction(first.id, 'stop');
+			await thirdManager.handleAction(third.id, 'develop');
+			await waitUntil(() => thirdExecutor.calls.length === 1);
+		});
+	});
+
 	test('identical task ids in different sets use independent reservations and chats', async () => {
 		await withMaxParallelTasks(1, async () => {
 			const firstStore = new TaskStore(vscode.Uri.joinPath(dir, 'first'), 'set-first');
@@ -1916,6 +2134,33 @@ suite('M3 RunManager', () => {
 				assert.strictEqual(after.tasks.filter((task) => task.status === 'running').length, 2);
 				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.state, 'approved');
 				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.status, 'idle');
+			} finally {
+				await cfg.update('gates.approvedToInProgress', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+	});
+
+	test('the Approved auto gate uses a remaining capacity slot while another Develop run is active', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('gates.approvedToInProgress', 'auto', vscode.ConfigurationTarget.Global);
+			try {
+				const running = await store.create('Already running Develop');
+				const queued = await store.create('Automatically start Develop');
+				await store.patch(running.id, { state: 'approved', status: 'idle' });
+				await store.patch(queued.id, { state: 'approved', status: 'idle' });
+				const runningExecutor = new StubExecutor(() => 'hang');
+				const queuedExecutor = new StubExecutor(() => 'hang');
+				const runningManager = new RunManager(store, runningExecutor, folder);
+				const queuedManager = new RunManager(store, queuedExecutor, folder);
+
+				await runningManager.handleAction(running.id, 'develop');
+				await waitUntil(() => runningExecutor.calls.length === 1);
+				await queuedManager.applyGatePolicies();
+				await waitUntil(() => queuedExecutor.calls.length === 1);
+
+				const after = await store.readAll();
+				assert.strictEqual(after.tasks.find((task) => task.id === queued.id)?.status, 'running');
 			} finally {
 				await cfg.update('gates.approvedToInProgress', undefined, vscode.ConfigurationTarget.Global);
 			}

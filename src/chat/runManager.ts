@@ -13,7 +13,7 @@ import { parseAuditEvents } from '../model/taskLog';
 import type { AuditEventInput, AuditOutcome, AuditStage } from '../model/taskLog';
 import { AgentNameOverrides, resolveAgentName } from './agentNames';
 import { Executor, ExecutorResult } from './executor';
-import { loadPromptTemplate, renderTemplate } from './promptTemplates';
+import { TASK_ATTACHMENT_CONTEXT, loadPromptTemplate, renderTemplate } from './promptTemplates';
 import { proposalFingerprint, proposalsForRun } from './proposals';
 import type { Proposal } from './proposals';
 import { findReceipt, formatReceipt, parseReceipts, Receipt, ReceiptResult, Stage } from './receipt';
@@ -34,6 +34,9 @@ const RECEIPT_GRACE_MS = 250;
 const RECEIPT_POLL_MS = 10;
 const LATE_RECEIPT_INITIAL_DELAY_MS = 500;
 const LATE_RECEIPT_GRACE_MS = 5_000;
+const POST_RECEIPT_PROPOSAL_INITIAL_DELAY_MS = 50;
+const POST_RECEIPT_PROPOSAL_POLL_MS = 50;
+const POST_RECEIPT_PROPOSAL_GRACE_MS = 5_000;
 const LATE_RECEIPT_MARKER = 'awaiting late receipt';
 const appliedReceiptKeys = new Set<string>();
 const inFlightReceiptKeys = new Set<string>();
@@ -110,13 +113,17 @@ class RunConcurrencyCoordinator {
 		return this.admission.run(async () => {
 			const { tasks } = await this.store.readAll();
 			this.syncActive(tasks);
-			const persistedRunning = tasks.filter(
-				(task) => task.status === 'running' && (!task.run || !this.active.has(this.key(task.id, task.run))),
-			).length;
+			const occupiedReservations = new Set([
+				...this.pending,
+				...this.active,
+				...tasks
+					.filter((task) => task.status === 'running')
+					.map((task) => this.key(task.id, task.run ?? 'persisted')),
+			]);
 			const reservationKey = this.key(taskId, runId);
 			if (
 				this.hasReservationForTask(taskId) ||
-				persistedRunning + this.active.size + this.pending.size >= maxParallelTasks
+				occupiedReservations.size >= maxParallelTasks
 			) {
 				return false;
 			}
@@ -375,6 +382,7 @@ export async function closeTaskChatTabs(sessionUri: vscode.Uri, tabGroups: TabGr
 
 export class RunManager {
 	private readonly concurrency: RunConcurrencyCoordinator;
+	private readonly postReceiptProposalRuns = new Set<string>();
 
 	constructor(
 		private readonly store: TaskStore,
@@ -573,6 +581,7 @@ export class RunManager {
 		}
 
 		await this.reconcileLateReceipts();
+		await this.reconcileOrdinaryProposals();
 		await this.reconcilePendingOutcomes();
 	}
 
@@ -580,6 +589,7 @@ export class RunManager {
 	async reconcileTaskChange(taskId?: string): Promise<void> {
 		await this.concurrency.reconcile();
 		await this.reconcileLateReceipts(taskId);
+		await this.reconcileOrdinaryProposals(taskId);
 		await this.reconcilePendingOutcomes(taskId);
 	}
 
@@ -730,7 +740,8 @@ export class RunManager {
 				stage === 'develop' && !!task.scopeHash && task.scopeHash !== hashScope(currentScope);
 
 			const template = await loadPromptTemplate(this.workspaceFolder, stage);
-			const prompt = renderTemplate(template, {
+			const attachmentUris = await this.store.attachmentUrisForTask(task.id);
+			const renderedPrompt = renderTemplate(template, {
 				id: task.id,
 				title: task.title,
 				agentName: resolveAgentName(stage, cfg.agentNames),
@@ -739,8 +750,12 @@ export class RunManager {
 				request: task.sections['Request'] ?? '',
 				refined: task.sections['Refined'] ?? '',
 				scope: currentScope,
+				taskFilePath: this.store.fileFor(task.id).fsPath,
 				scopeEdited,
 			});
+			const prompt = renderedPrompt.includes('Any image files attached after it are also task input')
+				? renderedPrompt
+				: `${renderedPrompt.trimEnd()}\n${TASK_ATTACHMENT_CONTEXT}`;
 
 			const timeoutMs = cfg.timeoutMinutes * 60_000;
 			const outcome = await raceWithTimeout(
@@ -749,6 +764,7 @@ export class RunManager {
 					sessionPrefix: cfg.sessionPrefix,
 					toolsIncludeForRefine: cfg.toolsIncludeForRefine,
 					toolsExclude: cfg.toolsExclude,
+					attachmentUris,
 					openBeside,
 					modelSelector: cfg.modelSelector,
 				}),
@@ -796,6 +812,167 @@ export class RunManager {
 				late.receipt,
 				(candidate) => this.isLateReceiptCandidate(candidate, late.marker, late.receipt),
 			);
+		}
+	}
+
+	/**
+	 * Finds settled Develop/Validate receipts whose optional proposals were not
+	 * visible during the first receipt pass. The activity audit pair is the
+	 * durable run identity: it prevents a receipt from an older run, or a
+	 * hand-written unrelated receipt, from being replayed after a later retry.
+	 */
+	private async reconcileOrdinaryProposals(taskId?: string): Promise<void> {
+		if (!readConfig().allowTaskProposals) {
+			return;
+		}
+
+		const { tasks } = await this.store.readAll();
+		for (const task of tasks) {
+			if ((taskId && task.id !== taskId) || task.run) {
+				continue;
+			}
+
+			const seenRuns = new Set<string>();
+			for (const receipt of [...parseReceipts(task.sections['Log'] ?? '')].reverse()) {
+				if (
+					receipt.taskId !== task.id ||
+					!STAGES_THAT_MAY_PROPOSE.has(receipt.stage) ||
+					seenRuns.has(`${receipt.runId}:${receipt.stage}`)
+				) {
+					continue;
+				}
+				seenRuns.add(`${receipt.runId}:${receipt.stage}`);
+				if (!this.isSettledOrdinaryReceiptCurrent(task, receipt)) {
+					continue;
+				}
+
+				await this.processOrdinaryProposals(
+					task.id,
+					receipt.runId,
+					receipt.stage,
+					(candidate) => this.isSettledOrdinaryReceiptCurrent(candidate, receipt),
+				);
+			}
+		}
+	}
+
+	private isSettledOrdinaryReceiptCurrent(task: Task, receipt: Receipt): boolean {
+		if (
+			task.run ||
+			receipt.taskId !== task.id ||
+			!STAGES_THAT_MAY_PROPOSE.has(receipt.stage)
+		) {
+			return false;
+		}
+
+		const events = parseAuditEvents(task.sections['Log'] ?? '');
+		const latestStart = [...events].reverse().find(
+			(event) =>
+				event.kind === 'activity-start' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage,
+		);
+		if (!latestStart || latestStart.runId !== receipt.runId) {
+			return false;
+		}
+
+		return events.some(
+			(event) =>
+				event.kind === 'activity-finish' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage &&
+				event.runId === receipt.runId &&
+				event.outcome === receipt.result,
+		);
+	}
+
+	/** Processes one settled ordinary run without reapplying its parent outcome. */
+	private async processOrdinaryProposals(
+		taskId: string,
+		runId: string,
+		stage: Stage,
+		isCurrent: (task: Task) => boolean,
+	): Promise<void> {
+		const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+		if (!task || !isCurrent(task)) {
+			return;
+		}
+
+		const logSection = task.sections['Log'] ?? '';
+		if (proposalsForRun(logSection, runId).length === 0) {
+			return;
+		}
+
+		try {
+			const result = await this.processProposals(task, runId, logSection);
+			if (result.persisted !== result.accepted) {
+				throw new Error(
+					`only ${result.persisted} of ${result.accepted} proposals are persisted in the active task set`,
+				);
+			}
+		} catch (error) {
+			await this.recordProposalError(taskId, runId, stage, error);
+		}
+	}
+
+	/** Records a retryable proposal failure once per exact error in the parent log. */
+	private async recordProposalError(taskId: string, runId: string, stage: Stage, error: unknown): Promise<void> {
+		const note = (error instanceof Error ? error.message : String(error))
+			.replace(/[\r\n"]+/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim() || 'unknown proposal reconciliation error';
+		const line = `- proposal-error run:${runId} task:${taskId} stage:${stage} note:"${note}"`;
+
+		await this.concurrency.runExclusive(async () => {
+			const current = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+			if (!current || (current.sections['Log'] ?? '').includes(line)) {
+				return;
+			}
+			await this.store.appendLog(taskId, line);
+		});
+	}
+
+	/** Starts a bounded recovery window after an ordinary receipt is applied. */
+	private schedulePostReceiptProposalRecovery(taskId: string, runId: string, stage: Stage): void {
+		const key = `${this.store.setId}:${taskId}:${runId}:${stage}`;
+		if (this.postReceiptProposalRuns.has(key)) {
+			return;
+		}
+
+		this.postReceiptProposalRuns.add(key);
+		void this.reconcilePostReceiptProposalsUntilDeadline(taskId, runId, stage).finally(() => {
+			this.postReceiptProposalRuns.delete(key);
+		});
+	}
+
+	private async reconcilePostReceiptProposalsUntilDeadline(taskId: string, runId: string, stage: Stage): Promise<void> {
+		await wait(POST_RECEIPT_PROPOSAL_INITIAL_DELAY_MS);
+		const deadline = Date.now() + POST_RECEIPT_PROPOSAL_GRACE_MS;
+
+		for (;;) {
+			const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+			if (!task || task.run || !readConfig().allowTaskProposals) {
+				return;
+			}
+
+			const receipt = [...parseReceipts(task.sections['Log'] ?? '')]
+				.reverse()
+				.find((candidate) => candidate.runId === runId && candidate.taskId === taskId && candidate.stage === stage);
+			if (!receipt || !this.isSettledOrdinaryReceiptCurrent(task, receipt)) {
+				return;
+			}
+
+			await this.processOrdinaryProposals(
+				taskId,
+				runId,
+				stage,
+				(candidate) => this.isSettledOrdinaryReceiptCurrent(candidate, receipt),
+			);
+
+			if (Date.now() >= deadline) {
+				return;
+			}
+			await wait(Math.min(POST_RECEIPT_PROPOSAL_POLL_MS, deadline - Date.now()));
 		}
 	}
 
@@ -943,7 +1120,7 @@ export class RunManager {
 				if (!latest || !isCurrent(latest)) {
 					return;
 				}
-				await this.processProposals(latest, runId, latest.sections['Log'] ?? '');
+				await this.processOrdinaryProposals(taskId, runId, stage, isCurrent);
 			}
 
 			const fresh = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
@@ -964,6 +1141,9 @@ export class RunManager {
 				},
 			);
 			appliedReceiptKeys.add(key);
+			if (STAGES_THAT_MAY_PROPOSE.has(stage) && readConfig().allowTaskProposals) {
+				this.schedulePostReceiptProposalRecovery(taskId, runId, stage);
+			}
 		} finally {
 			inFlightReceiptKeys.delete(key);
 		}
@@ -1318,6 +1498,10 @@ export class RunManager {
 	}
 
 	private async processProposals(task: Task, runId: string, logSection: string): Promise<ProposalProcessingResult> {
+		return this.concurrency.runExclusive(() => this.processProposalsWithinLock(task, runId, logSection));
+	}
+
+	private async processProposalsWithinLock(task: Task, runId: string, logSection: string): Promise<ProposalProcessingResult> {
 		const proposals = proposalsForRun(logSection, runId)
 			.map((proposal) => {
 				const type = proposal.type ?? task.type;

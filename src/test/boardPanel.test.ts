@@ -293,6 +293,30 @@ suite('BoardPanel Settings', () => {
 		const board = new constructor(panel, host);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		try {
+			const headerMarkup = /<header>([\s\S]*?)<\/header>/.exec(panel.webview.html)?.[0];
+			assert.ok(headerMarkup, 'header markup is present');
+			let previousControlOffset = -1;
+			for (const id of [
+				'taskSetSelect',
+				'taskSetCreate',
+				'taskSetRename',
+				'taskSetDelete',
+				'settingsToggle',
+				'newTaskToggle',
+			]) {
+				const controlOffset = headerMarkup.indexOf(`id="${id}"`);
+				assert.ok(controlOffset > previousControlOffset, `${id} remains in header source order`);
+				previousControlOffset = controlOffset;
+			}
+			const stylesheet = /<style[^>]*>([\s\S]*?)<\/style>/.exec(panel.webview.html)?.[1];
+			assert.ok(stylesheet, 'inline board stylesheet is present');
+			assert.match(stylesheet, /header\s*\{[\s\S]*?min-width:\s*0;/);
+			assert.match(stylesheet, /\.header-actions\s*\{[\s\S]*?min-width:\s*0;/);
+			assert.match(stylesheet, /\.task-set-controls\s*\{[\s\S]*?min-width:\s*0;/);
+			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?header\s*\{[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
+			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?\.header-actions\s*\{[\s\S]*?flex:\s*1 1 100%;[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
+			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?\.task-set-controls\s*\{[\s\S]*?flex:\s*1 1 100%;[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
+			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?\.task-set-select\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?max-width:\s*100%;[\s\S]*?\}/);
 			assert.ok(panel.webview.html.includes('id="settingsToggle"'));
 			assert.ok(panel.webview.html.includes('id="settingsBackdrop"'));
 			assert.ok(panel.webview.html.includes('settings/state'));
@@ -789,6 +813,152 @@ suite('BoardPanel Settings', () => {
 			/* already gone */
 		}
 	}
+	});
+
+	test('captures pasted images in the New Task description without intercepting text', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-paste-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-paste-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardPasteTest',
+			'Kanban Pilot Paste Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
+		const board = new constructor(panel, host);
+		let dom: JSDOM | undefined;
+		try {
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({
+							postMessage() {},
+						}),
+					});
+				},
+			});
+			dispatchWebviewMessage(dom, { type: 'newTask/open' });
+			const description = dom.window.document.getElementById('newTaskDescription') as HTMLTextAreaElement;
+			const shelf = dom.window.document.getElementById('newTaskAttachments');
+			assert.ok(shelf);
+			description.focus();
+
+			const dispatchPaste = (item: { kind: string; type: string; getAsFile(): unknown }) => {
+				const event = new dom!.window.Event('paste', { bubbles: true, cancelable: true });
+				Object.defineProperty(event, 'clipboardData', { value: { items: [item] } });
+				description.dispatchEvent(event);
+				return event;
+			};
+			const flushFileReader = async () => {
+				await new Promise<void>((resolve) => dom!.window.setTimeout(resolve, 0));
+				await new Promise<void>((resolve) => dom!.window.setTimeout(resolve, 0));
+			};
+
+			const firstFile = new dom.window.File(['first image'], 'first.png', { type: 'image/png' });
+			const firstPaste = dispatchPaste({
+				kind: 'file',
+				type: firstFile.type,
+				getAsFile: () => firstFile,
+			});
+			assert.strictEqual(firstPaste.defaultPrevented, true);
+			await flushFileReader();
+			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 1);
+			assert.match(description.value, /!\[first\.png\]\(attachment:\/\/image-[^)]+\)/);
+			assert.strictEqual(shelf.querySelector('img')?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
+
+			const clipboardTypedFile = new dom.window.File(['clipboard image'], 'clipboard.png', { type: '' });
+			const clipboardTypedPaste = dispatchPaste({
+				kind: 'file',
+				type: 'image/png',
+				getAsFile: () => clipboardTypedFile,
+			});
+			assert.strictEqual(clipboardTypedPaste.defaultPrevented, true);
+			await flushFileReader();
+			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 2);
+			assert.match(description.value, /!\[clipboard\.png\]\(attachment:\/\/image-[^)]+\)/);
+			assert.strictEqual(shelf.querySelectorAll('img')[1]?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
+
+			const clipboardPng = new dom.window.File(['converted clipboard image'], 'clipboard.png', { type: 'image/png' });
+			Object.defineProperty(dom.window.navigator, 'clipboard', {
+				configurable: true,
+				value: {
+					read: async () => [{
+						types: ['image/tiff', 'image/png'],
+						getType: async (type: string) => {
+							assert.strictEqual(type, 'image/png');
+							return clipboardPng;
+						},
+					}],
+				},
+			});
+			const tiffPaste = dispatchPaste({
+				kind: 'file',
+				type: 'image/png',
+				getAsFile: () => null,
+			});
+			assert.strictEqual(tiffPaste.defaultPrevented, true);
+			await flushFileReader();
+			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 3);
+			assert.match(description.value, /!\[clipboard\.png\]\(attachment:\/\/image-[^)]+\)/);
+			assert.strictEqual(shelf.querySelectorAll('img')[2]?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
+
+			const secondFile = new dom.window.File(['second image'], 'second.png', { type: 'image/png' });
+			dispatchPaste({
+				kind: 'file',
+				type: secondFile.type,
+				getAsFile: () => secondFile,
+			});
+			await flushFileReader();
+			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 4);
+			assert.match(description.value, /!\[second\.png\]\(attachment:\/\/image-[^)]+\)/);
+
+			description.value = 'Keep this text';
+			description.addEventListener('paste', (event) => {
+				if (!event.defaultPrevented) {
+					description.value += ' pasted text';
+				}
+			});
+			const textPaste = dispatchPaste({
+				kind: 'string',
+				type: 'text/plain',
+				getAsFile: () => null,
+			});
+			assert.strictEqual(textPaste.defaultPrevented, false);
+			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 4);
+			assert.strictEqual(description.value, 'Keep this text pasted text');
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
 	});
 
 	test('defines the same nine gate rows used by the Settings protocol', () => {

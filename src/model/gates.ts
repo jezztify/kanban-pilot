@@ -117,7 +117,7 @@ const GATE_DEFINITIONS = [
 		id: 'approvedToInProgress',
 		settingKey: 'gates.approvedToInProgress',
 		label: 'Approved → In Progress',
-		description: 'Start development on the next Approved task once nothing else is running.',
+		description: 'Start development on an Approved task while the shared run-capacity limit has room.',
 		defaultPolicy: 'manual',
 		kind: 'stage-start',
 		source: 'approved',

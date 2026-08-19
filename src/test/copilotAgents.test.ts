@@ -100,7 +100,7 @@ suite('Copilot custom-agent discovery', () => {
 		const locations = resolveCopilotAgentLocations({
 			workspaceFolders: [first, second],
 			additionalLocations: { '~/.shared-agents': true, 'relative-agents': true },
-			userHome: 'C:\\Users\\tester',
+			userHome: path.join(os.tmpdir(), 'kanban-pilot-no-agents-home'),
 			userAgentsDirectory: vscode.Uri.file(path.join(os.tmpdir(), 'kanban-pilot-no-agents-user')),
 		});
 		assert.strictEqual(locations.filter((location) => location.source === 'workspace').length, 2);

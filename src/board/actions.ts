@@ -308,7 +308,7 @@ export async function deleteTask(
 		return false;
 	}
 
-	await vscode.workspace.fs.delete(store.fileFor(taskId));
+	await store.delete(taskId);
 	return true;
 }
 

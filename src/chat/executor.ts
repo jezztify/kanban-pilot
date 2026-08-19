@@ -16,6 +16,8 @@ export interface RunOptions {
 	sessionPrefix: string;
 	toolsIncludeForRefine: string[];
 	toolsExclude: string[];
+	/** Validated task-local image files, appended after the Markdown task file. */
+	attachmentUris?: readonly vscode.Uri[];
 	/** Open the task session beside the board before injecting this action's prompt. */
 	openBeside?: boolean;
 	modelSelector?: { id?: string; vendor?: string };
@@ -32,6 +34,14 @@ export interface Executor {
 	isAvailable(): Promise<boolean>;
 	/** Opens the task's session and injects `prompt`, resolving at terminal state. */
 	run(task: Task, taskFileUri: vscode.Uri, prompt: string, stage: Stage, options: RunOptions): Promise<ExecutorResult>;
+}
+
+/** Copilot receives the Markdown task first, followed by images in reference order. */
+export function orderedTaskChatAttachments(
+	taskFileUri: vscode.Uri,
+	attachmentUris: readonly vscode.Uri[] = [],
+): vscode.Uri[] {
+	return [taskFileUri, ...attachmentUris];
 }
 
 interface ChatAgentResultish {
@@ -136,7 +146,7 @@ export class ChatSessionExecutor implements Executor {
 					query: prompt,
 					mode: options.mode,
 					blockOnResponse: true,
-					attachFiles: [taskFileUri],
+					attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
 					toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
 					toolsExclude: options.toolsExclude,
 					...(options.modelSelector && Object.keys(options.modelSelector).length

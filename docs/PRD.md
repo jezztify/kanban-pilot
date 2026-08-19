@@ -387,6 +387,18 @@ failed save leaves the editor open and surfaces a visible error; Cancel, close, 
 dismissal, and Escape discard unsaved values. A successful save refreshes the card and detail
 from disk without invoking the state machine, starting or stopping a run, or creating a receipt.
 
+Task-local images are referenced from the Request, Refined, or Scope Markdown with a generated
+relative path such as `TASK-142.attachments/browser-screenshot.png`. The extension stores those
+files beside the task Markdown in the active task-set directory; named sets therefore use
+`.kanban-pilot/task-sets/<stable-id>/tasks/TASK-142.attachments`, while the immutable Default set
+continues to use `kanbanPilot.tasksDir`. The board accepts PNG, JPEG, GIF, and WebP files up to
+10 MiB, verifies both the declared type and magic bytes, rejects SVG and path traversal, and
+never stores binary data in frontmatter or `## Log`. New Task and Edit task stage files in the
+webview until a successful atomic Markdown-plus-binary save. Cancel, Escape, backdrop dismissal,
+and a failed save do not write or delete files; explicit removal deletes the corresponding task
+asset in the same serialized mutation. Existing references are resubmitted unchanged by the
+editor so ordinary edits preserve them. Deleting a task removes only its own attachment directory.
+
 **Correction, found via live testing (2026-08-13):** "agent is never asked to touch it" used to
 be aspirational, not enforced — nothing in the prompt actually said so. A live develop run wrote
 a well-formed `## Log` receipt (`result:ok`) *and*, unprompted, also rewrote the frontmatter's
@@ -674,7 +686,7 @@ const result = await vscode.commands.executeCommand(
     query: prompt,
     mode: options.mode,                      // kanbanPilot.chat.mode, default 'agent'
     blockOnResponse: true,                   // resolves at terminal state
-    attachFiles: [taskFileUri],              // task file as first-class context
+    attachFiles: [taskFileUri, ...attachmentUris], // Markdown first, then referenced task images
     toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
     toolsExclude: options.toolsExclude,      // R12 (confirmed) — every stage, always
   },
@@ -685,7 +697,9 @@ Four options from `IChatViewOpenOptions` are doing real work here:
 
 - **`blockOnResponse`** — the completion signal (§6.2).
 - **`attachFiles`** — attaches the task file as context rather than pasting its content into
-  the prompt, so the agent reads the live file.
+  the prompt, so the agent reads the live file; validated task-local image files follow it in
+  Markdown reference order. Images are read-only context unless the task's Scope explicitly
+  permits modifying them.
 - **`toolsInclude`** is **refine-only and opt-in**, `undefined` by default. It *could* turn the
   scope-before-code guarantee (G4) from a polite instruction into a real capability boundary —
   but only if set to tool ids confirmed against the live Configure Tools picker first, the same
@@ -1139,8 +1153,8 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `task/reorder` | `{ taskId, column, beforeTaskId }` or `{ taskId, column, targetIndex }` — reorder within the current column; the extension validates the target against the current filesystem projection |
 | view → ext | `board/ready` | Webview mounted, request initial state |
 | view → ext | `action/invoke` | `{ taskId, action: 'accept' \| 'refine' \| ... }` — Refine, Develop, and Validate first dock the task's chat beside the board when `layout.dockChat` is enabled |
-| view → ext | `task/create` | `{ title, description, taskType }` — the New Task modal (§6.16); `taskType` is required and must be `feature` or `bug` (the envelope already uses `type` for the message name), while `description` becomes `## Request`, falling back to `title` when left blank |
-| view → ext | `task/edit` | `{ taskId, content: { title, request, refined, scope } }` — host-validated edit of the title and three Markdown specification sections only; rejects malformed payloads, missing targets, and fresh `status: running` tasks |
+| view → ext | `task/create` | `{ title, description, taskType, attachments? }` — the New Task modal (§6.16); `taskType` is required and must be `feature` or `bug` (the envelope already uses `type` for the message name), while `description` becomes `## Request`, falling back to `title` when left blank; staged attachments are validated and committed with the task |
+| view → ext | `task/edit` | `{ taskId, content: { title, request, refined, scope }, attachments?: { add, remove } }` — host-validated edit of the title, three Markdown specification sections, and explicit task-local image changes only; rejects malformed payloads, missing targets, invalid attachments, and fresh `status: running` tasks |
 | view → ext | `task/open` | `{ taskId }` — opens the markdown file in an editor |
 | view → ext | `task/openChat` | `{ taskId }` — the modal's Open Chat button; docks that task's chat beside the board (§6.10) |
 | ext → view | `task/editError` | `{ taskId?, error }` — visible save failure shown without closing the editor |
@@ -1250,15 +1264,25 @@ one run id so a stale or foreign line can never be replayed.
 
 **Where it hooks in.** `RunManager.reconcile` already re-reads the log exactly once per run,
 gated by the `task.run !== runId` staleness check that stops a superseded run from clobbering
-newer state. Proposal processing rides that same guard, right after the run's own receipt is
-confirmed present — no new bookkeeping needed for "already handled." Each proposal becomes a
-real task via the ordinary `TaskStore.create()` path (§8.1's id allocation, §6.2's atomic write),
-processed sequentially rather than in parallel so each `create`'s `nextId()` scan sees the
-previous one already on disk. A proposed task lands in Backlog exactly like a human-typed one —
-no state-machine changes at all. Extension-created children carry `origin_run` and a stable
-`origin_proposal` identity as well as `origin_task`; those fields let split reconciliation
-recognise a child that was persisted before a reload or before a later watcher pass and avoid
-creating it again.
+newer state. Proposal processing starts there, right after the run's own receipt is confirmed
+present, but it is not limited to that one read: receipt and proposal appends are separate file
+writes in practice, and a receipt may become visible first. A bounded post-receipt poll, the
+task-file watcher path (`reconcileTaskChange`), and activation reconciliation each drain valid
+same-run Develop/Validate proposals that become visible later. Those recovery passes use the
+durable activity start/finish audit pair and latest-stage-run guard, process children only, and
+never reapply the parent receipt outcome. Older or user-customized prompts therefore remain
+supported without making write order a correctness requirement.
+
+Each proposal becomes a real task via the ordinary active `TaskStore.create()` path (§8.1's id
+allocation, §6.2's atomic write), processed sequentially rather than in parallel so each
+`create`'s `nextId()` scan sees the previous one already on disk. A proposed task lands in
+Backlog exactly like a human-typed one — no state-machine changes at all — and it stays in the
+same active task set as its parent, including a named set rather than the legacy Default folder.
+Extension-created children carry `origin_run` and a stable `origin_proposal` identity as well as
+`origin_task`; those fields let reconciliation recognise a child that was persisted before a
+reload or before a later watcher pass and avoid creating it again. A child-write or verification
+failure is retained as an observable `proposal-error` entry in the parent log and remains
+retryable; it is never silently counted as handled.
 
 **Scope and safety:**
 - **Stages:** develop and validate only. Refine is scoping the *current* ticket, not surfacing
@@ -1268,6 +1292,10 @@ creating it again.
   confused agent filing dozens of tasks is a nuisance worth capping, not a policy worth exposing.
 - **Setting:** `kanbanPilot.chat.allowTaskProposals` (default `true`) — off makes `propose-task`
   lines inert text, same as any other line that doesn't match a known grammar.
+- **Ordering and recovery:** Develop/Validate prompts tell agents to write proposal lines to the
+  attached active task file before the receipt, but reconciliation also accepts the older receipt
+  first ordering and separate filesystem/watcher events. The bounded recovery and later activation
+  passes are retry-safe and idempotent; they never change the parent outcome a second time.
 - **Traceability:** the frontmatter gains `origin_task`, `origin_run`, and (when available)
   `origin_proposal` (`Task.originTask`, `Task.originRunId`, and `Task.originProposalKey`), set
   only on an agent-filed task — never on a human-typed one. The new task's `## Request` also gets a
@@ -1587,6 +1615,37 @@ the gate switches, text fields, Save/Reset buttons, and focused column-header pe
 keyboard-operable. The desktop layout uses a sidebar beside the main pane and adapts to a
 stacked, wrapping arrangement at narrow webview widths so category labels and settings
 controls remain usable without clipping.
+
+### 6.18 Task-local image attachments
+
+Images are durable task-owned input, not chat-only uploads. The New Task modal and the detail
+editor expose an accessible multi-file picker and clipboard-image handling. New Task pastes into
+Description, which becomes `## Request`; Edit task pastes into the focused Request, Refined, or
+Scope textarea. An image is previewed with its name and size, inserted at the caret as a temporary
+`attachment://<safe-id>` Markdown marker, and removable before submission. Clipboard text without
+an image continues through the browser's normal paste path. The command-palette `newTask`
+command opens this same modal rather than maintaining a second creation implementation.
+
+On save, the host validates every staged file as PNG, JPEG, GIF, or WebP, checks its magic bytes,
+rejects SVG, path traversal, unsafe names, empty data, and files over 10 MiB, then allocates a
+generated safe name under `<task-id>.attachments/`. It replaces temporary markers with relative
+links such as `TASK-009.attachments/screenshot.png` and commits the Markdown and binary files
+through one serialized atomic batch. An edit submits unchanged existing references plus explicit
+removals; a failed batch rolls back Markdown and newly written binaries. No binary content enters
+frontmatter or the append-only Log. Legacy tasks with no attachment directory remain valid.
+
+The detail renderer treats only validated references belonging to the current task as local
+images. It escapes user-authored Markdown text and alt text, allows only webview-safe resource
+URIs under the active task-set root, and turns missing, corrupt, cross-task, remote, SVG, or raw
+HTML image attempts into non-fatal unavailable placeholders. The webview CSP permits only the
+webview resource scheme and staged data previews. Task deletion removes only that task's attachment
+directory; active named-set routing is preserved for board rendering, persistence, and chat.
+
+Before Refine, Develop, Continue, or Validate runs, `TaskStore` resolves only the current task's
+valid referenced images in Markdown order. `ChatSessionExecutor` attaches the task Markdown first
+and those images afterward. Prompt defaults and custom-template fallback guidance identify images
+as read-only task context unless Scope explicitly permits modification. Text-only runs and the
+clipboard fallback remain unchanged.
 
 ---
 
