@@ -1475,6 +1475,7 @@ export class BoardPanel {
     position: relative;
     flex: none;
     display: flex; align-items: center; justify-content: space-between;
+    min-width: 0;
     padding: var(--kp-pad-header);
     background:
       linear-gradient(120deg,
@@ -1491,7 +1492,7 @@ export class BoardPanel {
   }
   h1 {
     font-size: 15px; font-weight: 800; margin: 0; letter-spacing: -0.01em;
-    display: inline-flex; align-items: center; gap: 8px;
+    display: inline-flex; align-items: center; gap: 8px; min-width: 0;
   }
   /* Small gradient chip standing in for a logo, so the brand color is present
      even where the h1 text has to stay theme-colored for contrast. */
@@ -1500,8 +1501,8 @@ export class BoardPanel {
     background: linear-gradient(135deg, #38bdf8, #a855f7 50%, #ec4899);
     box-shadow: 0 0 10px color-mix(in srgb, #a855f7 55%, transparent);
   }
-  .header-actions { display: flex; align-items: center; gap: 8px; }
-  .task-set-controls { display: inline-flex; align-items: center; gap: 6px; }
+  .header-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .task-set-controls { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
   .task-set-label { font-size: 12px; color: var(--vscode-descriptionForeground); }
   .task-set-select {
     min-width: 150px; max-width: 220px; font-family: inherit; font-size: 12px;
@@ -1682,6 +1683,28 @@ export class BoardPanel {
   }
   .gate-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
   @media (max-width: 620px) {
+    header {
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 10px 12px;
+    }
+    .header-actions {
+      flex: 1 1 100%;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+      row-gap: 8px;
+    }
+    .task-set-controls {
+      flex: 1 1 100%;
+      flex-wrap: wrap;
+    }
+    .task-set-label { flex: 0 0 auto; }
+    .task-set-select {
+      flex: 1 1 150px;
+      width: min(220px, 100%);
+      min-width: 0;
+      max-width: 100%;
+    }
     .settings-body { grid-template-columns: 1fr; }
     .settings-sidebar {
       padding: 12px; border-right: none; border-bottom: 1px solid var(--vscode-panel-border);
@@ -3290,7 +3313,7 @@ export class BoardPanel {
   function displayFileName(file, fallback) {
     const original = typeof file.name === 'string' && file.name ? file.name : fallback;
     const extension = file.type === 'image/jpeg' ? '.jpg' : ('.' + file.type.split('/')[1]);
-    let name = original.replace(/[\\/]/g, '-').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/\.\.+/g, '.');
+    let name = original.replace(/[\\/]/g, '-').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/\\.\\.+/g, '.');
     name = name.replace(/^-+|-+$/g, '').slice(0, 100);
     if (!name) { name = 'image' + extension; }
     return name;
@@ -3302,6 +3325,40 @@ export class BoardPanel {
       reader.onload = () => resolve(String(reader.result || ''));
       reader.onerror = () => reject(new Error('The image could not be read.'));
       reader.readAsDataURL(file);
+    });
+  }
+
+  function canonicalAttachmentMimeType(value) {
+    const mimeType = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (mimeType === 'image/jpg' || mimeType === 'image/pjpeg') { return 'image/jpeg'; }
+    if (mimeType === 'image/x-png') { return 'image/png'; }
+    return mimeType;
+  }
+
+  function attachmentMimeTypeFor(file, sourceMimeType) {
+    for (const candidate of [sourceMimeType, file && file.type]) {
+      const mimeType = canonicalAttachmentMimeType(candidate);
+      if (TASK_ATTACHMENT_TYPES.has(mimeType)) { return mimeType; }
+    }
+    return canonicalAttachmentMimeType(sourceMimeType || (file && file.type));
+  }
+
+  function supportedClipboardImageFile() {
+    if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+      return Promise.reject(new Error('The clipboard did not provide a PNG, JPEG, GIF, or WebP image.'));
+    }
+    return navigator.clipboard.read().then((clipboardItems) => {
+      for (const clipboardItem of clipboardItems) {
+        const sourceType = Array.from(clipboardItem.types || []).find((type) => TASK_ATTACHMENT_TYPES.has(canonicalAttachmentMimeType(type)));
+        if (!sourceType) { continue; }
+        const mimeType = canonicalAttachmentMimeType(sourceType);
+        return clipboardItem.getType(sourceType).then((blob) => new File(
+          [blob],
+          'pasted-image.' + mimeType.split('/')[1],
+          { type: mimeType },
+        ));
+      }
+      throw new Error('The clipboard did not provide a PNG, JPEG, GIF, or WebP image.');
     });
   }
 
@@ -3388,22 +3445,26 @@ export class BoardPanel {
     }
   }
 
-  function attachImageFile(file, textarea, state, shelf, textareas, errorNode, cursor) {
-    if (!file || !TASK_ATTACHMENT_TYPES.has(file.type)) {
+  function attachImageFile(file, textarea, state, shelf, textareas, errorNode, cursor, sourceMimeType) {
+    const mimeType = attachmentMimeTypeFor(file, sourceMimeType);
+    if (!file || !TASK_ATTACHMENT_TYPES.has(mimeType)) {
       setAttachmentError(errorNode, 'Only PNG, JPEG, GIF, and WebP images are supported.');
       return Promise.resolve();
     }
-    if (file.size > TASK_ATTACHMENT_MAX_BYTES) {
+    const imageFile = file.type === mimeType
+      ? file
+      : new File([file], file.name || 'pasted-image.' + mimeType.split('/')[1], { type: mimeType });
+    if (imageFile.size > TASK_ATTACHMENT_MAX_BYTES) {
       setAttachmentError(errorNode, 'Each image must be 10 MiB or smaller.');
       return Promise.resolve();
     }
-    return fileAsDataUrl(file).then((data) => {
+    return fileAsDataUrl(imageFile).then((data) => {
       const attachment = {
         id: attachmentId(),
-        name: displayFileName(file, 'pasted-image.' + file.type.split('/')[1]),
-        mimeType: file.type,
+        name: displayFileName(imageFile, 'pasted-image.' + mimeType.split('/')[1]),
+        mimeType,
         data,
-        size: file.size,
+        size: imageFile.size,
       };
       state.add.push(attachment);
       insertAttachment(textarea, attachment, cursor);
@@ -3429,12 +3490,23 @@ export class BoardPanel {
           start: typeof textarea.selectionStart === 'number' ? textarea.selectionStart : textarea.value.length,
           end: typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : textarea.value.length,
         };
-        void imageItems.reduce(
-          (promise, item) => promise.then(() => attachImageFile(
-            item.getAsFile(), textarea, state, shelf, textareas, errorNode, cursor,
-          )),
-          Promise.resolve(),
-        );
+        const imageFiles = imageItems.map((item) => ({ item, file: item.getAsFile() }));
+        const supportedItems = imageFiles.filter(({ item, file }) => file && TASK_ATTACHMENT_TYPES.has(attachmentMimeTypeFor(file, item.type)));
+        if (supportedItems.length) {
+          void supportedItems.reduce(
+            (promise, { item, file }) => promise.then(() => attachImageFile(
+              file, textarea, state, shelf, textareas, errorNode, cursor,
+              item.type,
+            )),
+            Promise.resolve(),
+          );
+          return;
+        }
+        void supportedClipboardImageFile().then((file) => attachImageFile(
+          file, textarea, state, shelf, textareas, errorNode, cursor,
+        )).catch((error) => {
+          setAttachmentError(errorNode, error && error.message ? error.message : 'The clipboard image could not be read.');
+        });
       });
     }
     for (const button of buttons) {

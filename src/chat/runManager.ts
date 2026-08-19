@@ -113,13 +113,17 @@ class RunConcurrencyCoordinator {
 		return this.admission.run(async () => {
 			const { tasks } = await this.store.readAll();
 			this.syncActive(tasks);
-			const persistedRunning = tasks.filter(
-				(task) => task.status === 'running' && (!task.run || !this.active.has(this.key(task.id, task.run))),
-			).length;
+			const occupiedReservations = new Set([
+				...this.pending,
+				...this.active,
+				...tasks
+					.filter((task) => task.status === 'running')
+					.map((task) => this.key(task.id, task.run ?? 'persisted')),
+			]);
 			const reservationKey = this.key(taskId, runId);
 			if (
 				this.hasReservationForTask(taskId) ||
-				persistedRunning + this.active.size + this.pending.size >= maxParallelTasks
+				occupiedReservations.size >= maxParallelTasks
 			) {
 				return false;
 			}

@@ -1894,6 +1894,49 @@ suite('M3 RunManager', () => {
 		assert.strictEqual(secondExecutor.calls.length, 0, 'capacity denial must not invoke the executor');
 	});
 
+	test('a second Develop run uses the remaining slot, while a third waits until capacity is released', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const first = await store.create('First Develop run');
+			const second = await store.create('Second Develop run');
+			const third = await store.create('Queued Develop run');
+			for (const task of [first, second, third]) {
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+			}
+			const firstExecutor = new StubExecutor(() => 'hang');
+			const secondExecutor = new StubExecutor(() => 'hang');
+			const thirdExecutor = new StubExecutor(() => 'hang');
+			const firstManager = new RunManager(store, firstExecutor, folder);
+			const secondManager = new RunManager(store, secondExecutor, folder);
+			const thirdManager = new RunManager(store, thirdExecutor, folder);
+
+			await firstManager.handleAction(first.id, 'develop');
+			await waitUntil(() => firstExecutor.calls.length === 1);
+			await secondManager.handleAction(second.id, 'develop');
+			await waitUntil(() => secondExecutor.calls.length === 1);
+
+			let after = await store.readAll();
+			const firstAfter = after.tasks.find((task) => task.id === first.id)!;
+			const secondAfter = after.tasks.find((task) => task.id === second.id)!;
+			assert.strictEqual(firstAfter.status, 'running');
+			assert.strictEqual(secondAfter.status, 'running');
+			assert.ok(firstAfter.run);
+			assert.ok(secondAfter.run);
+			assert.notStrictEqual(firstAfter.run, secondAfter.run);
+
+			await thirdManager.handleAction(third.id, 'develop');
+			after = await store.readAll();
+			const thirdAfter = after.tasks.find((task) => task.id === third.id)!;
+			assert.strictEqual(thirdAfter.state, 'approved');
+			assert.strictEqual(thirdAfter.status, 'idle');
+			assert.strictEqual(thirdAfter.run, undefined);
+			assert.strictEqual(thirdExecutor.calls.length, 0);
+
+			await firstManager.handleAction(first.id, 'stop');
+			await thirdManager.handleAction(third.id, 'develop');
+			await waitUntil(() => thirdExecutor.calls.length === 1);
+		});
+	});
+
 	test('identical task ids in different sets use independent reservations and chats', async () => {
 		await withMaxParallelTasks(1, async () => {
 			const firstStore = new TaskStore(vscode.Uri.joinPath(dir, 'first'), 'set-first');
@@ -2091,6 +2134,33 @@ suite('M3 RunManager', () => {
 				assert.strictEqual(after.tasks.filter((task) => task.status === 'running').length, 2);
 				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.state, 'approved');
 				assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.status, 'idle');
+			} finally {
+				await cfg.update('gates.approvedToInProgress', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+	});
+
+	test('the Approved auto gate uses a remaining capacity slot while another Develop run is active', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('gates.approvedToInProgress', 'auto', vscode.ConfigurationTarget.Global);
+			try {
+				const running = await store.create('Already running Develop');
+				const queued = await store.create('Automatically start Develop');
+				await store.patch(running.id, { state: 'approved', status: 'idle' });
+				await store.patch(queued.id, { state: 'approved', status: 'idle' });
+				const runningExecutor = new StubExecutor(() => 'hang');
+				const queuedExecutor = new StubExecutor(() => 'hang');
+				const runningManager = new RunManager(store, runningExecutor, folder);
+				const queuedManager = new RunManager(store, queuedExecutor, folder);
+
+				await runningManager.handleAction(running.id, 'develop');
+				await waitUntil(() => runningExecutor.calls.length === 1);
+				await queuedManager.applyGatePolicies();
+				await waitUntil(() => queuedExecutor.calls.length === 1);
+
+				const after = await store.readAll();
+				assert.strictEqual(after.tasks.find((task) => task.id === queued.id)?.status, 'running');
 			} finally {
 				await cfg.update('gates.approvedToInProgress', undefined, vscode.ConfigurationTarget.Global);
 			}
