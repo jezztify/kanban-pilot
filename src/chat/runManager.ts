@@ -16,9 +16,18 @@ import { Executor, ExecutorResult } from './executor';
 import { TASK_ATTACHMENT_CONTEXT, loadPromptTemplate, renderTemplate } from './promptTemplates';
 import { proposalFingerprint, proposalsForRun } from './proposals';
 import type { Proposal } from './proposals';
-import { findReceipt, formatReceipt, parseReceipts, Receipt, ReceiptResult, Stage } from './receipt';
+import {
+	findReceiptDetails,
+	formatReceipt,
+	parseReceipts,
+	Receipt,
+	ReceiptExpectation,
+	ReceiptIssue,
+	ReceiptResult,
+	Stage,
+} from './receipt';
 import { hashScope } from './scopeHash';
-import { DEFAULT_TASK_SET_ID, sessionIdForTask, sessionUriForId, sessionUriForTask } from './sessionUri';
+import { sessionIdForTaskBinding, sessionUriForTaskBinding } from './sessionUri';
 import {
 	GATE_CATALOG,
 	receiptGateFor,
@@ -331,6 +340,12 @@ function canAwaitLateReceipt(task: Task, marker: Receipt): boolean {
 	);
 }
 
+function latestLateReceiptMarker(task: Task): Receipt | undefined {
+	return [...parseReceipts(task.sections['Log'] ?? '')]
+		.reverse()
+		.find((receipt) => receipt.taskId === task.id && isLateReceiptMarker(receipt));
+}
+
 function sameReceipt(a: Receipt, b: Receipt): boolean {
 	return (
 		a.runId === b.runId &&
@@ -344,6 +359,43 @@ function sameReceipt(a: Receipt, b: Receipt): boolean {
 interface LateReceiptPair {
 	marker: Receipt;
 	receipt: Receipt;
+}
+
+export interface StaleCompletionCandidate {
+	taskId: string;
+	runId: string;
+	stage: Stage;
+	result: 'ok';
+	note: string;
+	summary: string;
+	currentRunId?: string;
+	latestRunId?: string;
+	supersededByRunId?: string;
+}
+
+export type StaleCompletionRecoveryResult =
+	| { kind: 'recovered'; runId: string; stage: Stage; gate?: GateId }
+	| { kind: 'not-found' }
+	| { kind: 'invalid' }
+	| { kind: 'no-candidate' }
+	| { kind: 'active-run' }
+	| { kind: 'pending-outcome' }
+	| { kind: 'stale' };
+
+interface IndexedReceipt {
+	receipt: Receipt;
+	lineIndex: number;
+}
+
+interface IndexedAuditEvent {
+	event: ReturnType<typeof parseAuditEvents>[number];
+	lineIndex: number;
+}
+
+interface ValidatedStaleCompletion {
+	candidate: StaleCompletionCandidate;
+	receipt: Receipt;
+	receiptLineIndex: number;
 }
 
 interface ProposalProcessingResult {
@@ -360,6 +412,8 @@ interface TabGroupsLike {
 	readonly all: readonly vscode.TabGroup[];
 	close(tab: vscode.Tab | readonly vscode.Tab[], preserveFocus?: boolean): Thenable<boolean>;
 }
+
+export type CommandExecutor = <T>(command: string, ...args: unknown[]) => Thenable<T>;
 
 export async function closeTaskChatTabs(sessionUri: vscode.Uri, tabGroups: TabGroupsLike): Promise<void> {
 	const tabs = tabGroups.all.flatMap((group) => group.tabs).filter((tab) => {
@@ -389,6 +443,7 @@ export class RunManager {
 		private readonly executor: Executor,
 		private readonly workspaceFolder: vscode.WorkspaceFolder,
 		private readonly tabGroups: TabGroupsLike = vscode.window.tabGroups,
+		private readonly executeCommand: CommandExecutor = vscode.commands.executeCommand.bind(vscode.commands),
 	) {
 		this.concurrency = coordinatorFor(workspaceFolder, store);
 	}
@@ -516,15 +571,19 @@ export class RunManager {
 		return outcome;
 	}
 
-	/** §6.10: open the task's session beside the board. */
-	async dockTaskChat(taskId: string, opts: { onSelect: boolean }): Promise<void> {
+	/** §6.10: open the task's session, beside the board when automatic docking is enabled. */
+	async dockTaskChat(taskId: string, opts: { onSelect: boolean; explicit?: boolean }): Promise<void> {
 		const cfg = readConfig();
-		if (!cfg.dockChat || (opts.onSelect && !cfg.dockChatOnSelect)) {
+		if (!opts.explicit && (!cfg.dockChat || (opts.onSelect && !cfg.dockChatOnSelect))) {
+			return;
+		}
+		const chat = await this.resolveTaskChat(taskId, cfg, true);
+		if (!chat) {
 			return;
 		}
 		try {
-			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix, this.store.setId), {
-				viewColumn: vscode.ViewColumn.Beside,
+			await this.executeCommand('vscode.open', chat.uri, {
+				...(cfg.dockChat ? { viewColumn: vscode.ViewColumn.Beside } : {}),
 				preserveFocus: true,
 				preview: true,
 			});
@@ -555,6 +614,90 @@ export class RunManager {
 	}
 
 	/**
+	 * Lists successful receipts that are eligible for explicit human-confirmed
+	 * stale completion recovery. This is deliberately separate from ordinary
+	 * reconciliation: a receipt from an older run is never adopted merely
+	 * because it exists in the task log.
+	 */
+	async listStaleCompletionCandidates(taskId?: string): Promise<StaleCompletionCandidate[]> {
+		const { tasks } = await this.store.readAll();
+		return tasks
+			.filter((task) => !taskId || task.id === taskId)
+			.flatMap((task) => this.validatedStaleCompletions(task).map(({ candidate }) => candidate));
+	}
+
+	/**
+	 * Explicitly adopts one validated successful receipt from an earlier run.
+	 * The task, receipt, and extension-owned history are all re-read while the
+	 * workspace coordinator is held. No executor is invoked on this path.
+	 */
+	async recoverStaleCompletion(
+		taskId: string,
+		runId: string,
+		stage: Stage,
+	): Promise<StaleCompletionRecoveryResult> {
+		if (!/^TASK-\d+$/.test(taskId) || !/^[A-Za-z0-9._:/-]+$/.test(runId) || !this.isStage(stage)) {
+			return { kind: 'invalid' };
+		}
+
+		let outcome: StaleCompletionRecoveryResult = { kind: 'stale' };
+		await this.concurrency.runExclusive(async () => {
+			const current = (await this.store.readAll()).tasks.find((task) => task.id === taskId);
+			if (!current) {
+				outcome = { kind: 'not-found' };
+				return;
+			}
+			if (current.run) {
+				outcome = { kind: 'active-run' };
+				return;
+			}
+			if (current.pendingOutcome) {
+				outcome = { kind: 'pending-outcome' };
+				return;
+			}
+
+			const validated = this.validatedStaleCompletions(current).find(({ candidate }) =>
+				candidate.runId === runId && candidate.stage === stage,
+			);
+			if (!validated) {
+				outcome = { kind: 'no-candidate' };
+				return;
+			}
+
+			await this.applyReceipt(
+				taskId,
+				runId,
+				stage,
+				validated.receipt,
+				(candidate) => this.validatedStaleCompletions(candidate).some(({ candidate: item }) =>
+					item.runId === runId && item.stage === stage,
+				),
+				{ action: 'manual-recovery', correction: true, withinLock: true, transitionAction: 'late-receipt' },
+			);
+
+			const after = (await this.store.readAll()).tasks.find((task) => task.id === taskId);
+			const recovered = after && parseAuditEvents(after.sections['Log'] ?? '').some((event) =>
+				event.kind === 'activity-finish' &&
+				event.taskId === taskId &&
+				event.runId === runId &&
+				event.stage === stage &&
+				event.action === 'manual-recovery' &&
+				event.correction === true &&
+				event.outcome === 'ok',
+			);
+			if (recovered) {
+				outcome = {
+					kind: 'recovered',
+					runId,
+					stage,
+					gate: receiptGateFor(stage, 'ok')?.id,
+				};
+			}
+		});
+		return outcome;
+	}
+
+	/**
 	 * On activation, any task left `running` had its in-memory run state lost
 	 * to the reload (§6.4). Reconciles against whatever the file shows now.
 	 */
@@ -568,29 +711,44 @@ export class RunManager {
 			const runId = task.run;
 			const stage = stageForRun(task, runId, stageForColumn(task.state));
 			try {
-				const receipt = findReceipt(task.sections['Log'] ?? '', runId, task.id);
+				const details = findReceiptDetails(task.sections['Log'] ?? '', { runId, taskId: task.id, stage });
 
-				if (receipt?.stage === stage) {
-					await this.applyReceipt(task.id, runId, stage, receipt, (candidate) => candidate.run === runId);
+				if (details.receipt) {
+					await this.applyReceipt(task.id, runId, stage, details.receipt, (candidate) => candidate.run === runId);
 				} else {
+					await this.recordReceiptIssues(task.id, { runId, taskId: task.id, stage }, details.issues);
 					await this.markMissingReceipt(task.id, runId, stage, 'interrupted by window reload; no receipt found');
 				}
+			} catch (error) {
+				await this.recordReconciliationFailure(task.id, error);
 			} finally {
 				this.concurrency.release(task.id, runId);
 			}
 		}
 
-		await this.reconcileLateReceipts();
-		await this.reconcileOrdinaryProposals();
-		await this.reconcilePendingOutcomes();
+		for (const reconcile of [
+			() => this.reconcileLateReceipts(),
+			() => this.reconcileOrdinaryProposals(),
+			() => this.reconcilePendingOutcomes(),
+		]) {
+			try {
+				await reconcile();
+			} catch (error) {
+				await this.recordReconciliationFailure(undefined, error);
+			}
+		}
 	}
 
 	/** Reconciles a receipt that arrived after the extension's no-receipt fallback. */
 	async reconcileTaskChange(taskId?: string): Promise<void> {
-		await this.concurrency.reconcile();
-		await this.reconcileLateReceipts(taskId);
-		await this.reconcileOrdinaryProposals(taskId);
-		await this.reconcilePendingOutcomes(taskId);
+		try {
+			await this.concurrency.reconcile();
+			await this.reconcileLateReceipts(taskId);
+			await this.reconcileOrdinaryProposals(taskId);
+			await this.reconcilePendingOutcomes(taskId);
+		} catch (error) {
+			await this.recordReconciliationFailure(taskId, error);
+		}
 	}
 
 	/**
@@ -688,9 +846,7 @@ export class RunManager {
 				return false;
 			}
 
-			const sessionId = this.store.setId === DEFAULT_TASK_SET_ID
-				? task.chat ?? sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId)
-				: sessionIdForTask(taskId, cfg.sessionPrefix, this.store.setId);
+			const sessionId = sessionIdForTaskBinding(task, cfg.sessionPrefix, this.store.setId);
 			await this.store.auditedPatch(
 				taskId,
 				{
@@ -788,6 +944,162 @@ export class RunManager {
 
 	// ---- reconciliation (§6.2, §6.4, §6.9) ------------------------------
 
+	private isStage(value: unknown): value is Stage {
+		return value === 'refine' || value === 'develop' || value === 'validate' || value === 'split';
+	}
+
+	private indexedTaskLog(task: Task): { receipts: IndexedReceipt[]; audits: IndexedAuditEvent[] } {
+		const receipts: IndexedReceipt[] = [];
+		const audits: IndexedAuditEvent[] = [];
+		for (const [lineIndex, line] of (task.sections['Log'] ?? '').split(/\r?\n/).entries()) {
+			const lineReceipts = parseReceipts(line);
+			if (lineReceipts[0]) {
+				receipts.push({ receipt: lineReceipts[0], lineIndex });
+			}
+			const lineAudits = parseAuditEvents(line);
+			if (lineAudits[0]) {
+				audits.push({ event: lineAudits[0], lineIndex });
+			}
+		}
+		return { receipts, audits };
+	}
+
+	/**
+	 * Correlates a canonical success with the extension's own start and
+	 * provisional terminal history. Every rejection here is intentional:
+	 * recovery must never turn an arbitrary log line, a manually moved card, or
+	 * an unresolved newer run into a completion.
+	 */
+	private validatedStaleCompletions(task: Task): ValidatedStaleCompletion[] {
+		if (
+			task.run ||
+			task.pendingOutcome ||
+			(task.status !== 'failed' && task.status !== 'blocked')
+		) {
+			return [];
+		}
+
+		const { receipts, audits } = this.indexedTaskLog(task);
+		const candidates: ValidatedStaleCompletion[] = [];
+		const seen = new Set<string>();
+		for (const indexedReceipt of [...receipts].reverse()) {
+			const receipt = indexedReceipt.receipt;
+			const key = `${receipt.runId}:${receipt.stage}`;
+			if (
+				seen.has(key) ||
+				receipt.taskId !== task.id ||
+				receipt.result !== 'ok' ||
+				task.state !== columnForStage(receipt.stage)
+			) {
+				continue;
+			}
+
+			const start = [...audits].reverse().find(({ event, lineIndex }) =>
+				event.kind === 'activity-start' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage &&
+				event.runId === receipt.runId &&
+				lineIndex < indexedReceipt.lineIndex,
+			);
+			if (!start) {
+				continue;
+			}
+
+			const marker = [...receipts].reverse().find(({ receipt: candidate, lineIndex }) =>
+				candidate.taskId === task.id &&
+				candidate.runId === receipt.runId &&
+				candidate.stage === receipt.stage &&
+				isLateReceiptMarker(candidate) &&
+				lineIndex > start.lineIndex &&
+				lineIndex < indexedReceipt.lineIndex,
+			);
+			const terminal = [...audits].reverse().find(({ event, lineIndex }) =>
+				event.kind === 'activity-finish' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage &&
+				event.runId === receipt.runId &&
+				event.provisional === true &&
+				(event.outcome === 'timeout' || event.outcome === 'missing-receipt' || event.outcome === 'blocked') &&
+				lineIndex > start.lineIndex &&
+				lineIndex < indexedReceipt.lineIndex,
+			);
+			if (!marker || !terminal || indexedReceipt.lineIndex <= Math.max(marker.lineIndex, terminal.lineIndex)) {
+				continue;
+			}
+
+			const historyAfterStart = audits.filter(({ event, lineIndex }) =>
+				event.taskId === task.id && lineIndex > start.lineIndex,
+			);
+			if (historyAfterStart.some(({ event }) =>
+				event.kind === 'state-change' ||
+				event.correction === true ||
+				event.action === 'manual-recovery' ||
+				(event.kind === 'activity-finish' &&
+					event.runId === receipt.runId &&
+					(event.outcome === 'ok' || event.outcome === 'stopped' || event.outcome === 'superseded')) ||
+				(event.kind === 'activity-finish' &&
+					event.runId === receipt.runId &&
+					event.outcome === 'error' &&
+					event.action === 'manual-complete')
+			)) {
+				continue;
+			}
+
+			const laterStarts = audits.filter(({ event, lineIndex }) =>
+				event.kind === 'activity-start' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage &&
+				lineIndex > start.lineIndex,
+			);
+			let invalidated = false;
+			for (const laterStart of laterStarts) {
+				const laterFinishes = audits.filter(({ event, lineIndex }) =>
+					event.kind === 'activity-finish' &&
+					event.taskId === task.id &&
+					event.stage === receipt.stage &&
+					event.runId === laterStart.event.runId &&
+					lineIndex > laterStart.lineIndex,
+				);
+				if (
+					laterFinishes.length === 0 ||
+					laterFinishes.some(({ event }) =>
+						event.outcome === 'ok' || event.outcome === 'stopped' || event.outcome === 'superseded',
+					)
+				) {
+					invalidated = true;
+					break;
+				}
+			}
+			if (invalidated) {
+				continue;
+			}
+
+			const latestStart = [...audits].reverse().find(({ event }) =>
+				event.kind === 'activity-start' &&
+				event.taskId === task.id &&
+				event.stage === receipt.stage,
+			);
+			const latestRunId = latestStart?.event.runId ?? receipt.runId;
+			seen.add(key);
+			candidates.push({
+				candidate: {
+					taskId: task.id,
+					runId: receipt.runId,
+					stage: receipt.stage,
+					result: 'ok',
+					note: receipt.note,
+					summary: receipt.note,
+					currentRunId: task.run,
+					latestRunId,
+					supersededByRunId: latestRunId === receipt.runId ? undefined : latestRunId,
+				},
+				receipt,
+				receiptLineIndex: indexedReceipt.lineIndex,
+			});
+		}
+		return candidates.reverse();
+	}
+
 	private async reconcileLateReceipts(taskId?: string): Promise<void> {
 		const { tasks } = await this.store.readAll();
 		for (const task of tasks) {
@@ -795,8 +1107,17 @@ export class RunManager {
 				continue;
 			}
 
+			const marker = latestLateReceiptMarker(task);
 			const late = this.findLateReceipt(task);
-			if (!late || !canAwaitLateReceipt(task, late.marker) || task.run) {
+			if (!late) {
+				if (marker && !task.run && canAwaitLateReceipt(task, marker) && task.state === columnForStage(marker.stage)) {
+					const expected: ReceiptExpectation = { runId: marker.runId, taskId: task.id, stage: marker.stage };
+					const details = findReceiptDetails(task.sections['Log'] ?? '', expected);
+					await this.recordReceiptIssues(task.id, expected, details.issues);
+				}
+				continue;
+			}
+			if (!canAwaitLateReceipt(task, late.marker) || task.run) {
 				continue;
 			}
 
@@ -892,6 +1213,7 @@ export class RunManager {
 		runId: string,
 		stage: Stage,
 		isCurrent: (task: Task) => boolean,
+		withinLock = false,
 	): Promise<void> {
 		const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 		if (!task || !isCurrent(task)) {
@@ -904,32 +1226,45 @@ export class RunManager {
 		}
 
 		try {
-			const result = await this.processProposals(task, runId, logSection);
+			const result = withinLock
+				? await this.processProposalsWithinLock(task, runId, logSection)
+				: await this.processProposals(task, runId, logSection);
 			if (result.persisted !== result.accepted) {
 				throw new Error(
 					`only ${result.persisted} of ${result.accepted} proposals are persisted in the active task set`,
 				);
 			}
 		} catch (error) {
-			await this.recordProposalError(taskId, runId, stage, error);
+			await this.recordProposalError(taskId, runId, stage, error, withinLock);
 		}
 	}
 
 	/** Records a retryable proposal failure once per exact error in the parent log. */
-	private async recordProposalError(taskId: string, runId: string, stage: Stage, error: unknown): Promise<void> {
+	private async recordProposalError(
+		taskId: string,
+		runId: string,
+		stage: Stage,
+		error: unknown,
+		withinLock = false,
+	): Promise<void> {
 		const note = (error instanceof Error ? error.message : String(error))
 			.replace(/[\r\n"]+/g, ' ')
 			.replace(/\s+/g, ' ')
 			.trim() || 'unknown proposal reconciliation error';
 		const line = `- proposal-error run:${runId} task:${taskId} stage:${stage} note:"${note}"`;
 
-		await this.concurrency.runExclusive(async () => {
+		const persist = async (): Promise<void> => {
 			const current = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 			if (!current || (current.sections['Log'] ?? '').includes(line)) {
 				return;
 			}
 			await this.store.appendLog(taskId, line);
-		});
+		};
+		if (withinLock) {
+			await persist();
+		} else {
+			await this.concurrency.runExclusive(persist);
+		}
 	}
 
 	/** Starts a bounded recovery window after an ordinary receipt is applied. */
@@ -1054,12 +1389,90 @@ export class RunManager {
 		return [this.store.setId, this.store.directory.toString(), taskId, runId, stage, receipt.result, receipt.note].join('|');
 	}
 
+	private async recordReceiptIssues(
+		taskId: string,
+		expected: ReceiptExpectation,
+		issues: readonly ReceiptIssue[],
+	): Promise<void> {
+		if (issues.length === 0) {
+			return;
+		}
+
+		const lines = new Map<string, string>();
+		for (const issue of issues) {
+			const receipt = issue.receipt;
+			const identity = receipt
+				? `${issue.kind}|${receipt.runId}|${receipt.taskId}|${receipt.stage}|${receipt.result}|${receipt.note}`
+				: `${issue.kind}|${issue.line ?? ''}`;
+			let line = `- receipt-diagnostic kind:${issue.kind} task:${taskId} expected-run:${expected.runId} expected-stage:${expected.stage}`;
+			if (receipt) {
+				line += ` actual-run:${receipt.runId} actual-task:${receipt.taskId} actual-stage:${receipt.stage}`;
+			}
+			const note = issue.kind === 'task-mismatch'
+				? `Ignored receipt because task id ${receipt?.taskId} does not match expected task ${expected.taskId}.`
+				: issue.kind === 'run-mismatch'
+					? `Ignored receipt because run id ${receipt?.runId} is stale; expected ${expected.runId}.`
+					: issue.kind === 'stage-mismatch'
+						? `Ignored receipt because stage ${receipt?.stage} does not match expected ${expected.stage}.`
+						: 'Ignored a malformed receipt-like log line; append the canonical run, task, stage, result, and note fields.';
+			lines.set(identity, `${line} note:"${note}"`);
+		}
+
+		await this.concurrency.runExclusive(async () => {
+			const current = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+			if (!current) {
+				return;
+			}
+			let log = current.sections['Log'] ?? '';
+			for (const line of lines.values()) {
+				if (log.includes(line)) {
+					continue;
+				}
+				await this.store.appendLog(taskId, line);
+				log = `${log}${log ? '\n' : ''}${line}`;
+			}
+		});
+	}
+
+	/** Records a watcher/activation persistence failure instead of dropping it. */
+	async recordReconciliationFailure(taskId: string | undefined, error: unknown, withinLock = false): Promise<void> {
+		const note = (error instanceof Error ? error.message : String(error))
+			.replace(/[\r\n"]+/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.slice(0, 240) || 'unknown reconciliation failure';
+		const line = `- reconciliation-error set:${this.store.setId} task:${taskId ?? 'task-set'} note:"${note}"`;
+
+		try {
+			if (taskId) {
+				const persist = async (): Promise<void> => {
+					const current = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+					if (!current || (current.sections['Log'] ?? '').includes(line)) {
+						return;
+					}
+					await this.store.appendLog(taskId, line);
+				};
+				if (withinLock) {
+					await persist();
+				} else {
+					await this.concurrency.runExclusive(persist);
+				}
+			}
+		} catch (loggingError) {
+			console.error(`Kanban Pilot could not persist reconciliation failure: ${loggingError instanceof Error ? loggingError.message : String(loggingError)}`);
+		}
+
+		console.error(`Kanban Pilot reconciliation failed for ${taskId ?? this.store.setId}: ${note}`);
+		void vscode.window.showErrorMessage(`Kanban Pilot reconciliation failed for ${taskId ?? this.store.setId}: ${note}`);
+	}
+
 	private async applyReceipt(
 		taskId: string,
 		runId: string,
 		stage: Stage,
 		receipt: Receipt,
 		isCurrent: (task: Task) => boolean,
+		options: { action?: string; correction?: boolean; transitionAction?: string; withinLock?: boolean } = {},
 	): Promise<void> {
 		const initial = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 		if (!initial || !isCurrent(initial)) {
@@ -1085,11 +1498,17 @@ export class RunManager {
 
 				let splitResult: ProposalProcessingResult;
 				try {
-					splitResult = await this.processProposals(
-						proposalTask,
-						runId,
-						proposalTask.sections['Log'] ?? '',
-					);
+					splitResult = options.withinLock
+						? await this.processProposalsWithinLock(
+							proposalTask,
+							runId,
+							proposalTask.sections['Log'] ?? '',
+						)
+						: await this.processProposals(
+							proposalTask,
+							runId,
+							proposalTask.sections['Log'] ?? '',
+						);
 				} catch (error) {
 					await this.markSplitIncomplete(
 						taskId,
@@ -1120,7 +1539,7 @@ export class RunManager {
 				if (!latest || !isCurrent(latest)) {
 					return;
 				}
-				await this.processOrdinaryProposals(taskId, runId, stage, isCurrent);
+				await this.processOrdinaryProposals(taskId, runId, stage, isCurrent, options.withinLock);
 			}
 
 			const fresh = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
@@ -1135,15 +1554,19 @@ export class RunManager {
 				receipt.result,
 				fresh.sections['Scope'],
 				{
-					correction: !initial.run,
+					correction: options.correction ?? !initial.run,
 					note: receipt.note,
-					action: initial.run ? 'receipt' : 'late-receipt',
+					action: options.action ?? (initial.run ? 'receipt' : 'late-receipt'),
+					transitionAction: options.transitionAction,
 				},
 			);
 			appliedReceiptKeys.add(key);
 			if (STAGES_THAT_MAY_PROPOSE.has(stage) && readConfig().allowTaskProposals) {
 				this.schedulePostReceiptProposalRecovery(taskId, runId, stage);
 			}
+		} catch (error) {
+			await this.recordReconciliationFailure(taskId, error, options.withinLock);
+			throw error;
 		} finally {
 			inFlightReceiptKeys.delete(key);
 		}
@@ -1171,17 +1594,21 @@ export class RunManager {
 
 	private async waitForReceipt(taskId: string, runId: string, stage: Stage): Promise<Receipt | undefined> {
 		const deadline = Date.now() + RECEIPT_GRACE_MS;
+		const expected: ReceiptExpectation = { runId, taskId, stage };
+		let lastIssues: readonly ReceiptIssue[] = [];
 		for (;;) {
 			const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 			if (!task || task.run !== runId) {
 				return undefined;
 			}
 
-			const receipt = findReceipt(task.sections['Log'] ?? '', runId, taskId);
-			if (receipt?.stage === stage) {
-				return receipt;
+			const details = findReceiptDetails(task.sections['Log'] ?? '', expected);
+			lastIssues = details.issues;
+			if (details.receipt) {
+				return details.receipt;
 			}
 			if (Date.now() >= deadline) {
+				await this.recordReceiptIssues(taskId, expected, lastIssues);
 				return undefined;
 			}
 			await wait(Math.min(RECEIPT_POLL_MS, deadline - Date.now()));
@@ -1199,6 +1626,7 @@ export class RunManager {
 		// first. This backstop is specifically for a missed or coalesced event.
 		await wait(LATE_RECEIPT_INITIAL_DELAY_MS);
 		const deadline = Date.now() + LATE_RECEIPT_GRACE_MS;
+		let recordedDiagnostics = false;
 		for (;;) {
 			const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
 			if (!task || task.run || task.state !== columnForStage(stage) || (task.status !== 'blocked' && task.status !== 'failed')) {
@@ -1221,6 +1649,14 @@ export class RunManager {
 				if (!after || (after.status !== 'blocked' && after.status !== 'failed') || after.run || after.state !== columnForStage(stage)) {
 					return;
 				}
+			} else if (!recordedDiagnostics) {
+				const marker = latestLateReceiptMarker(task);
+				if (marker && marker.runId === runId && marker.stage === stage) {
+					const expected: ReceiptExpectation = { runId, taskId, stage };
+					const details = findReceiptDetails(task.sections['Log'] ?? '', expected);
+					await this.recordReceiptIssues(taskId, expected, details.issues);
+				}
+				recordedDiagnostics = true;
 			}
 
 			if (Date.now() >= deadline) {
@@ -1236,11 +1672,13 @@ export class RunManager {
 			return;
 		}
 
-		const existing = findReceipt(current.sections['Log'] ?? '', runId, taskId);
-		if (existing?.stage === stage) {
-			await this.applyReceipt(taskId, runId, stage, existing, (candidate) => candidate.run === runId);
+		const expected: ReceiptExpectation = { runId, taskId, stage };
+		const details = findReceiptDetails(current.sections['Log'] ?? '', expected);
+		if (details.receipt) {
+			await this.applyReceipt(taskId, runId, stage, details.receipt, (candidate) => candidate.run === runId);
 			return;
 		}
+		await this.recordReceiptIssues(taskId, expected, details.issues);
 
 		await this.store.appendLog(
 			taskId,
@@ -1362,11 +1800,13 @@ export class RunManager {
 				return;
 			}
 
-			const raceReceipt = findReceipt(current.sections['Log'] ?? '', runId, taskId);
-			if (raceReceipt?.stage === stage) {
-				await this.applyReceipt(taskId, runId, stage, raceReceipt, (candidate) => candidate.run === runId);
+			const expected: ReceiptExpectation = { runId, taskId, stage };
+			const raceDetails = findReceiptDetails(current.sections['Log'] ?? '', expected);
+			if (raceDetails.receipt) {
+				await this.applyReceipt(taskId, runId, stage, raceDetails.receipt, (candidate) => candidate.run === runId);
 				return;
 			}
+			await this.recordReceiptIssues(taskId, expected, raceDetails.issues);
 
 			await this.store.appendLog(
 				taskId,
@@ -1415,7 +1855,14 @@ export class RunManager {
 
 		// §6.9: automatic misroute detection via Copilot's own conversation id.
 		if (result.sessionId) {
-			const sessionPatch: Record<string, string | undefined> = { copilot_session_id: result.sessionId };
+			// The local derived id creates the first chat, but Copilot returns the
+			// concrete durable conversation id. Persist both fields so a subsequent
+			// VS Code-window reload reopens the transcript rather than an empty
+			// local-session resource.
+			const sessionPatch: Record<string, string | undefined> = {
+				chat: result.sessionId,
+				copilot_session_id: result.sessionId,
+			};
 			if (task.copilotSessionId && task.copilotSessionId !== result.sessionId) {
 				sessionPatch.chat_reset_required = 'true';
 			}
@@ -1555,8 +2002,9 @@ export class RunManager {
 		stage: Stage,
 		result: ReceiptResult,
 		scope?: string,
-		activity: { correction?: boolean; note?: string; action?: string } = {},
+		activity: { correction?: boolean; note?: string; action?: string; transitionAction?: string } = {},
 	): Promise<void> {
+		const transitionAction = activity.transitionAction ?? activity.action ?? 'receipt';
 		const finishEvent: AuditEventInput = {
 			kind: 'activity-finish',
 			runId,
@@ -1595,7 +2043,7 @@ export class RunManager {
 					pending_outcome: encodePendingOutcome(pending),
 				},
 				{
-					action: activity.action ?? 'receipt',
+					action: transitionAction,
 					runId,
 					outcome: result as AuditOutcome,
 					events: [finishEvent],
@@ -1608,7 +2056,7 @@ export class RunManager {
 		}
 
 		if (result !== 'ok') {
-			await patchOutcome({ status: result, run: undefined }, activity.action ?? 'receipt');
+			await patchOutcome({ status: result, run: undefined }, transitionAction);
 			return;
 		}
 
@@ -1617,16 +2065,20 @@ export class RunManager {
 		if (stage === 'refine') {
 			patch.scope_hash = hashScope(scope ?? '');
 		}
-		await patchOutcome(patch, activity.action ?? 'receipt');
+		await patchOutcome(patch, transitionAction);
 	}
 
 	private async resetSession(taskId: string): Promise<void> {
 		const cfg = readConfig();
+		const chat = await this.resolveTaskChat(taskId, cfg, true);
+		if (!chat) {
+			return;
+		}
 		try {
-			await vscode.commands.executeCommand('vscode.open', sessionUriForTask(taskId, cfg.sessionPrefix, this.store.setId), {
+			await this.executeCommand('vscode.open', chat.uri, {
 				preserveFocus: false,
 			});
-			await vscode.commands.executeCommand('workbench.action.chat.newChat');
+			await this.executeCommand('workbench.action.chat.newChat');
 		} catch {
 			// §6.8: newChat is confirmed unreliable (R10) for reasons beyond R12's
 			// fix. Layers 2–3 (scope_hash mismatch, inlining) are the real backstop.
@@ -1634,10 +2086,27 @@ export class RunManager {
 	}
 
 	private async closeTaskChatTab(taskId: string, cfg: RunManagerConfig): Promise<void> {
-		const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
-		const sessionUri = task?.chat
-			? sessionUriForId(task.chat)
-			: sessionUriForTask(taskId, cfg.sessionPrefix, this.store.setId);
-		await closeTaskChatTabs(sessionUri, this.tabGroups);
+		const chat = await this.resolveTaskChat(taskId, cfg, false);
+		if (chat) {
+			await closeTaskChatTabs(chat.uri, this.tabGroups);
+		}
+	}
+
+	private async resolveTaskChat(
+		taskId: string,
+		cfg: RunManagerConfig,
+		persistFallback: boolean,
+	): Promise<{ uri: vscode.Uri; sessionId: string } | undefined> {
+		const { tasks } = await this.store.readAll();
+		const task = tasks.find((candidate) => candidate.id === taskId);
+		if (!task) {
+			return undefined;
+		}
+
+		const sessionId = sessionIdForTaskBinding(task, cfg.sessionPrefix, this.store.setId);
+		if (persistFallback && !task.chat) {
+			await this.store.patch(task.id, { chat: sessionId });
+		}
+		return { sessionId, uri: sessionUriForTaskBinding({ ...task, chat: sessionId }, cfg.sessionPrefix, this.store.setId) };
 	}
 }

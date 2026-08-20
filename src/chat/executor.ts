@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { Task } from '../model/task';
 import { Stage } from './receipt';
-import { sessionUriForTask } from './sessionUri';
+import { sessionUriForTaskBinding } from './sessionUri';
 
 /**
  * Confirmed present via the Configure Tools picker (built-in `vscode`
@@ -46,6 +46,12 @@ export function orderedTaskChatAttachments(
 
 interface ChatAgentResultish {
 	metadata?: { sessionId?: string };
+}
+
+/** Minimal command surface used by the executor and its concurrency tests. */
+export interface ChatCommandApi {
+	getCommands(includeInternal?: boolean): Thenable<string[]>;
+	executeCommand<T>(command: string, ...args: unknown[]): Thenable<T>;
 }
 
 /** Serializes injections process-wide (§6.9) — two card actions can never race for focus. */
@@ -95,27 +101,17 @@ export function taskChatOpenOptions(openBeside: boolean): vscode.TextDocumentSho
 }
 
 /**
- * The mode-scoped open action id is built at runtime by VS Code from the
- * mode's own name (`getOpenChatActionIdForMode`) — M0 confirmed it comes out
- * lowercase (`workbench.action.chat.openagent`, not `openAgent`). Looked up
- * against the live command registry rather than trusted blind, per §6.6.
- */
-async function resolveAgentOpenCommand(mode: string): Promise<string | undefined> {
-	const all = await vscode.commands.getCommands(true);
-	const expected = `workbench.action.chat.open${mode}`.toLowerCase();
-	return all.find((id) => id.toLowerCase() === expected);
-}
-
-/**
  * The v1 `Executor` (PRD §6.6) — the mechanism proven in
  * `copilot-poc/src/extension.ts`, extended with the session binding of §6.7
  * and the narrow-window protocol of §6.9: nothing is awaited between opening
  * the session and injecting, and a process-wide mutex serializes the pair.
  */
 export class ChatSessionExecutor implements Executor {
+	constructor(private readonly commands: ChatCommandApi = vscode.commands) {}
+
 	async isAvailable(mode = 'agent'): Promise<boolean> {
-		const openCommand = await resolveAgentOpenCommand(mode);
-		const all = await vscode.commands.getCommands(true);
+		const openCommand = await this.resolveAgentOpenCommand(mode);
+		const all = await this.commands.getCommands(true);
 		return !!openCommand && all.includes('vscode.open');
 	}
 
@@ -126,48 +122,58 @@ export class ChatSessionExecutor implements Executor {
 		stage: Stage,
 		options: RunOptions,
 	): Promise<ExecutorResult> {
-		const openCommand = await resolveAgentOpenCommand(options.mode);
+		const openCommand = await this.resolveAgentOpenCommand(options.mode);
 		if (!openCommand) {
 			return this.clipboardFallback(task, prompt, options);
 		}
 
-		return injectionMutex.run(async () => {
-			try {
-				// Open immediately before injecting, with nothing awaited in
-				// between (§6.9) — every added await is another window for
-				// focus to move.
-				await vscode.commands.executeCommand(
+		try {
+			// Open immediately before injecting, with nothing awaited in
+			// between (§6.9) — every added await is another window for
+			// focus to move. The command's terminal response is returned as a
+			// value so the mutex releases before blockOnResponse settles.
+			const pending = await injectionMutex.run(async () => {
+				await this.commands.executeCommand(
 					'vscode.open',
-					sessionUriForTask(task.id, options.sessionPrefix, task.setId),
+					sessionUriForTaskBinding(task, options.sessionPrefix, task.setId),
 					taskChatOpenOptions(options.openBeside === true),
 				);
 
-				const result = await vscode.commands.executeCommand(openCommand, {
-					query: prompt,
-					mode: options.mode,
-					blockOnResponse: true,
-					attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
-					toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
-					toolsExclude: options.toolsExclude,
-					...(options.modelSelector && Object.keys(options.modelSelector).length
-						? { modelSelector: options.modelSelector }
-						: {}),
-				});
+				return {
+					response: this.commands.executeCommand<ChatAgentResultish | undefined>(openCommand, {
+						query: prompt,
+						mode: options.mode,
+						blockOnResponse: true,
+						attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
+						toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
+						toolsExclude: options.toolsExclude,
+						...(options.modelSelector && Object.keys(options.modelSelector).length
+							? { modelSelector: options.modelSelector }
+							: {}),
+					}),
+				};
+			});
 
-				const sessionId = (result as ChatAgentResultish | undefined)?.metadata?.sessionId;
-				return { ok: true, sessionId };
-			} catch (e) {
-				return { ok: false, error: e instanceof Error ? e.message : String(e) };
-			}
-		});
+			const result = await pending.response;
+			const sessionId = result?.metadata?.sessionId;
+			return { ok: true, sessionId };
+		} catch (e) {
+			return { ok: false, error: e instanceof Error ? e.message : String(e) };
+		}
+	}
+
+	private async resolveAgentOpenCommand(mode: string): Promise<string | undefined> {
+		const all = await this.commands.getCommands(true);
+		const expected = `workbench.action.chat.open${mode}`.toLowerCase();
+		return all.find((id) => id.toLowerCase() === expected);
 	}
 
 	/** §6.6: on failure, session binding still holds and the board still tracks state via the receipt. */
 	private async clipboardFallback(task: Task, prompt: string, options: RunOptions): Promise<ExecutorResult> {
 		try {
-			await vscode.commands.executeCommand(
+			await this.commands.executeCommand(
 				'vscode.open',
-				sessionUriForTask(task.id, options.sessionPrefix, task.setId),
+				sessionUriForTaskBinding(task, options.sessionPrefix, task.setId),
 				taskChatOpenOptions(options.openBeside === true),
 			);
 			await vscode.env.clipboard.writeText(prompt);

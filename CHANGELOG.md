@@ -8,6 +8,47 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.3.2] - 2026-08-20
+
+### Added
+
+- Human-confirmed **Recover Stale Completion** support for adopting an exact successful receipt
+	from an extension-started timed-out or missing-receipt run, with candidate validation, modal
+	confirmation, normal gate handling, append-only audit history, and no new agent run.
+- Durable task-to-chat session bindings that are reused by Open Chat and stage runs after board or
+	window reloads, while keeping named task-set conversations isolated.
+
+### Changed
+
+- Receipt reconciliation now requires exact task, run, and stage identity, records actionable
+	diagnostics for rejected or malformed receipt-like lines, and applies eligible same-run late
+	receipts idempotently. Stopped, manually moved, newer, or otherwise superseded run output cannot
+	overwrite the current task; stale completion recovery remains an explicit human decision.
+- Parallel task execution now allows admitted runs to await their own Copilot responses while
+	serializing only the short session open-and-inject handoff. `run.maxParallelTasks` remains the
+	capacity authority, and no backend server is required.
+- Agent assignment discovery now includes workspace `.github/agents` and `.claude/agents`,
+	configured agent-file locations, and user-level `~/.copilot/agents` and `~/.claude/agents`
+	folders, with workspace-first collision precedence and compatibility for legacy assignments.
+- Pending completion cards now say **Review Required** while preserving the transition context and
+	existing Apply Pending Completion behavior.
+
+### Fixed
+
+- Valid PNG, JPEG, GIF, and WebP attachments referenced by the current task now render in task
+	details through safe webview resources; missing, corrupt, cross-task, remote, SVG, raw-HTML, and
+	other unsafe references remain an unavailable placeholder.
+
+## [0.3.1] - 2026-08-19
+
+### Changed
+
+- Improved the board webview for smaller views and fixed parallel task handling.
+
+### Fixed
+
+- Fixed pasting images into task fields.
+
 ## [0.3.0] - 2026-08-18
 
 ### Added

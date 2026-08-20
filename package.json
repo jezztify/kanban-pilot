@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -130,6 +130,11 @@
       {
         "command": "kanban-pilot.applyPendingOutcome",
         "title": "Apply Pending Completion",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.recoverStaleCompletion",
+        "title": "Recover Stale Completion",
         "category": "Kanban Pilot"
       },
       {

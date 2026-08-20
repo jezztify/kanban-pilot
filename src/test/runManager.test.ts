@@ -5,13 +5,14 @@ import * as vscode from 'vscode';
 
 import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { Executor, ExecutorResult, RunOptions } from '../chat/executor';
-import { closeTaskChatTabs, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
+import { ChatCommandApi, ChatSessionExecutor, Executor, ExecutorResult, RunOptions } from '../chat/executor';
+import { closeTaskChatTabs, CommandExecutor, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 import { parseAuditEvents } from '../model/taskLog';
-import { sessionUriForTask } from '../chat/sessionUri';
+import { sessionUriForTask, sessionUriForTaskBinding } from '../chat/sessionUri';
 import { RECEIPT_COMPLETION_GATES } from '../model/gates';
+import { hashScope } from '../chat/scopeHash';
 
 /**
  * M3 — RunManager orchestration (PRD §6.4, §6.9). Uses a stub `Executor` so
@@ -51,6 +52,22 @@ async function waitUntilSettled(store: TaskStore, taskId: string): Promise<Task>
 
 type Next = (task: Task, prompt: string) => Promise<ExecutorResult> | 'hang';
 
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve(value: T): void;
+	reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
 class StubExecutor implements Executor {
 	calls: { task: Task; prompt: string; options: RunOptions }[] = [];
 	constructor(private next: Next) {}
@@ -75,6 +92,36 @@ class StubExecutor implements Executor {
 		}
 		return outcome;
 	}
+}
+
+class PendingChatCommands implements ChatCommandApi {
+	readonly responses: { runId: string; deferred: Deferred<unknown> }[] = [];
+
+	getCommands(): Thenable<string[]> {
+		return Promise.resolve(['workbench.action.chat.openagent']);
+	}
+
+	executeCommand<T>(command: string, ...args: unknown[]): Thenable<T> {
+		if (command === 'vscode.open') {
+			return Promise.resolve(undefined as T);
+		}
+
+		const query = (args[0] as { query?: unknown } | undefined)?.query;
+		if (typeof query !== 'string') {
+			return Promise.reject(new Error('chat command did not receive a prompt'));
+		}
+
+		const response = deferred<unknown>();
+		this.responses.push({ runId: runIdFromPrompt(query), deferred: response });
+		return response.promise as unknown as Thenable<T>;
+	}
+}
+
+function recordingCommandExecutor(calls: { command: string; args: readonly unknown[] }[]): CommandExecutor {
+	return <T>(command: string, ...args: unknown[]) => {
+		calls.push({ command, args });
+		return Promise.resolve(undefined as T);
+	};
 }
 
 /** Every default template embeds `run:<id>` in the receipt instruction (verified separately). */
@@ -146,6 +193,82 @@ function okReceiptThenProposals(
 	};
 }
 
+async function seedStaleCompletionHistory(
+	store: TaskStore,
+	task: Task,
+	stage: 'refine' | 'develop' | 'validate',
+	oldRunId: string,
+	newerRunId?: string,
+	withProposal = false,
+	fallback: 'timeout' | 'missing-receipt' = 'timeout',
+	includeSuccess = true,
+): Promise<void> {
+	const state = stage === 'refine' ? 'refine' : stage === 'develop' ? 'in-progress' : 'validation';
+	const fallbackStatus = fallback === 'timeout' ? 'failed' : 'blocked';
+	await store.patch(task.id, { state, status: fallbackStatus });
+	await store.auditedPatch(task.id, { state, status: fallbackStatus }, {
+		action: stage,
+		runId: oldRunId,
+		events: [{ kind: 'activity-start', stage, action: stage, runId: oldRunId }],
+	});
+	await store.appendLog(task.id, formatReceipt({
+		runId: oldRunId,
+		taskId: task.id,
+		stage,
+		result: fallback === 'timeout' ? 'failed' : 'blocked',
+		note: fallback === 'timeout' ? 'timed out; awaiting late receipt' : 'no receipt found; awaiting late receipt',
+	}));
+	await store.auditedPatch(task.id, { status: fallbackStatus, run: undefined }, {
+		action: fallback === 'timeout' ? 'timeout' : 'missing-receipt',
+		runId: oldRunId,
+		outcome: fallback === 'timeout' ? 'timeout' : 'missing-receipt',
+		events: [{
+			kind: 'activity-finish',
+			runId: oldRunId,
+			stage,
+			outcome: fallback === 'timeout' ? 'timeout' : 'missing-receipt',
+			provisional: true,
+			note: fallback === 'timeout' ? 'Activity timed out; awaiting late receipt.' : 'No receipt found; awaiting late receipt.',
+		}],
+	});
+
+	if (newerRunId) {
+		await store.auditedPatch(task.id, { status: 'idle' }, { action: stage });
+		await store.auditedPatch(task.id, { status: 'running', run: newerRunId }, {
+			action: stage,
+			runId: newerRunId,
+			events: [{ kind: 'activity-start', stage, action: stage, runId: newerRunId }],
+		});
+		await store.appendLog(task.id, formatReceipt({
+			runId: newerRunId,
+			taskId: task.id,
+			stage,
+			result: 'failed',
+			note: 'retry failed',
+		}));
+		await store.auditedPatch(task.id, { status: 'failed', run: undefined }, {
+			action: 'executor-error',
+			runId: newerRunId,
+			outcome: 'error',
+			events: [{ kind: 'activity-finish', runId: newerRunId, stage, outcome: 'error', note: 'Retry failed.' }],
+		});
+	}
+
+	if (withProposal) {
+		await store.appendLog(task.id, `- propose-task run:${oldRunId} title:"Recovered follow-up" note:"created by the stale run"`);
+	}
+	if (!includeSuccess) {
+		return;
+	}
+	await store.appendLog(task.id, formatReceipt({
+		runId: oldRunId,
+		taskId: task.id,
+		stage,
+		result: 'ok',
+		note: 'implementation finished in the earlier run',
+	}));
+}
+
 suite('M3 RunManager', () => {
 	let store: TaskStore;
 	let dir: vscode.Uri;
@@ -211,7 +334,8 @@ suite('M3 RunManager', () => {
 
 		test('manual move into Done closes only the matching task chat tab', async () => {
 			const task = await store.create('Close chat on manual completion');
-			const target = sessionUriForTask(task.id);
+			await store.patch(task.id, { chat: 'persisted-close-session' });
+			const target = sessionUriForTaskBinding({ id: task.id, chat: 'persisted-close-session' });
 			const other = sessionUriForTask('TASK-004');
 			const matchingTab = { input: { uri: target } } as unknown as vscode.Tab;
 			const otherTab = { input: { uri: other } } as unknown as vscode.Tab;
@@ -283,6 +407,194 @@ suite('M3 RunManager', () => {
 			await waitUntil(() => executor.calls.length > 0); // phase 2 is fire-and-forget
 			assert.strictEqual(executor.calls.length, 1);
 			assert.strictEqual(executor.calls[0].options.openBeside, true);
+		});
+
+		test('docking persists first-use identity and reuses it after manager recreation', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('layout.dockChat', true, vscode.ConfigurationTarget.Global);
+			try {
+				const existing = await store.create('Existing conversation');
+				await store.patch(existing.id, { chat: 'persisted-before-reload' });
+				const firstCalls: { command: string; args: readonly unknown[] }[] = [];
+				const firstManager = new RunManager(
+					store,
+					new StubExecutor(() => 'hang'),
+					folder,
+					undefined,
+					recordingCommandExecutor(firstCalls),
+				);
+
+				await firstManager.dockTaskChat(existing.id, { onSelect: false });
+				const existingUri = firstCalls[0].args[0] as vscode.Uri;
+				assert.strictEqual(existingUri.toString(), sessionUriForTaskBinding({ id: existing.id, chat: 'persisted-before-reload' }, 'new-prefix-', store.setId).toString());
+
+				const reloadedCalls: { command: string; args: readonly unknown[] }[] = [];
+				const reloadedManager = new RunManager(
+					store,
+					new StubExecutor(() => 'hang'),
+					folder,
+					undefined,
+					recordingCommandExecutor(reloadedCalls),
+				);
+				await reloadedManager.dockTaskChat(existing.id, { onSelect: false });
+				assert.strictEqual((reloadedCalls[0].args[0] as vscode.Uri).toString(), existingUri.toString());
+
+				const firstUse = await store.create('First chat');
+				const firstUseCalls: { command: string; args: readonly unknown[] }[] = [];
+				const firstUseManager = new RunManager(
+					store,
+					new StubExecutor(() => 'hang'),
+					folder,
+					undefined,
+					recordingCommandExecutor(firstUseCalls),
+				);
+				await firstUseManager.dockTaskChat(firstUse.id, { onSelect: false });
+
+				const afterFirstUse = (await store.readAll()).tasks.find((candidate) => candidate.id === firstUse.id)!;
+				assert.ok(afterFirstUse.chat);
+				assert.strictEqual(
+					(firstUseCalls[0].args[0] as vscode.Uri).toString(),
+					sessionUriForTaskBinding(afterFirstUse, 'kanban-pilot-', store.setId).toString(),
+				);
+			} finally {
+				await cfg.update('layout.dockChat', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('an explicit Open Chat persists and opens its binding when automatic docking is disabled', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('layout.dockChat', false, vscode.ConfigurationTarget.Global);
+			try {
+				const task = await store.create('Open this conversation explicitly');
+				const calls: { command: string; args: readonly unknown[] }[] = [];
+				const manager = new RunManager(
+					store,
+					new StubExecutor(() => 'hang'),
+					folder,
+					undefined,
+					recordingCommandExecutor(calls),
+				);
+
+				await manager.dockTaskChat(task.id, { onSelect: false, explicit: true });
+
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.ok(after.chat, 'an explicit first-use open must persist the durable binding');
+				assert.deepStrictEqual(calls.map(({ command }) => command), ['vscode.open']);
+				assert.strictEqual(
+					(calls[0].args[0] as vscode.Uri).toString(),
+					sessionUriForTaskBinding(after, 'kanban-pilot-', store.setId).toString(),
+				);
+				assert.deepStrictEqual(calls[0].args[1], { preserveFocus: true, preview: true });
+			} finally {
+				await cfg.update('layout.dockChat', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a recreated manager preserves the binding for an ongoing run', async () => {
+			const task = await store.create('Ongoing conversation');
+			await store.patch(task.id, {
+				state: 'in-progress',
+				status: 'running',
+				run: 'r-active',
+				chat: 'ongoing-chat-session',
+			});
+			const calls: { command: string; args: readonly unknown[] }[] = [];
+			const reloadedManager = new RunManager(
+				store,
+				new StubExecutor(() => 'hang'),
+				folder,
+				undefined,
+				recordingCommandExecutor(calls),
+			);
+
+			await reloadedManager.dockTaskChat(task.id, { onSelect: false });
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.status, 'running');
+			assert.strictEqual(after.run, 'r-active');
+			assert.strictEqual(after.chat, 'ongoing-chat-session');
+			assert.strictEqual(
+				(calls[0].args[0] as vscode.Uri).toString(),
+				sessionUriForTaskBinding(after, 'different-prefix-', store.setId).toString(),
+			);
+		});
+
+		test('a reloaded manager opens Copilot’s persisted conversation id over a legacy derived binding', async () => {
+			const task = await store.create('Reopen the completed conversation');
+			await store.patch(task.id, {
+				chat: 'legacy-derived-binding',
+				copilot_session_id: 'copilot-conversation-id',
+			});
+			const calls: { command: string; args: readonly unknown[] }[] = [];
+			const manager = new RunManager(
+				store,
+				new StubExecutor(() => 'hang'),
+				folder,
+				undefined,
+				recordingCommandExecutor(calls),
+			);
+
+			await manager.dockTaskChat(task.id, { onSelect: false, explicit: true });
+
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(
+				(calls[0].args[0] as vscode.Uri).toString(),
+				sessionUriForTaskBinding(after, 'different-prefix-', store.setId).toString(),
+			);
+			assert.strictEqual(after.chat, 'legacy-derived-binding');
+			assert.strictEqual(after.copilotSessionId, 'copilot-conversation-id');
+		});
+
+		test('session reset reuses the persisted binding and opens it exactly once', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('chat.resetOnApprove', true, vscode.ConfigurationTarget.Global);
+			try {
+				const task = await store.create('Reset this conversation');
+				await store.patch(task.id, {
+					state: 'scoped',
+					status: 'idle',
+					chat: 'persisted-reset-session',
+				});
+				const calls: { command: string; args: readonly unknown[] }[] = [];
+				const manager = new RunManager(
+					store,
+					new StubExecutor(() => 'hang'),
+					folder,
+					undefined,
+					recordingCommandExecutor(calls),
+				);
+
+				await manager.handleAction(task.id, 'approve');
+
+				assert.deepStrictEqual(calls.map(({ command }) => command), [
+					'vscode.open',
+					'workbench.action.chat.newChat',
+				]);
+				assert.strictEqual(
+					(calls[0].args[0] as vscode.Uri).toString(),
+					sessionUriForTaskBinding({ id: task.id, chat: 'persisted-reset-session' }, 'different-prefix-', store.setId).toString(),
+				);
+				assert.strictEqual((await store.readAll()).tasks.find((candidate) => candidate.id === task.id)?.chat, 'persisted-reset-session');
+			} finally {
+				await cfg.update('chat.resetOnApprove', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('stage runs keep a persisted binding when resumed by a recreated manager', async () => {
+			const task = await store.create('Resume this conversation');
+			await store.patch(task.id, {
+				state: 'in-progress',
+				status: 'idle',
+				chat: 'persisted-resume-chat',
+			});
+			const executor = new StubExecutor(() => 'hang');
+			const reloadedManager = new RunManager(store, executor, folder);
+
+			await reloadedManager.handleAction(task.id, 'continue');
+			await waitUntil(() => executor.calls.length === 1);
+			assert.strictEqual(executor.calls[0].task.chat, 'persisted-resume-chat');
+			assert.strictEqual((await store.readAll()).tasks.find((candidate) => candidate.id === task.id)?.chat, 'persisted-resume-chat');
+
+			await reloadedManager.handleAction(task.id, 'stop');
 		});
 
 		test('approve moves Scoped → Approved and does not reset the session by default', async () => {
@@ -377,6 +689,7 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'scoped');
 			assert.strictEqual(after.status, 'idle');
 			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(after.chat, 's1', 'the concrete Copilot session id must replace the first-use derived binding');
 			assert.strictEqual(after.copilotSessionId, 's1');
 			assert.ok(after.scopeHash, 'refine success must record scope_hash for §6.8 layer 2');
 			const audit = parseAuditEvents(after.sections['Log']);
@@ -630,6 +943,74 @@ suite('M3 RunManager', () => {
 			const after = await waitUntilSettled(store, task.id);
 
 			assert.strictEqual(after.status, 'blocked', 'a task-id-mismatched receipt must be treated as no receipt at all');
+			assert.ok(after.sections['Log'].includes('receipt-diagnostic kind:task-mismatch'));
+			assert.ok(after.sections['Log'].includes('actual-task:TASK-999'));
+
+			const beforeRepeat = after.sections['Log'];
+			const watcherManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await watcherManager.reconcileTaskChange(task.id);
+			await watcherManager.reconcileTaskChange(task.id);
+			const afterRepeat = (await store.readAll()).tasks[0];
+			assert.strictEqual(
+				afterRepeat.sections['Log'].split('\n').filter((line) => line.includes('receipt-diagnostic kind:task-mismatch')).length,
+				1,
+				'a repeated reconciliation must not duplicate the mismatch diagnostic',
+			);
+			assert.ok(afterRepeat.sections['Log'].length >= beforeRepeat.length);
+		});
+
+		test('a receipt whose run id does not match the active run is rejected with a diagnostic', async () => {
+			const task = await store.create('Reject a stale run receipt');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(async (t) => {
+				await store.appendLog(t.id, formatReceipt({ runId: 'r-foreign', taskId: t.id, stage: 'refine', result: 'ok', note: 'stale run' }));
+				return { ok: true };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.status, 'blocked');
+			assert.ok(after.sections['Log'].includes('receipt-diagnostic kind:run-mismatch'));
+			assert.ok(after.sections['Log'].includes('actual-run:r-foreign'));
+		});
+
+		test('a wrong-stage receipt cannot hide a later exact-stage receipt', async () => {
+			const task = await store.create('Prefer the exact receipt stage');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'exact stage' }));
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'wrong stage' }));
+				return { ok: true };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'scoped');
+			assert.strictEqual(after.status, 'idle');
+		});
+
+		test('a wrong-stage receipt without an exact match is rejected with a diagnostic', async () => {
+			const task = await store.create('Reject a wrong-stage receipt');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(async (t, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'wrong stage' }));
+				return { ok: true };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.status, 'blocked');
+			assert.ok(after.sections['Log'].includes('receipt-diagnostic kind:stage-mismatch'));
+			assert.ok(after.sections['Log'].includes('actual-stage:develop'));
 		});
 
 		test('session id changing between runs sets chat_reset_required automatically (§6.9)', async () => {
@@ -1855,6 +2236,224 @@ suite('M3 RunManager', () => {
 		assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.action === 'manual-complete'));
 	});
 
+	test('lists a stale successful receipt without allowing automatic reconciliation to adopt it', async () => {
+		const task = await store.create('Recover the completed implementation');
+		await seedStaleCompletionHistory(store, task, 'develop', 'rignbml', 'rzpjmzh');
+		const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+
+		await manager.reconcileTaskChange(task.id);
+		let after = (await store.readAll()).tasks[0];
+		assert.strictEqual(after.state, 'in-progress');
+		assert.strictEqual(after.status, 'failed');
+		assert.strictEqual(after.pendingOutcome, undefined);
+
+		const candidates = await manager.listStaleCompletionCandidates(task.id);
+		assert.deepStrictEqual(candidates, [{
+			taskId: task.id,
+			runId: 'rignbml',
+			stage: 'develop',
+			result: 'ok',
+			note: 'implementation finished in the earlier run',
+			summary: 'implementation finished in the earlier run',
+			currentRunId: undefined,
+			latestRunId: 'rzpjmzh',
+			supersededByRunId: 'rzpjmzh',
+		}]);
+		assert.strictEqual(new StubExecutor(() => 'hang').calls.length, 0);
+
+		after = (await store.readAll()).tasks[0];
+		assert.strictEqual(after.state, 'in-progress', 'stale success must not be auto-applied');
+		assert.strictEqual(after.status, 'failed');
+	});
+
+	test('explicit stale recovery applies the normal Develop gate, proposals, and correction audit exactly once', async () => {
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		await cfg.update('gates.developToValidation', 'auto', vscode.ConfigurationTarget.Global);
+		try {
+			const task = await store.create('Recover Develop without rerunning it');
+			await seedStaleCompletionHistory(store, task, 'develop', 'r-old', 'r-new', true);
+			const executor = new StubExecutor(() => 'hang');
+			const manager = new RunManager(store, executor, folder);
+
+			const result = await manager.recoverStaleCompletion(task.id, 'r-old', 'develop');
+			assert.deepStrictEqual(result, { kind: 'recovered', runId: 'r-old', stage: 'develop', gate: 'developToValidation' });
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.pendingOutcome, undefined, 'the configured automatic gate should promote the recovered outcome');
+			assert.strictEqual(executor.calls.length, 0, 'recovery must not launch another executor run');
+			assert.strictEqual(parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === 'r-old' && receipt.result === 'ok').length, 1);
+			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.action === 'manual-recovery').length, 1);
+			assert.strictEqual((await store.readAll()).tasks.filter((candidate) => candidate.title === 'Recovered follow-up').length, 1);
+
+			const reloadedManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await reloadedManager.reconcileOnActivation();
+			await reloadedManager.reconcileTaskChange(task.id);
+			const repeated = await reloadedManager.recoverStaleCompletion(task.id, 'r-old', 'develop');
+			assert.notStrictEqual(repeated.kind, 'recovered');
+			const repeatedTask = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(parseAuditEvents(repeatedTask.sections['Log']).filter((event) => event.action === 'manual-recovery').length, 1);
+		} finally {
+			await cfg.update('gates.developToValidation', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+
+	test('manual stale recovery preserves the Refine scope hash in a pending completion', async () => {
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		await cfg.update('gates.refineToScoped', 'manual', vscode.ConfigurationTarget.Global);
+		try {
+			const task = await store.create('Recover Refine scope');
+			await store.edit(task.id, {
+				title: task.title,
+				request: task.sections.Request ?? '',
+				refined: task.sections.Refined ?? '',
+				scope: 'Recovered scope\n\n- Keep the original receipt.',
+			});
+			await seedStaleCompletionHistory(store, task, 'refine', 'r-refine', 'r-refine-retry');
+			const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+
+			const result = await manager.recoverStaleCompletion(task.id, 'r-refine', 'refine');
+			assert.deepStrictEqual(result, { kind: 'recovered', runId: 'r-refine', stage: 'refine', gate: 'refineToScoped' });
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.pendingOutcome?.scopeHash, hashScope(after.sections.Scope));
+			assert.strictEqual(after.pendingOutcome?.scopeHash, hashScope('Recovered scope\n\n- Keep the original receipt.'));
+		} finally {
+			await cfg.update('gates.refineToScoped', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+
+	test('manual stale Develop recovery keeps the normal pending gate until it is applied', async () => {
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		await cfg.update('gates.developToValidation', 'manual', vscode.ConfigurationTarget.Global);
+		try {
+			const task = await store.create('Recover Develop with a manual gate');
+			await seedStaleCompletionHistory(store, task, 'develop', 'r-manual-old', 'r-manual-retry');
+			const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+
+			assert.deepStrictEqual(
+				await manager.recoverStaleCompletion(task.id, 'r-manual-old', 'develop'),
+				{ kind: 'recovered', runId: 'r-manual-old', stage: 'develop', gate: 'developToValidation' },
+			);
+			let after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'in-progress');
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.pendingOutcome?.gate, 'developToValidation');
+
+			assert.deepStrictEqual(await manager.applyPendingOutcome(task.id), { kind: 'applied', gate: 'developToValidation' });
+			after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.pendingOutcome, undefined);
+		} finally {
+			await cfg.update('gates.developToValidation', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+
+	test('stale Validate recovery uses the normal Validate-to-Done semantics', async () => {
+		const task = await store.create('Recover Validate without rerunning QA');
+		await seedStaleCompletionHistory(store, task, 'validate', 'r-validate-old', 'r-validate-retry');
+		const executor = new StubExecutor(() => 'hang');
+		const manager = new RunManager(store, executor, folder);
+
+		const result = await manager.recoverStaleCompletion(task.id, 'r-validate-old', 'validate');
+		assert.deepStrictEqual(result, { kind: 'recovered', runId: 'r-validate-old', stage: 'validate', gate: 'validateToDone' });
+		const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+		assert.strictEqual(after.state, 'done');
+		assert.strictEqual(after.status, 'idle');
+		assert.strictEqual(after.pendingOutcome, undefined);
+		assert.strictEqual(executor.calls.length, 0);
+		assert.ok(parseAuditEvents(after.sections['Log']).some((event) =>
+			event.kind === 'activity-finish' && event.action === 'manual-recovery' && event.correction && event.outcome === 'ok',
+		));
+	});
+
+	test('stale recovery accepts a canonical success after a missing-receipt fallback', async () => {
+		const task = await store.create('Recover a blocked completion');
+		await seedStaleCompletionHistory(store, task, 'develop', 'r-missing-receipt', undefined, false, 'missing-receipt');
+		const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+
+		const candidates = await manager.listStaleCompletionCandidates(task.id);
+		assert.strictEqual(candidates.length, 1);
+		assert.strictEqual(candidates[0].runId, 'r-missing-receipt');
+		assert.deepStrictEqual(
+			await manager.recoverStaleCompletion(task.id, 'r-missing-receipt', 'develop'),
+			{ kind: 'recovered', runId: 'r-missing-receipt', stage: 'develop', gate: 'developToValidation' },
+		);
+		assert.strictEqual((await store.readAll()).tasks[0].state, 'validation');
+	});
+
+	test('stale recovery does not deadlock when applying the correction fails', async () => {
+		const task = await store.create('Recover with a persistence failure');
+		await seedStaleCompletionHistory(store, task, 'develop', 'r-persistence-failure');
+		const failingStore = new TaskStore(store.directory, store.setId, async () => {
+			throw new Error('simulated recovery write failure');
+		});
+		const manager = new RunManager(failingStore, new StubExecutor(() => 'hang'), folder);
+		const completion = manager.recoverStaleCompletion(task.id, 'r-persistence-failure', 'develop');
+		const result = await Promise.race([
+			completion.then(() => 'resolved', () => 'rejected'),
+			new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 500)),
+		]);
+		assert.strictEqual(result, 'rejected', 'recovery errors must release the coordinator instead of waiting on a nested lock');
+	});
+
+	test('stale recovery requires extension history, a fallback marker, and the exact stage', async () => {
+		const noHistory = await store.create('Success with no extension history');
+		await store.patch(noHistory.id, { state: 'in-progress', status: 'failed' });
+		await store.appendLog(noHistory.id, formatReceipt({
+			runId: 'r-no-history',
+			taskId: noHistory.id,
+			stage: 'develop',
+			result: 'ok',
+			note: 'hand written success',
+		}));
+
+		const fallbackOnly = await store.create('Fallback with no success');
+		await seedStaleCompletionHistory(store, fallbackOnly, 'develop', 'r-fallback-only', undefined, false, 'timeout', false);
+
+		const wrongStage = await store.create('Success for the wrong stage');
+		await seedStaleCompletionHistory(store, wrongStage, 'refine', 'r-wrong-stage');
+		await store.patch(wrongStage.id, { state: 'in-progress', status: 'failed' });
+
+		const wrongTask = await store.create('Receipt names another task');
+		await store.patch(wrongTask.id, { state: 'in-progress', status: 'failed' });
+		await store.appendLog(wrongTask.id, formatReceipt({
+			runId: 'r-wrong-task',
+			taskId: 'TASK-999',
+			stage: 'develop',
+			result: 'ok',
+			note: 'misrouted success',
+		}));
+
+		const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+		for (const task of [noHistory, fallbackOnly, wrongStage, wrongTask]) {
+			assert.deepStrictEqual(await manager.listStaleCompletionCandidates(task.id), [], task.title);
+		}
+	});
+
+	test('stale recovery filters arbitrary receipts, active runs, and manually moved tasks', async () => {
+		const arbitrary = await store.create('Reject an arbitrary success');
+		await store.patch(arbitrary.id, { state: 'in-progress', status: 'failed' });
+		await store.appendLog(arbitrary.id, formatReceipt({ runId: 'hand-written', taskId: arbitrary.id, stage: 'develop', result: 'ok', note: 'not extension-owned' }));
+		const manager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+		assert.deepStrictEqual(await manager.listStaleCompletionCandidates(arbitrary.id), []);
+		assert.notStrictEqual((await manager.recoverStaleCompletion(arbitrary.id, 'hand-written', 'develop')).kind, 'recovered');
+
+		const active = await store.create('Reject while newer run is active');
+		await seedStaleCompletionHistory(store, active, 'develop', 'r-active-old');
+		await store.patch(active.id, { status: 'running', run: 'r-active-new' });
+		assert.deepStrictEqual(await manager.listStaleCompletionCandidates(active.id), []);
+		assert.strictEqual((await manager.recoverStaleCompletion(active.id, 'r-active-old', 'develop')).kind, 'active-run');
+
+		const moved = await store.create('Reject after manual move');
+		await seedStaleCompletionHistory(store, moved, 'develop', 'r-moved-old');
+		assert.deepStrictEqual(await manager.moveTask(moved.id, 'done'), { kind: 'applied' });
+		await manager.moveTask(moved.id, 'in-progress');
+		await store.patch(moved.id, { status: 'failed' });
+		assert.deepStrictEqual(await manager.listStaleCompletionCandidates(moved.id), []);
+	});
+
 	suite('configurable run capacity', () => {
 		async function withMaxParallelTasks(value: unknown, fn: () => Promise<void>): Promise<void> {
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
@@ -1937,6 +2536,72 @@ suite('M3 RunManager', () => {
 		});
 	});
 
+	test('configured capacity reaches two real chat injections before either response settles', async () => {
+		await withMaxParallelTasks(2, async () => {
+			const first = await store.create('First real chat run');
+			const second = await store.create('Second real chat run');
+			const third = await store.create('Run after a real completion');
+			for (const task of [first, second, third]) {
+				await store.patch(task.id, { state: 'approved', status: 'idle' });
+			}
+
+			const commands = new PendingChatCommands();
+			const manager = new RunManager(store, new ChatSessionExecutor(commands), folder);
+			await Promise.all([
+				manager.handleAction(first.id, 'develop'),
+				manager.handleAction(second.id, 'develop'),
+			]);
+
+			await waitUntil(() => commands.responses.length === 2);
+			let after = await store.readAll();
+			assert.strictEqual(after.tasks.filter((task) => task.status === 'running').length, 2);
+
+			const responseCountBeforeDuplicateStart = commands.responses.length;
+			await manager.handleAction(first.id, 'continue');
+			assert.strictEqual(
+				commands.responses.length,
+				responseCountBeforeDuplicateStart,
+				'a second start for an active task must be rejected by the coordinator',
+			);
+
+			const settle = async (pending: { runId: string; deferred: Deferred<unknown> }): Promise<Task> => {
+				const current = (await store.readAll()).tasks.find((task) => task.run === pending.runId);
+				if (!current) {
+					throw new Error(`No running task found for ${pending.runId}`);
+				}
+				pending.deferred.resolve({ metadata: { sessionId: `session-${current.id}` } });
+				await store.appendLog(current.id, formatReceipt({
+					runId: pending.runId,
+					taskId: current.id,
+					stage: 'develop',
+					result: 'ok',
+					note: 'real chat completion',
+				}));
+				const settled = await waitUntilSettled(store, current.id);
+				assert.strictEqual(settled.copilotSessionId, `session-${current.id}`);
+				return settled;
+			};
+
+			const firstRunId = (await store.readAll()).tasks.find((task) => task.id === first.id)?.run;
+			const firstResponse = commands.responses.find((response) => response.runId === firstRunId);
+			if (!firstResponse) {
+				throw new Error('First real chat response was not registered');
+			}
+			await settle(firstResponse);
+
+			await waitUntil(async () => {
+				await manager.handleAction(third.id, 'develop');
+				return commands.responses.length === 3;
+			});
+			after = await store.readAll();
+			assert.strictEqual(after.tasks.find((task) => task.id === third.id)?.status, 'running');
+
+			for (const pending of commands.responses.filter((response) => response.deferred !== firstResponse.deferred)) {
+				await settle(pending);
+			}
+		});
+	});
+
 	test('identical task ids in different sets use independent reservations and chats', async () => {
 		await withMaxParallelTasks(1, async () => {
 			const firstStore = new TaskStore(vscode.Uri.joinPath(dir, 'first'), 'set-first');
@@ -1946,11 +2611,7 @@ suite('M3 RunManager', () => {
 			const first = await firstStore.create('First set task');
 			const second = await secondStore.create('Second set task');
 			await firstStore.patch(first.id, { state: 'refine', status: 'idle' });
-			await secondStore.patch(second.id, {
-				state: 'refine',
-				status: 'idle',
-				chat: 'kanban-pilot-TASK-001',
-			});
+			await secondStore.patch(second.id, { state: 'refine', status: 'idle' });
 			const firstExecutor = new StubExecutor(() => 'hang');
 			const secondExecutor = new StubExecutor(() => 'hang');
 			const firstManager = new RunManager(firstStore, firstExecutor, folder);

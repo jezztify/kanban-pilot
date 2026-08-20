@@ -3,7 +3,7 @@ import { deleteTask, pickTaskFor } from './board/actions';
 import { BoardPanel } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
 import { ChatSessionExecutor } from './chat/executor';
-import { normalizeMaxParallelTasks, RunManager } from './chat/runManager';
+import { normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
 import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore } from './model/taskStore';
@@ -69,7 +69,7 @@ export class WorkspaceTaskSetContext {
 			this.watcherQueue = this.watcherQueue
 				.then(() => changeKind === 'position-only' ? undefined : manager.reconcileTaskChange(taskId))
 				.then(() => changeKind === 'position-only' ? undefined : manager.applyGatePolicies())
-				.catch(() => undefined);
+				.catch((error) => manager.recordReconciliationFailure(taskId, error));
 		});
 	}
 
@@ -417,7 +417,7 @@ export function activate(context_: vscode.ExtensionContext) {
 			if (id) {
 				// Deliberately bypasses the dockChat/dockChatOnSelect gates — an
 				// explicit "open the chat" ask, not automatic docking (§6.10).
-				await ctx.runManager.dockTaskChat(id, { onSelect: false });
+				await ctx.runManager.dockTaskChat(id, { onSelect: false, explicit: true });
 			}
 		}),
 
@@ -486,6 +486,85 @@ export function activate(context_: vscode.ExtensionContext) {
 			}
 			if (id) {
 				await ctx.runManager.applyPendingOutcome(id);
+			}
+		}),
+
+		vscode.commands.registerCommand('kanban-pilot.recoverStaleCompletion', async (taskId?: string) => {
+			const ctx = context();
+			if (!ctx) {
+				return;
+			}
+			await ctx.ready;
+
+			const allCandidates = await ctx.runManager.listStaleCompletionCandidates(taskId);
+			if (allCandidates.length === 0) {
+				void vscode.window.showInformationMessage('No validated stale completions are available for recovery.');
+				return;
+			}
+
+			let selectedTaskId = taskId;
+			if (!selectedTaskId) {
+				const taskPicks = [...new Set(allCandidates.map((candidate) => candidate.taskId))].map((id) => ({
+					label: id,
+					description: `${allCandidates.filter((candidate) => candidate.taskId === id).length} validated stale completion(s)`,
+					id,
+				}));
+				const taskPick = await vscode.window.showQuickPick(taskPicks, {
+					placeHolder: 'Pick a retryable task with a stale completion',
+				});
+				selectedTaskId = taskPick?.id;
+			}
+			if (!selectedTaskId) {
+				return;
+			}
+
+			const taskCandidates = allCandidates.filter((candidate) => candidate.taskId === selectedTaskId);
+			if (taskCandidates.length === 0) {
+				void vscode.window.showInformationMessage(`No validated stale completions remain for ${selectedTaskId}.`);
+				return;
+			}
+			const candidatePick = await vscode.window.showQuickPick(
+				taskCandidates.map((candidate) => ({
+					label: `${candidate.stage} · ${candidate.runId}`,
+					description: `Latest run: ${candidate.latestRunId ?? 'none'} · Receipt: ${candidate.summary}`,
+					detail: candidate.supersededByRunId
+						? `This completion predates retry ${candidate.supersededByRunId}.`
+						: 'This completion belongs to the timed-out or missing-receipt run.',
+					candidate,
+				})),
+				{ placeHolder: 'Pick the stale completion to recover' },
+			);
+			const selected = candidatePick?.candidate as StaleCompletionCandidate | undefined;
+			if (!selected) {
+				return;
+			}
+
+			const currentRun = selected.currentRunId ?? 'none';
+			const latestRun = selected.latestRunId ?? 'none';
+			const confirmed = await vscode.window.showWarningMessage(
+				`Recover ${selected.stage} completion for ${selected.taskId} from old run ${selected.runId}? Current run: ${currentRun}. Latest run: ${latestRun}. Receipt: ${selected.summary}`,
+				{ modal: true },
+				'Recover',
+			);
+			if (confirmed !== 'Recover') {
+				return;
+			}
+
+			try {
+				const result = await ctx.runManager.recoverStaleCompletion(selected.taskId, selected.runId, selected.stage);
+				if (result.kind === 'recovered') {
+					void vscode.window.showInformationMessage(
+						`Recovered ${selected.stage} completion for ${selected.taskId} without starting a new run.`,
+					);
+					return;
+				}
+				if (result.kind === 'active-run') {
+					void vscode.window.showWarningMessage('Recovery was not applied because a newer run is active.');
+					return;
+				}
+				void vscode.window.showWarningMessage('Recovery was not applied because the selected completion is stale. Refresh and choose a current validated candidate.');
+			} catch (error) {
+				void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
 			}
 		}),
 

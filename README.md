@@ -98,11 +98,12 @@ the card waits for you. Flip any gate to **Auto** in Settings when you'd rather 
 - `gates.splitToDone` — retire a Split parent after its children are persisted.
 
 When a finishing gate is manual, the run still completes and its result is written to the card's
-log — the card just holds the outcome as **pending** instead of moving. Apply it from the card's
-detail dialog or the **Apply Pending Completion** command whenever you're ready; applying it only
-moves the card and never starts another agent run. Pending outcomes survive reloads and window
-restarts. Auto stage starts still respect the shared run-capacity limit. Blocked or failed work is
-never retried on its own.
+log — the card just holds the outcome for review instead of moving and shows **Review Required**.
+Apply it from the card's detail dialog or the **Apply Pending Completion** command whenever you're
+ready; the transition context remains available, applying it only moves the card, and it never
+starts another agent run. Review-required outcomes survive reloads and window restarts. Auto stage
+starts still respect the shared run-capacity limit. Blocked or failed work is never retried on its
+own.
 
 ## Things you'll do along the way
 
@@ -110,7 +111,9 @@ never retried on its own.
 
 Use the **Task set** picker in the header to switch between the built-in **Default** set and any
 named sets you create. Each set keeps its own tasks, its own card order, and its own chat
-sessions, so an experiment doesn't get tangled up with your main work.
+sessions, so an experiment doesn't get tangled up with your main work. A task's persisted chat
+binding is reused by **Open Chat** and later stage runs after the board or window is reloaded; the
+set-specific binding keeps chats from different sets isolated.
 
 - **New** creates a set and switches to it.
 - **Rename** works on named sets; **Delete** works on empty named sets.
@@ -145,10 +148,22 @@ note about whether a split looks worthwhile — a suggestion for you, not an aut
 Split is transactional: the parent is retired only after valid, same-run child proposals have
 been persisted in the active task set. Missing or invalid proposals, or a child-write failure,
 leave the parent retryable instead of silently marking it Done; repeated reconciliation does not
-create duplicate children. A timed-out run is marked failed and remains retryable when no receipt
-arrives, but a matching late receipt from that run can still be reconciled. A receipt from a run
-that was stopped, manually moved, or replaced by a newer retry cannot overwrite the newer task
-state.
+create duplicate children. Receipt reconciliation requires the exact task, run, and stage identity;
+wrong-task, wrong-run, wrong-stage, or malformed receipt-like lines are ignored and leave an
+actionable diagnostic in the task log. A timed-out run is marked failed and remains retryable when
+no receipt arrives, but a matching late receipt from that run can still be reconciled once its
+fallback history is verified. A receipt from a run that was stopped, manually moved, or replaced
+by a newer retry cannot overwrite the newer task state.
+
+If an earlier implementation finished but its receipt arrived after the extension had already
+timed out that run and a later retry failed, use **Kanban Pilot: Recover Stale Completion** or
+the recovery action in the task detail. Automatic reconciliation never treats old and new run
+ids as interchangeable. The command lists only candidates with an exact successful receipt,
+extension-owned start and timeout/missing-receipt history, and a retryable task with no active
+run or pending outcome. It shows the old and latest run context and asks for modal confirmation
+before applying the ordinary stage gate. Recovery is append-only and idempotent, records a
+manual-recovery correction audit, processes eligible proposals once, and never starts another
+agent run. The normal retry remains available when no validated candidate exists.
 
 ### Let agents file follow-up work
 
@@ -176,9 +191,10 @@ assignments are the one batched category: one **Save** commits all seven column 
 each column keeps its own **Reset** control before the shared save.
 
 Agent assignments use keyboard-accessible dropdowns populated when Settings opens or refreshes.
-Choices come from workspace `.github/agents` folders, configured agent-file locations, and the
-user-level `~/.copilot/agents` folder; workspace choices win when names collide. Existing or
-legacy labels remain selectable as a compatibility fallback even when their profile is no longer
+Choices come from workspace `.github/agents` and `.claude/agents` folders, configured agent-file
+locations, and user-level `~/.copilot/agents` and `~/.claude/agents` folders. Workspace choices
+win when names collide, followed by configured and then user-level choices. Existing or legacy
+labels remain selectable as a compatibility fallback even when their profile is no longer
 discoverable. The pencil on a column header jumps straight to that column's field. Refine's name
 is also used for **Split**, and names on the resting columns are just labels — they never start a
 chat run.
@@ -196,7 +212,10 @@ Raise `kanbanPilot.run.maxParallelTasks` if you want more, but treat that as opt
 edits in the same workspace — set up git worktrees or another isolation strategy yourself if
 parallel runs will be writing code. When capacity is full, extra work simply waits in **Approved**.
 Raising the limit lets waiting work start; lowering it never interrupts runs already going. A
-finished run holding a pending outcome doesn't occupy a slot.
+finished run holding a pending outcome doesn't occupy a slot. `RunManager` owns this complete-run
+capacity; the chat executor only serializes the short task-session open-and-inject handoff and
+releases that mutex before waiting for Copilot's terminal response. No backend server is needed
+for this coordination, and adding one would not provide workspace or chat-session isolation.
 
 ## Where your tasks live
 
@@ -239,7 +258,10 @@ text-only tasks remain compatible.
 Refine, Develop, Continue, and Validate attach the task Markdown first and its referenced images
 in Markdown order. Agents are told to treat those images as read-only task context unless the
 task Scope explicitly permits modifying them. If automatic chat injection is unavailable, the
-existing clipboard fallback remains text-only.
+existing clipboard fallback remains text-only. Valid supported images referenced by the current
+task render in its detail view through safe webview resources; missing, corrupt, cross-task,
+remote, SVG, raw-HTML, and other unsafe references remain an unavailable placeholder rather than
+being loaded from an arbitrary path.
 
 ### The activity log
 
@@ -255,9 +277,10 @@ timestamps:
 
 Every run records one start and one finish — success, failure, timeout, stop, or manual
 completion. If a result arrives late, Kanban Pilot reconciles it, provided a newer retry or a
-manual move hasn't already taken over. Hand edits you make directly to a task file are fully
-supported, but they won't produce audit lines: a file watcher can't tell what the old value was or
-who changed it.
+manual move hasn't already taken over. Receipt lines must match the expected task, run, and stage;
+rejected or malformed lines produce a diagnostic instead of silently completing the card. Hand
+edits you make directly to a task file are fully supported, but they won't produce audit lines: a
+file watcher can't tell what the old value was or who changed it.
 
 ## Install the agent skill
 
@@ -302,7 +325,7 @@ Every option lives under `kanbanPilot.*` and can be edited from the board's **Se
 | `chat.agentNames` | `{}` | Dropdown-selected labels for each column's agent; the Agent assignments category saves all seven together and preserves legacy values. |
 | `chat.allowTaskProposals` | `true` | Let develop and validate runs file follow-up backlog tasks. |
 | `run.timeoutMinutes` | `20` | How long a run may go before it's marked failed. |
-| `run.maxParallelTasks` | `1` | How many runs may be active at once. |
+| `run.maxParallelTasks` | `1` | How many complete Refine, Split, Develop/Continue, and Validate runs may be active at once; values above one allow same-workspace edits without worktree isolation. |
 | `board.openOnStartup` | `false` | Open the board automatically when the workspace loads. |
 | `layout.dockChat` | `true` | Open the selected task's chat beside the board. |
 | `layout.dockChatOnSelect` | `false` | Dock the chat as soon as you select a card. |
@@ -316,7 +339,7 @@ None tracked yet.
 A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 1. Update `version` in `package.json` (and the matching versions in `package-lock.json`), commit.
-2. Push a tag that exactly matches, e.g. `v0.3.0`.
+2. Push a tag that exactly matches, e.g. `v0.3.2`.
 3. GitHub Actions installs with `npm ci`, runs tests, build, and lint, packages the VSIX, and
    checks its metadata.
 4. Once everything passes, it creates the GitHub Release and attaches
@@ -324,7 +347,17 @@ A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 ## Release notes
 
-The current documented release is **0.3.0**.
+The current documented release is **0.3.2**.
+
+**0.3.2** — Exact task/run/stage receipt reconciliation with actionable diagnostics and
+idempotent same-run late-result handling; explicit, confirmed stale-completion recovery with
+supersession protection; durable task-to-chat bindings across reloads; response-independent
+parallel runs without a backend server; secure task-local image detail rendering; expanded
+Copilot and Claude agent-profile discovery; and clearer **Review Required** wording for pending
+outcomes without changing the apply decision flow.
+
+**0.3.1** — Improved the board for smaller views, fixed pasted task images, and fixed parallel
+task handling.
 
 **0.3.0** — Complete manual/auto gates for the normal pipeline with durable pending outcomes;
 the full in-board Settings editor; Copilot custom-agent discovery and assignment dropdowns; one

@@ -16,12 +16,14 @@ export interface CopilotAgentFileSystem {
 }
 
 export interface CopilotAgentDiscoveryOptions {
-	/** Workspace roots whose `.github/agents` directories should be scanned. */
+	/** Workspace roots whose default Copilot custom-agent directories should be scanned. */
 	workspaceFolders?: readonly vscode.Uri[];
 	/** The configured `chat.agentFilesLocations` value. */
 	additionalLocations?: unknown;
 	/** Override the default user-level `~/.copilot/agents` directory. */
 	userAgentsDirectory?: vscode.Uri;
+	/** Override the default user-level `~/.claude/agents` directory. */
+	userClaudeAgentsDirectory?: vscode.Uri;
 	/** Override the home directory used to expand `~` in configured paths. */
 	userHome?: string;
 	/** Filesystem seam used by tests and non-file extension hosts. */
@@ -41,6 +43,11 @@ interface AgentHeader {
 	infer?: boolean;
 }
 
+const WORKSPACE_AGENT_DIRECTORY_PARTS: readonly (readonly string[])[] = [
+	['.github', 'agents'],
+	['.claude', 'agents'],
+];
+
 const DEFAULT_FILE_SYSTEM: CopilotAgentFileSystem = {
 	readDirectory: (uri) => vscode.workspace.fs.readDirectory(uri),
 	readFile: (uri) => vscode.workspace.fs.readFile(uri),
@@ -52,17 +59,19 @@ const DEFAULT_FILE_SYSTEM: CopilotAgentFileSystem = {
  * user-level Copilot directory when names collide.
  */
 export function resolveCopilotAgentLocations(
-	options: Pick<CopilotAgentDiscoveryOptions, 'workspaceFolders' | 'additionalLocations' | 'userAgentsDirectory' | 'userHome'> = {},
+	options: Pick<CopilotAgentDiscoveryOptions, 'workspaceFolders' | 'additionalLocations' | 'userAgentsDirectory' | 'userClaudeAgentsDirectory' | 'userHome'> = {},
 ): readonly AgentLocation[] {
 	const workspaceFolders = options.workspaceFolders ?? vscode.workspace.workspaceFolders?.map((folder) => folder.uri) ?? [];
 	const userHome = options.userHome ?? os.homedir();
 	const locations: AgentLocation[] = [];
 
 	for (const workspaceFolder of workspaceFolders) {
-		locations.push({
-			uri: vscode.Uri.joinPath(workspaceFolder, '.github', 'agents'),
-			source: 'workspace',
-		});
+		for (const parts of WORKSPACE_AGENT_DIRECTORY_PARTS) {
+			locations.push({
+				uri: vscode.Uri.joinPath(workspaceFolder, ...parts),
+				source: 'workspace',
+			});
+		}
 	}
 
 	for (const configuredLocation of configuredLocationUris(options.additionalLocations, workspaceFolders, userHome)) {
@@ -71,6 +80,10 @@ export function resolveCopilotAgentLocations(
 
 	locations.push({
 		uri: options.userAgentsDirectory ?? vscode.Uri.file(path.join(userHome, '.copilot', 'agents')),
+		source: 'user',
+	});
+	locations.push({
+		uri: options.userClaudeAgentsDirectory ?? vscode.Uri.file(path.join(userHome, '.claude', 'agents')),
 		source: 'user',
 	});
 

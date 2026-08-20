@@ -300,8 +300,10 @@ Kanban Pilot uses two signals, because each covers the other's blind spot:
 | `blockOnResponse` await | *Has the turn ended?* | Window reloads mid-run; resolves on `confirmation` (a pause, not a finish) |
 | `## Log` receipt line | *Did the work actually succeed?* | Agent forgets to write it |
 
-A run resolves `ok` when **both** the await returns and a receipt matching its `runId` is
-present. Await-without-receipt → `blocked`, surfaced on the card for a human call.
+A run resolves `ok` when **both** the await returns and a receipt with the exact expected
+task/run/stage identity is present. Await-without-receipt → `blocked`, surfaced on the card for
+a human call. A receipt that matches only one or two of those fields remains ignored and cannot
+become the result of this run.
 Receipt-without-await (window reloaded) → reconciled from disk on next activation, which is
 why the receipt cannot be dropped even though the await exists.
 
@@ -427,7 +429,13 @@ stuck (§5's new `Validation → InProgress` edge). An actually-errored validate
 this far: it's caught before a receipt is even looked for, same as any other stage (§6.4).
 
 `task:` is the misroute detector (§6.9): a receipt whose task id disagrees with the file it
-appeared in is rejected rather than accepted as completion.
+appeared in is rejected rather than accepted as completion. Reconciliation applies the same
+exact-identity rule to all three routing fields: `task:` must match the task file, `run:` must
+match the active run (or a specifically eligible fallback run), and `stage:` must match the
+stage being reconciled. A wrong-task, stale/wrong-run, wrong-stage, or malformed receipt-like
+line is ignored and cannot mutate workflow state or `pending_outcome`. The extension appends an
+idempotent `receipt-diagnostic` log entry identifying the expected and observed identity so a
+misroute is actionable instead of silently looking like a missing receipt.
 
 **Extension audit grammar** — the extension appends its own one-line events beside agent
 receipts and `propose-task` lines. The distinct `audit:` prefix means existing receipt and
@@ -454,6 +462,29 @@ one explicit, idempotent correction finish rather than another start.
 Reload reconciliation, repeated file-watcher passes, and stale run results use the task/run
 identity and audit order to avoid duplicating lifecycle entries or allowing an old timed-out
 run to reclaim newer work.
+
+**Explicit stale-completion adoption** is a separate, human-confirmed recovery path for the
+case where an earlier run finished its implementation but its receipt was written after that
+run had already timed out and a later retry has failed. Automatic reconciliation never equates
+the old run id with the current or latest run id. `Recover Stale Completion` may instead list a
+candidate only when the exact task/stage has a canonical `result:ok` receipt, an extension-owned
+`activity-start`, and a matching provisional timeout or missing-receipt/fallback history. The
+task must still be retryable in the stage's working column, have no active run or pending
+outcome, and have no later active run, Stop, manual move, supersession, or prior recovery that
+invalidates the candidate. The command and task detail show the adopted run, latest run, and
+receipt summary, then require explicit confirmation. Recovery re-reads these predicates while
+holding the workspace coordinator, routes the receipt through the normal stage-specific gate
+and proposal path, never starts an executor run, never rewrites the receipt, and appends one
+`activity-finish` correction with `action:manual-recovery` and `correction:true`. Repeated
+command, watcher, reload, and task-set passes therefore cannot duplicate the transition,
+pending outcome, proposals, or correction audit. Frontmatter remains extension-owned; agents
+only edit their stage sections and append their canonical receipt.
+
+Ignored receipt-like lines are recorded as `receipt-diagnostic` entries with the expected and
+observed task/run/stage identity. Watcher or activation persistence failures are recorded as
+`reconciliation-error` entries when the task is available, written to the extension console,
+and surfaced through a VS Code error notification; repeated passes do not duplicate either
+diagnostic. These records are extension-owned observability, not agent receipts.
 
 The extension writes frontmatter changes and the corresponding audit entries through one
 serialized atomic task-store mutation. Agent receipts and proposals can still be appended and
@@ -522,6 +553,9 @@ cooperative protocol with a non-deterministic party:
   question — `blockOnResponse` counts *pending user confirmation* as terminal, so this is the
   common case, not an edge case. The card deep-links into its session (§6.7) so the user lands
   in the right conversation.
+- **Ignored or malformed receipt** → no state transition. The extension records the mismatch
+  or malformed-line reason in `## Log`, and a reconciliation failure is also visible in the
+  console and through a VS Code error notification when persistence itself fails.
 - **`result:blocked`** → status `blocked`, the note surfaces on the card face. For validate
   specifically, three outcomes exist, not two — see §6.3's grammar note and §5's new
   `Validation → InProgress` edge for what `result:failed` does there.
@@ -1018,7 +1052,8 @@ With prevention weakened, these stop being defence-in-depth and become the actua
 | --- | --- | --- |
 | **Self-contained prompts** | Every prompt names the task id, its file path, and inlines the scope — it never depends on conversation history | Correct work recorded in the correct file, in the wrong room |
 | **Visible banner** | Every prompt opens with `@{{agentName}}` then a `## [kanban-pilot TASK-142]` banner | A human-visible anomaly, not a silent absorb |
-| **Receipt carries the task id** | `- run:r8 task:TASK-142 …` — a receipt whose `task:` disagrees with the file it landed in is rejected | A detected, logged error |
+| **Receipt carries exact identity** | `- run:r8 task:TASK-142 stage:develop …` — `task:`, `run:`, and `stage:` must all match the task file, active/recoverable run, and stage being reconciled | A detected, idempotently logged mismatch; wrong-task, stale/wrong-run, wrong-stage, and malformed lines cannot complete the card |
+| **Late receipt has durable prerequisites** | A fallback marker plus matching activity/audit history must identify the same run and stage, with no newer run or manual transition | A valid late result can be recovered once; otherwise the task stays retryable and the reason is diagnosable |
 | **Automatic repair** | `copilot_session_id` mismatch (above) sets `chat_reset_required` without operator action; `Kanban Pilot: Reset This Task's Chat` remains for manual use | A self-detected, one-click fix |
 
 Repair is **user-triggered rather than automatic**, because a misroute cannot be detected
@@ -1443,6 +1478,12 @@ same policy path. Blocked or failed executor outcomes and retryable blocked/fail
 start automatically. Successful Split still must have usable same-run proposals and all
 accepted children persisted before its receipt can create the pending Done outcome.
 
+Receipt completion is idempotent across the executor, task-file watcher, and activation
+reconciliation paths: each exact receipt/run/stage identity can settle its run and transition
+the task at most once. Reconciliation never launches a second agent run merely to promote a
+receipt or recover an eligible late result; manual mode leaves the durable pending outcome for
+the human action, while auto mode uses the same validated promotion path immediately.
+
 **Mechanism — `RunManager.applyGatePolicies()`:** a single sweep over every task, firing
 `handleAction` (the same entry point a click uses) for whichever tasks are both `status: idle`
 in a gated column and the matching setting is `auto`. Two things worth being explicit about:
@@ -1564,8 +1605,8 @@ manifest keys; obsolete documentation-only settings are not rendered.
 
 **Agent assignments.** Each row is pre-filled with its effective label and has a native,
 keyboard-accessible dropdown, Save, and Reset actions. The dropdown is rebuilt from a fresh
-scan of the active workspace's `.github/agents` directories, the user-level `~/.copilot/agents`
-directory, and enabled `chat.agentFilesLocations` entries. It reads only the custom-agent
+scan of the active workspace's `.github/agents` and `.claude/agents` directories, the user-level
+`~/.copilot/agents` and `~/.claude/agents` directories, and enabled `chat.agentFilesLocations` entries. It reads only the custom-agent
 frontmatter needed for the picker: `name` (falling back to the `.agent.md`/`.md` filename),
 `description`, `target`, and user-invocation visibility. Profiles that are malformed, unreadable,
 targeted at another environment, or hidden with `user-invocable: false`/legacy `infer: false`
@@ -1695,6 +1736,9 @@ creating a set because the new set becomes active, is refused while the active s
 running task; this keeps file watchers, automatic gate processing,
 receipts, and chat actions bound to one store at a time. Task ids remain local to a set, while
 chat session ids, run reservations, and receipt de-duplication keys include the stable set id.
+Receipt lookup, late-receipt recovery, diagnostics, and watcher/activation reconciliation are
+also scoped to that active store, so a receipt in the legacy Default directory cannot complete
+the same task id in a named set.
 All RunManager proposal and split-child writes use the active set's TaskStore, directory, and
 id allocation. In particular, a split launched from a named set appends proposals to its attached
 task file and creates children under `.kanban-pilot/task-sets/<stable-id>/tasks`; it never falls
@@ -1791,11 +1835,15 @@ behavior and the checkpoint story: before a develop run, the extension commits t
 (default) and records the sha in frontmatter, making `revertToCheckpoint` a one-click undo of
 everything the agent did.
 
-The Executor's mutex (§6.9) remains intentionally narrower: it serializes only the brief
-open-and-inject step so chat focus cannot race. It is not the full-run coordinator. Worktree-per-
-task isolation for safer true parallel code-writing remains future work; the `Executor` and
-`RunManager` interfaces are designed to accept a working-directory parameter so that can remain
-additive.
+This is intentionally an extension-local coordination problem, not a reason to add a backend
+server. A server would not control VS Code's editor focus or Copilot chat commands, and would add
+IPC, lifecycle, persistence, and failure-recovery surfaces without isolating the working tree.
+`RunManager` is the complete-run coordinator. The Executor's mutex (§6.9) remains intentionally
+narrower: it serializes only the brief task-session open-and-inject handoff so chat focus cannot
+race, then releases before waiting for `blockOnResponse` to reach terminal state. It is not the
+full-run coordinator. Worktree-per-task isolation for safer true parallel code-writing remains
+future work; the `Executor` and `RunManager` interfaces are designed to accept a working-directory
+parameter so that can remain additive.
 
 ---
 
