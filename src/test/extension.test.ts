@@ -103,4 +103,10 @@ suite('Extension Test Suite', () => {
 		assert.ok(commands.includes('kanban-pilot.applyPendingOutcome'));
 		await vscode.commands.executeCommand('kanban-pilot.applyPendingOutcome', 'TASK-NOT-FOUND-FOR-PENDING-TEST');
 	});
+
+	test('Recover Stale Completion is registered and safely reports no candidates', async () => {
+		const commands = await vscode.commands.getCommands(true);
+		assert.ok(commands.includes('kanban-pilot.recoverStaleCompletion'));
+		await vscode.commands.executeCommand('kanban-pilot.recoverStaleCompletion', 'TASK-NOT-FOUND-FOR-RECOVERY-TEST');
+	});
 });

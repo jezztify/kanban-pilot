@@ -29,8 +29,9 @@ import {
 } from '../board/boardPanel';
 import { Executor } from '../chat/executor';
 import { RunManager } from '../chat/runManager';
+import { formatReceipt } from '../chat/receipt';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
-import { encodePendingOutcome } from '../model/task';
+import { encodePendingOutcome, taskAttachmentReference } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 
 const noopExecutor: Executor = {
@@ -55,6 +56,13 @@ function detailViewFor(task: {
 	id: string;
 	title: string;
 	sections: Record<string, string>;
+	attachments?: readonly {
+		name: string;
+		relativePath: string;
+		mimeType: string;
+		size: number;
+		src: string;
+	}[];
 }, canEdit = true) {
 	return {
 		id: task.id,
@@ -69,6 +77,7 @@ function detailViewFor(task: {
 		refined: task.sections.Refined ?? '',
 		scope: task.sections.Scope ?? '',
 		lastLog: task.sections.Log ?? '',
+		attachments: task.attachments ?? [],
 		moveTargets: [{ id: 'backlog', label: 'Backlog' }],
 		secondary: null,
 	};
@@ -81,6 +90,42 @@ function dispatchWebviewMessage(dom: JSDOM, data: unknown): void {
 function clickElement(element: unknown): void {
 	assert.ok(element, 'expected an interactive webview element');
 	(element as { click(): void }).click();
+}
+
+async function seedStaleBoardCandidate(store: TaskStore, taskId: string, runId: string): Promise<void> {
+	await store.patch(taskId, { state: 'in-progress', status: 'failed' });
+	await store.auditedPatch(taskId, { state: 'in-progress', status: 'failed' }, {
+		action: 'develop',
+		runId,
+		events: [{ kind: 'activity-start', stage: 'develop', action: 'develop', runId }],
+	});
+	await store.appendLog(taskId, formatReceipt({
+		runId,
+		taskId,
+		stage: 'develop',
+		result: 'failed',
+		note: 'timed out; awaiting late receipt',
+	}));
+	await store.auditedPatch(taskId, { status: 'failed', run: undefined }, {
+		action: 'timeout',
+		runId,
+		outcome: 'timeout',
+		events: [{
+			kind: 'activity-finish',
+			runId,
+			stage: 'develop',
+			outcome: 'timeout',
+			provisional: true,
+			note: 'Activity timed out; awaiting late receipt.',
+		}],
+	});
+	await store.appendLog(taskId, formatReceipt({
+		runId,
+		taskId,
+		stage: 'develop',
+		result: 'ok',
+		note: 'implementation finished in the earlier run',
+	}));
 }
 
 suite('BoardPanel Settings', () => {
@@ -815,6 +860,324 @@ suite('BoardPanel Settings', () => {
 	}
 	});
 
+	test('renders saved task-local images in detail sections through safe webview URIs', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-images-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-images-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardImagesTest',
+			'Kanban Pilot Images Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
+		const board = new constructor(panel, host);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Saved image detail', {
+				request: [
+					'![first screenshot](attachment://first)',
+					'![second screenshot](attachment://second)',
+					'![JPEG evidence](attachment://jpeg)',
+					'![GIF evidence](attachment://gif)',
+					'![WebP evidence](attachment://webp)',
+				].join('\n\n'),
+				attachments: {
+					add: [
+						{
+							id: 'first',
+							name: 'image.png',
+							mimeType: 'image/png',
+							data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+						},
+						{
+							id: 'second',
+							name: 'image-2.png',
+							mimeType: 'image/png',
+							data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+						},
+						{
+							id: 'jpeg',
+							name: 'evidence.jpg',
+							mimeType: 'image/jpeg',
+							data: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+						},
+						{
+							id: 'gif',
+							name: 'evidence.gif',
+							mimeType: 'image/gif',
+							data: new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]),
+						},
+						{
+							id: 'webp',
+							name: 'evidence.webp',
+							mimeType: 'image/webp',
+							data: new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]),
+						},
+					],
+				},
+			});
+			const firstReference = taskAttachmentReference(task.id, 'image.png');
+			const secondReference = taskAttachmentReference(task.id, 'image-2.png');
+			const jpegReference = taskAttachmentReference(task.id, 'evidence.jpg');
+			const gifReference = taskAttachmentReference(task.id, 'evidence.gif');
+			const webpReference = taskAttachmentReference(task.id, 'evidence.webp');
+			await store.edit(task.id, {
+				title: task.title,
+				request: `![first screenshot](${firstReference})\n\n![second screenshot](${secondReference})`,
+				refined: `![JPEG evidence](${jpegReference})`,
+				scope: `![GIF evidence](${gifReference})\n\n![WebP evidence](${webpReference})`,
+			});
+			const edited = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
+			assert.ok(edited);
+			const saved = await store.listAttachments(task.id);
+			assert.deepStrictEqual(saved.map((attachment) => attachment.relativePath), [
+				firstReference,
+				secondReference,
+				jpegReference,
+				gifReference,
+				webpReference,
+			]);
+			const attachments = saved.map((attachment) => ({
+				name: attachment.name,
+				relativePath: attachment.relativePath,
+				mimeType: attachment.mimeType,
+				size: attachment.size,
+				src: panel.webview.asWebviewUri(attachment.uri).toString(),
+			}));
+			assert.ok(
+				attachments.every((attachment) => (
+					/^vscode-webview-resource:/i.test(attachment.src) ||
+					/^https:\/\/file(?:%2b|\+)\.vscode-resource\.vscode-cdn\.net\//i.test(attachment.src)
+				)),
+				JSON.stringify(attachments.map((attachment) => attachment.src)),
+			);
+
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({ postMessage() {} }),
+					});
+				},
+			});
+			dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor({ ...edited, attachments }) });
+
+			const images = Array.from(dom.window.document.querySelectorAll('#detail .task-image'));
+			assert.strictEqual(images.length, 5);
+			assert.deepStrictEqual(images.map((image) => image.getAttribute('alt')), [
+				'first screenshot',
+				'second screenshot',
+				'JPEG evidence',
+				'GIF evidence',
+				'WebP evidence',
+			]);
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image-placeholder').length, 0);
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail img[src^="file:"]').length, 0);
+
+			const corruptReference = taskAttachmentReference(task.id, 'corrupt.png');
+			const orphanReference = taskAttachmentReference(task.id, 'orphan.png');
+			await vscode.workspace.fs.writeFile(
+				store.attachmentFileFor(task.id, corruptReference),
+				new Uint8Array([0x00, 0x01, 0x02]),
+			);
+			await vscode.workspace.fs.writeFile(
+				store.attachmentFileFor(task.id, orphanReference),
+				new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			);
+			assert.deepStrictEqual(
+				(await store.listAttachments(task.id)).map((attachment) => attachment.relativePath),
+				[ firstReference, secondReference, jpegReference, gifReference, webpReference ],
+			);
+
+			const unsafeReference = taskAttachmentReference(task.id, 'unsafe.png');
+			const unsafeAttachments = [...attachments, {
+				name: 'unsafe.png',
+				relativePath: unsafeReference,
+				mimeType: 'image/png',
+				size: 1,
+				src: 'https://example.com/unsafe.png',
+			}];
+			dispatchWebviewMessage(dom, {
+				type: 'task/detail',
+				task: detailViewFor({
+					...edited,
+					sections: {
+						...edited.sections,
+						Request: [
+							`![valid](${firstReference})`,
+							`![missing](${task.id}.attachments/missing.png)`,
+							'![cross-task](TASK-999.attachments/other.png)',
+							'![remote](https://example.com/remote.png)',
+							`![svg](${task.id}.attachments/vector.svg)`,
+							'![malformed](not-an-attachment)',
+							`![corrupt](${corruptReference})`,
+							`![unmapped](${orphanReference})`,
+							`![unsafe URI](${unsafeReference})`,
+						].join('\n\n'),
+						Refined: '<img src="https://example.com/raw.png">',
+						Scope: `![valid WebP](${webpReference})`,
+					},
+					attachments: unsafeAttachments,
+				}),
+			});
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image').length, 2);
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image-placeholder').length, 8);
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail img:not(.task-image)').length, 0);
+
+			// Re-rendering the detail view must not retain the previous invalid state.
+			dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor({ ...edited, attachments }) });
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image').length, 5);
+			assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image-placeholder').length, 0);
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('routes detail attachments through the active Default and named task sets', async () => {
+		const root = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-task-sets-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const variants: readonly { id: string; name: string; isDefault: boolean; directory: vscode.Uri; fileName: string }[] = [
+			{
+				id: DEFAULT_TASK_SET_ID,
+				name: DEFAULT_TASK_SET_NAME,
+				isDefault: true,
+				directory: vscode.Uri.joinPath(root, 'default'),
+				fileName: 'default.png',
+			},
+			{
+				id: 'set-images',
+				name: 'Images',
+				isDefault: false,
+				directory: vscode.Uri.joinPath(root, 'named'),
+				fileName: 'named.png',
+			},
+		];
+
+		try {
+			for (const variant of variants) {
+				const store = new TaskStore(variant.directory, variant.id);
+				await store.ensureDirectory();
+				const task = await store.create(`Active ${variant.name} image`, {
+					request: '![active image](attachment://active-image)',
+					attachments: {
+						add: [{
+							id: 'active-image',
+							name: variant.fileName,
+							mimeType: 'image/png',
+							data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+						}],
+					},
+				});
+				const saved = await store.listAttachments(task.id);
+				assert.deepStrictEqual(saved.map((attachment) => attachment.name), [variant.fileName]);
+
+				const activeSet: TaskSet = {
+					id: variant.id,
+					name: variant.name,
+					directory: variant.directory,
+					isDefault: variant.isDefault,
+				};
+				const folder: vscode.WorkspaceFolder = { uri: variant.directory, name: variant.name, index: 0 };
+				const runManager = new RunManager(store, noopExecutor, folder);
+				const host: BoardTaskSetHost = {
+					ready: Promise.resolve(),
+					store,
+					runManager,
+					activeSet,
+					async listTaskSets() {
+						return [activeSet];
+					},
+					async switchTaskSet() {},
+					async createTaskSet() {},
+					async renameTaskSet() {},
+					async deleteTaskSet() {},
+					onDidChange() {
+						return new vscode.Disposable(() => undefined);
+					},
+				};
+				const panel = vscode.window.createWebviewPanel(
+					'kanbanPilot.boardTaskSetImagesTest',
+					`Kanban Pilot ${variant.name} Images Test`,
+					vscode.ViewColumn.One,
+					{ enableScripts: true },
+				);
+				const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
+				const board = new constructor(panel, host);
+				let dom: JSDOM | undefined;
+				try {
+					assert.deepStrictEqual(
+						panel.webview.options.localResourceRoots?.map((uri) => uri.toString()),
+						[variant.directory.toString()],
+					);
+					const attachments = saved.map((attachment) => ({
+						name: attachment.name,
+						relativePath: attachment.relativePath,
+						mimeType: attachment.mimeType,
+						size: attachment.size,
+						src: panel.webview.asWebviewUri(attachment.uri).toString(),
+					}));
+					dom = new JSDOM(panel.webview.html, {
+						runScripts: 'dangerously',
+						pretendToBeVisual: true,
+						beforeParse(window) {
+							Object.defineProperty(window, 'acquireVsCodeApi', {
+								value: () => ({ postMessage() {} }),
+							});
+						},
+					});
+					dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor({
+						...task,
+						sections: { Request: `![active image](${saved[0]!.relativePath})` },
+						attachments,
+					}) });
+					assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image').length, 1);
+					assert.strictEqual(dom.window.document.querySelectorAll('#detail .task-image-placeholder').length, 0);
+					assert.strictEqual(dom.window.document.querySelector('#detail .task-image')?.getAttribute('alt'), 'active image');
+					assert.strictEqual(dom.window.document.querySelectorAll('#detail img[src^="file:"]').length, 0);
+				} finally {
+					dom?.window.close();
+					board.dispose();
+				}
+			}
+		} finally {
+			try {
+				await vscode.workspace.fs.delete(root, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
 	test('captures pasted images in the New Task description without intercepting text', async () => {
 		const directory = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-board-paste-${Date.now()}-${Math.random().toString(36).slice(2)}`),
@@ -873,9 +1236,14 @@ suite('BoardPanel Settings', () => {
 				description.dispatchEvent(event);
 				return event;
 			};
-			const flushFileReader = async () => {
-				await new Promise<void>((resolve) => dom!.window.setTimeout(resolve, 0));
-				await new Promise<void>((resolve) => dom!.window.setTimeout(resolve, 0));
+			const flushFileReader = async (expectedAttachments: number) => {
+				const deadline = Date.now() + 1000;
+				while (shelf.querySelectorAll('.attachment-card').length < expectedAttachments) {
+					if (Date.now() > deadline) {
+						throw new Error('Timed out waiting for pasted image attachment');
+					}
+					await new Promise<void>((resolve) => dom!.window.setTimeout(resolve, 0));
+				}
 			};
 
 			const firstFile = new dom.window.File(['first image'], 'first.png', { type: 'image/png' });
@@ -885,7 +1253,7 @@ suite('BoardPanel Settings', () => {
 				getAsFile: () => firstFile,
 			});
 			assert.strictEqual(firstPaste.defaultPrevented, true);
-			await flushFileReader();
+			await flushFileReader(1);
 			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 1);
 			assert.match(description.value, /!\[first\.png\]\(attachment:\/\/image-[^)]+\)/);
 			assert.strictEqual(shelf.querySelector('img')?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
@@ -897,7 +1265,7 @@ suite('BoardPanel Settings', () => {
 				getAsFile: () => clipboardTypedFile,
 			});
 			assert.strictEqual(clipboardTypedPaste.defaultPrevented, true);
-			await flushFileReader();
+			await flushFileReader(2);
 			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 2);
 			assert.match(description.value, /!\[clipboard\.png\]\(attachment:\/\/image-[^)]+\)/);
 			assert.strictEqual(shelf.querySelectorAll('img')[1]?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
@@ -921,7 +1289,7 @@ suite('BoardPanel Settings', () => {
 				getAsFile: () => null,
 			});
 			assert.strictEqual(tiffPaste.defaultPrevented, true);
-			await flushFileReader();
+			await flushFileReader(3);
 			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 3);
 			assert.match(description.value, /!\[clipboard\.png\]\(attachment:\/\/image-[^)]+\)/);
 			assert.strictEqual(shelf.querySelectorAll('img')[2]?.getAttribute('src')?.startsWith('data:image/png;base64,'), true);
@@ -932,7 +1300,7 @@ suite('BoardPanel Settings', () => {
 				type: secondFile.type,
 				getAsFile: () => secondFile,
 			});
-			await flushFileReader();
+			await flushFileReader(4);
 			assert.strictEqual(shelf.querySelectorAll('.attachment-card').length, 4);
 			assert.match(description.value, /!\[second\.png\]\(attachment:\/\/image-[^)]+\)/);
 
@@ -1086,9 +1454,9 @@ suite('BoardPanel Settings', () => {
 				},
 			});
 			const card = dom.window.document.querySelector('.card');
-			assert.strictEqual(card?.querySelector('.status-text.pending')?.textContent, 'Pending: Develop → Validation');
-			assert.strictEqual(card?.querySelector('.status-text.pending')?.getAttribute('aria-label'), 'Pending completion: Develop → Validation');
-			assert.match(card?.getAttribute('aria-label') ?? '', /Pending completion: Develop → Validation/);
+			assert.strictEqual(card?.querySelector('.status-text.pending')?.textContent, 'Review Required');
+			assert.strictEqual(card?.querySelector('.status-text.pending')?.getAttribute('aria-label'), 'Review required: Develop → Validation');
+			assert.match(card?.getAttribute('aria-label') ?? '', /Review required: Develop → Validation/);
 
 			dispatchWebviewMessage(dom, {
 				type: 'task/detail',
@@ -1119,6 +1487,112 @@ suite('BoardPanel Settings', () => {
 				JSON.parse(JSON.stringify(posted.at(-1))),
 				{ type: 'pending/apply', taskId: task.id },
 			);
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('projects stale completions with accessible recovery and rejects forged host messages', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-stale-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-stale-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardStaleTest',
+			'Kanban Pilot Stale Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
+		const board = new constructor(panel, host);
+		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Recover from the board');
+			await seedStaleBoardCandidate(store, task.id, 'r-board-old');
+			const candidate = (await runManager.listStaleCompletionCandidates(task.id))[0];
+			assert.ok(candidate);
+
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({
+							postMessage(message: unknown) {
+								posted.push(message);
+							},
+						}),
+					});
+				},
+			});
+			dispatchWebviewMessage(dom, {
+				type: 'task/detail',
+				task: {
+					id: task.id,
+					title: task.title,
+					type: 'bug',
+					typeLabel: 'Bug',
+					state: 'in-progress',
+					stateLabel: 'In Progress',
+					status: 'failed',
+					canEdit: true,
+					request: '',
+					refined: '',
+					scope: '',
+					lastLog: candidate.summary,
+					staleCompletions: [candidate],
+					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
+					secondary: null,
+				},
+			});
+
+			const recoveryButton = dom.window.document.querySelector(
+				'button[aria-label="Recover stale develop completion from run r-board-old"]',
+			);
+			assert.ok(recoveryButton);
+			assert.strictEqual(recoveryButton?.textContent, 'Recover develop completion');
+			assert.match(recoveryButton?.getAttribute('title') ?? '', /Old run r-board-old/);
+			clickElement(recoveryButton);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'stale/recover',
+				taskId: task.id,
+				runId: 'r-board-old',
+				stage: 'develop',
+			});
+
+			const before = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(task.id))).toString('utf8');
+			await onMessage({ type: 'stale/recover', taskId: task.id, runId: 'r-board-old!', stage: 'develop' });
+			await onMessage({ type: 'stale/recover', taskId: task.id, runId: 'r-board-old', stage: 'deploy' });
+			const after = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(task.id))).toString('utf8');
+			assert.strictEqual(after, before, 'forged task-boundary messages must not mutate the task');
 		} finally {
 			dom?.window.close();
 			board.dispose();

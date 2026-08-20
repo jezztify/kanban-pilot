@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "activeSetId": "set-msy7sgyc-0ujetw",
+  "activeSetId": "set-mt022q8z-a5m5we",
   "sets": [
     {
       "id": "default",
@@ -13,6 +13,10 @@
     {
       "id": "set-msy7sgyc-0ujetw",
       "name": "0.3.0"
+    },
+    {
+      "id": "set-mt022q8z-a5m5we",
+      "name": "0.3.2"
     }
   ]
 }

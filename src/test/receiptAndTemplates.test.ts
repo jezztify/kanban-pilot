@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { findLatestReceipt, findReceipt, formatReceipt, parseReceipts } from '../chat/receipt';
+import { findLatestReceipt, findReceipt, findReceiptDetails, formatReceipt, parseReceipts } from '../chat/receipt';
 import { loadPromptTemplate, renderTemplate, TemplateVars } from '../chat/promptTemplates';
 import { hashScope } from '../chat/scopeHash';
 import { STAGE_AGENT_NAME } from '../chat/agentNames';
@@ -96,6 +96,23 @@ suite('M3 receipt grammar', () => {
 
 		assert.strictEqual(findLatestReceipt(log, 'r7', 'TASK-142')?.result, 'ok');
 		assert.strictEqual(findReceipt(log, 'r7', 'TASK-142')?.note, 'late completion');
+	});
+
+	test('findReceiptDetails selects the exact stage and classifies ignored receipts', () => {
+		const log = [
+			'- run:old task:TASK-142 stage:refine result:ok note:"stale"',
+			'- run:r7 task:TASK-999 stage:refine result:ok note:"wrong task"',
+			'- run:r7 task:TASK-142 stage:validate result:ok note:"wrong stage"',
+			'- run:r7 task:TASK-142 stage:refine result:ok note:"active"',
+			'- run:r7 task:TASK-142 stage:refine result:okay note:"malformed result"',
+		].join('\n');
+
+		const lookup = findReceiptDetails(log, { runId: 'r7', taskId: 'TASK-142', stage: 'refine' });
+		assert.strictEqual(lookup.receipt?.note, 'active');
+		assert.deepStrictEqual(
+			lookup.issues.map((issue) => issue.kind),
+			['run-mismatch', 'task-mismatch', 'stage-mismatch', 'malformed'],
+		);
 	});
 
 	test('formatReceipt round-trips through parseReceipts', () => {

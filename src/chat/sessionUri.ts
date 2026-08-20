@@ -42,6 +42,21 @@ export function sessionIdForTask(
 	return `${prefix}${setId === DEFAULT_TASK_SET_ID ? taskId : `${setId}-${taskId}`}`;
 }
 
+/**
+ * Resolves the durable chat identity for a task. Copilot's returned session
+ * id is the concrete persisted conversation identity after a prompt has run;
+ * it must win over the derived local-session id when VS Code restores chats
+ * after a window reload. The legacy `chat` binding remains the first-use
+ * fallback until Copilot supplies that concrete id.
+ */
+export function sessionIdForTaskBinding(
+	task: { id: string; chat?: string; copilotSessionId?: string },
+	prefix = DEFAULT_SESSION_PREFIX,
+	setId = DEFAULT_TASK_SET_ID,
+): string {
+	return task.copilotSessionId || task.chat || sessionIdForTask(task.id, prefix, setId);
+}
+
 export function sessionUriForId(sessionId: string): vscode.Uri {
 	return vscode.Uri.from({
 		scheme: CHAT_SESSION_SCHEME,
@@ -55,7 +70,16 @@ export function sessionUriForTask(
 	prefix = DEFAULT_SESSION_PREFIX,
 	setId = DEFAULT_TASK_SET_ID,
 ): vscode.Uri {
-	return sessionUriForId(sessionIdForTask(taskId, prefix, setId));
+	return sessionUriForTaskBinding({ id: taskId }, prefix, setId);
+}
+
+/** Returns the URI for a task using its persisted binding when available. */
+export function sessionUriForTaskBinding(
+	task: { id: string; chat?: string; copilotSessionId?: string },
+	prefix = DEFAULT_SESSION_PREFIX,
+	setId = DEFAULT_TASK_SET_ID,
+): vscode.Uri {
+	return sessionUriForId(sessionIdForTaskBinding(task, prefix, setId));
 }
 
 /** Inverse of {@link sessionUriForId}; undefined when the uri is not a local chat session. */

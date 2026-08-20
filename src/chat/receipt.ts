@@ -35,6 +35,25 @@ export interface Receipt {
 	note: string;
 }
 
+export interface ReceiptExpectation {
+	runId: string;
+	taskId: string;
+	stage: Stage;
+}
+
+export type ReceiptIssueKind = 'task-mismatch' | 'run-mismatch' | 'stage-mismatch' | 'malformed';
+
+export interface ReceiptIssue {
+	kind: ReceiptIssueKind;
+	receipt?: Receipt;
+	line?: string;
+}
+
+export interface ReceiptDetails {
+	receipt?: Receipt;
+	issues: ReceiptIssue[];
+}
+
 const RECEIPT_LINE =
 	/^-\s*run:(\S+)\s+task:(\S+)\s+stage:(refine|develop|validate|split)\s+result:(ok|blocked|failed)\s+note:"([^"]*)"\s*$/;
 
@@ -59,6 +78,55 @@ export function parseReceipts(logSection: string): Receipt[] {
  */
 export function findReceipt(logSection: string, runId: string, taskId: string): Receipt | undefined {
 	return findLatestReceipt(logSection, runId, taskId);
+}
+
+/**
+ * Finds the latest receipt with the exact run, task, and stage identity while
+ * retaining enough detail for reconciliation to explain ignored entries.
+ * `findReceipt` intentionally keeps its older run/task-only contract; stage
+ * reconciliation uses this stricter lookup so a later wrong-stage line cannot
+ * hide an otherwise valid receipt for the active stage.
+ */
+export function findReceiptDetails(logSection: string, expected: ReceiptExpectation): ReceiptDetails {
+	let receipt: Receipt | undefined;
+	const issues: ReceiptIssue[] = [];
+
+	for (const line of logSection.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		const match = RECEIPT_LINE.exec(trimmed);
+		if (!match) {
+			if (/^-\s*run:/.test(trimmed)) {
+				issues.push({ kind: 'malformed', line: trimmed });
+			}
+			continue;
+		}
+
+		const [, runId, taskId, stage, result, note] = match;
+		const candidate: Receipt = {
+			runId,
+			taskId,
+			stage: stage as Stage,
+			result: result as ReceiptResult,
+			note,
+		};
+
+		if (candidate.taskId !== expected.taskId) {
+			issues.push({ kind: 'task-mismatch', receipt: candidate });
+			continue;
+		}
+		if (candidate.runId !== expected.runId) {
+			issues.push({ kind: 'run-mismatch', receipt: candidate });
+			continue;
+		}
+		if (candidate.stage !== expected.stage) {
+			issues.push({ kind: 'stage-mismatch', receipt: candidate });
+			continue;
+		}
+
+		receipt = candidate;
+	}
+
+	return { receipt, issues };
 }
 
 /** Finds the last receipt for a run/task pair, so a late outcome can supersede an extension fallback receipt. */

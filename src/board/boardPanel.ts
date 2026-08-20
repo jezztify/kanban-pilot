@@ -10,6 +10,7 @@ import {
   stageForColumn,
 } from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
+import type { StaleCompletionCandidate } from '../chat/runManager';
 import {
   COLUMNS,
   COLUMN_LABELS,
@@ -114,6 +115,10 @@ const COLUMN_ACCENT: Record<Column, { from: string; to: string }> = {
  * stage field explicit for the webview.
  */
 const COLUMN_STAGE = stageForColumn;
+
+function isRecoveryStage(value: unknown): value is StaleCompletionCandidate['stage'] {
+  return value === 'refine' || value === 'develop' || value === 'validate' || value === 'split';
+}
 
 /** Per-column agent badge, resolved against current `chat.agentNames` overrides (§12 Q10). */
 function agentLabelFor(column: Column, overrides: AgentNameOverrides): string {
@@ -235,6 +240,8 @@ export async function invokeBoardAction(
 interface InMessage {
 	type?: string;
 	taskId?: string;
+  runId?: unknown;
+  stage?: unknown;
   taskSetId?: string;
   destination?: unknown;
   beforeTaskId?: unknown;
@@ -967,9 +974,9 @@ export class BoardPanel {
 				}
 				return;
 
-			case 'task/openChat':
+      case 'task/openChat':
 				if (message.taskId) {
-					void this.runManager.dockTaskChat(message.taskId, { onSelect: false });
+          void this.runManager.dockTaskChat(message.taskId, { onSelect: false, explicit: true });
 				}
 				return;
 
@@ -1054,6 +1061,54 @@ export class BoardPanel {
           await this.runManager.applyPendingOutcome(message.taskId);
         }
         return;
+
+      case 'stale/recover': {
+        if (
+          typeof message.taskId !== 'string' ||
+          !/^TASK-\d+$/.test(message.taskId) ||
+          typeof message.runId !== 'string' ||
+          !/^[A-Za-z0-9._:/-]+$/.test(message.runId) ||
+          !isRecoveryStage(message.stage)
+        ) {
+          return;
+        }
+
+        const candidates = await this.runManager.listStaleCompletionCandidates(message.taskId);
+        const candidate = candidates.find((item) =>
+          item.taskId === message.taskId && item.runId === message.runId && item.stage === message.stage,
+        );
+        if (!candidate) {
+          await this.pushAll();
+          return;
+        }
+
+        const confirmed = await vscode.window.showWarningMessage(
+          `Recover ${candidate.stage} completion for ${candidate.taskId} from old run ${candidate.runId}? Current run: ${candidate.currentRunId ?? 'none'}. Latest run: ${candidate.latestRunId ?? 'none'}. Receipt: ${candidate.summary}`,
+          { modal: true },
+          'Recover',
+        );
+        if (confirmed !== 'Recover') {
+          return;
+        }
+
+        try {
+          const result = await this.runManager.recoverStaleCompletion(
+            candidate.taskId,
+            candidate.runId,
+            candidate.stage,
+          );
+          if (result.kind === 'active-run') {
+            void vscode.window.showWarningMessage('Recovery was not applied because a newer run is active.');
+          } else if (result.kind !== 'recovered') {
+            void vscode.window.showWarningMessage('Recovery was not applied because the selected completion is stale.');
+          }
+        } catch (error) {
+          void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+        } finally {
+          await this.pushAll();
+        }
+        return;
+      }
 
 			case 'gates/set': {
 				if (!isGateKey(message.key) || (message.value !== 'manual' && message.value !== 'auto')) {
@@ -1218,6 +1273,7 @@ export class BoardPanel {
 
 		const logLines = (task.sections['Log'] ?? '').trim().split(/\r?\n/).filter(Boolean);
     const attachments = await this.store.listAttachments(task.id);
+    const staleCompletions: StaleCompletionCandidate[] = await this.runManager.listStaleCompletionCandidates(task.id);
 
 		await this.panel.webview.postMessage({
 			type: 'task/detail',
@@ -1243,6 +1299,7 @@ export class BoardPanel {
           src: this.panel.webview.asWebviewUri(attachment.uri).toString(),
         })),
         pending: pendingView(task),
+        staleCompletions,
         moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
 				// The card face shows one button (primary); this is where the
 				// prototype's un-rendered secondary action (§5.2) lives instead.
@@ -2446,8 +2503,14 @@ export class BoardPanel {
     return /^TASK-\\d+\\.attachments\\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
   }
 
+  // asWebviewUri used the custom scheme in older VS Code releases and uses
+  // the special file-resource CDN host in current releases. Both forms are
+  // still constrained to resources produced by the host under local roots.
   function isSafeImageSource(src) {
-    return typeof src === 'string' && /^vscode-webview-resource:/i.test(src);
+    return typeof src === 'string' && (
+      /^vscode-webview-resource:/i.test(src) ||
+      /^https:\\/\\/file(?:%2b|\\+)\\.vscode-resource\\.vscode-cdn\\.net\\//i.test(src)
+    );
   }
 
   function taskImageAlt(value) {
@@ -2618,7 +2681,7 @@ export class BoardPanel {
     node.dataset.taskId = card.id;
     node.setAttribute('role', 'button');
     node.setAttribute('aria-label', card.id + ': ' + card.title + '. Type: ' + card.typeLabel +
-      '.' + (card.pending ? ' Pending completion: ' + card.pending.label + '.' : '') +
+      '.' + (card.pending ? ' Review required: ' + card.pending.label + '.' : '') +
       ' Use Arrow Up or Arrow Down to change position.');
     let suppressClick = false;
 
@@ -2702,9 +2765,9 @@ export class BoardPanel {
       foot.insertBefore(el('span', 'status-text ' + card.status, card.status), foot.firstChild);
     }
     if (card.pending) {
-      const pending = el('span', 'status-text pending', 'Pending: ' + card.pending.label);
+      const pending = el('span', 'status-text pending', 'Review Required');
       pending.title = card.pending.description;
-      pending.setAttribute('aria-label', 'Pending completion: ' + card.pending.label);
+      pending.setAttribute('aria-label', 'Review required: ' + card.pending.label);
       foot.insertBefore(pending, foot.firstChild);
     }
     // Exactly one button per card, matching the prototype — see module doc.
@@ -3272,6 +3335,19 @@ export class BoardPanel {
       pendingAction.title = task.pending.description;
       pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
       links.appendChild(pendingAction);
+    }
+    for (const candidate of task.staleCompletions || []) {
+      const recovery = el('button', 'btn-modal-primary', 'Recover ' + candidate.stage + ' completion');
+      recovery.type = 'button';
+      recovery.setAttribute('aria-label', 'Recover stale ' + candidate.stage + ' completion from run ' + candidate.runId);
+      recovery.title = 'Old run ' + candidate.runId + '. Latest run: ' + (candidate.latestRunId || 'none') + '. ' + candidate.summary;
+      recovery.addEventListener('click', () => vscode.postMessage({
+        type: 'stale/recover',
+        taskId: task.id,
+        runId: candidate.runId,
+        stage: candidate.stage,
+      }));
+      links.appendChild(recovery);
     }
     if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
     body.appendChild(links);

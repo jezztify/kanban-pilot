@@ -24,7 +24,7 @@ import {
 	updateEditableTaskContent,
 	updateFrontmatter,
 } from '../model/task';
-import { sessionIdForTask } from '../chat/sessionUri';
+import { sessionIdForTask, sessionIdForTaskBinding } from '../chat/sessionUri';
 import { DEFAULT_TASK_SET_ID, TaskSetError, TaskSetRegistry } from '../model/taskSets';
 import { TaskMutationConflictError, TaskStore } from '../model/taskStore';
 import { invokeBoardAction, primaryAction, shouldDockTaskChat } from '../board/boardPanel';
@@ -675,6 +675,29 @@ suite('M1 task store', () => {
 		assert.strictEqual(refine?.tasks.length, 1);
 		assert.strictEqual(refine.tasks[0].id, task.id);
 		assert.strictEqual(refine.tasks[0].status, 'running');
+	});
+
+	test('persists a first-use chat binding atomically and preserves it after a fresh store reload', async () => {
+		const task = await store.create('Keep this conversation');
+		const before = task.body;
+		const chat = sessionIdForTaskBinding(task, 'kanban-pilot-', store.setId);
+
+		await store.patch(task.id, {
+			state: 'in-progress',
+			status: 'running',
+			run: 'r-active',
+			chat,
+		});
+
+		const reloaded = new TaskStore(dir, store.setId);
+		const after = (await reloaded.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+		assert.strictEqual(after.chat, chat);
+		assert.strictEqual(after.state, 'in-progress');
+		assert.strictEqual(after.status, 'running');
+		assert.strictEqual(after.run, 'r-active');
+		assert.strictEqual(after.body, before);
+		assert.strictEqual(sessionIdForTask(task.id, 'different-prefix-', store.setId), 'different-prefix-TASK-001');
+		assert.strictEqual(sessionIdForTaskBinding(after, 'different-prefix-', store.setId), chat);
 	});
 
 	test('patch preserves body edits made outside the extension (G5)', async () => {
