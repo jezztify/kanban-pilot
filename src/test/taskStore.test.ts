@@ -19,6 +19,7 @@ import {
 	taskAttachmentReference,
 	taskAttachmentReferences,
 	newTaskFile,
+	parseTaskDetailSections,
 	parseSections,
 	taskFromRaw,
 	updateEditableTaskContent,
@@ -94,6 +95,15 @@ suite('M1 task schema', () => {
 		assert.ok(task.sections['Log'].startsWith('- run:r7'));
 	});
 
+	test('keeps Markdown h1 and h2 headings inside canonical task sections', () => {
+		const raw = newTaskFile('TASK-143', 'Heading task', {
+			request: '# H1\n\n## H2\nH2 content',
+		});
+		const task = taskFromRaw(raw);
+
+		assert.strictEqual(parseTaskDetailSections(task?.body ?? '').Request, '# H1\n\n## H2\nH2 content');
+	});
+
 	test('strips trailing comments from frontmatter values', () => {
 		const withComment = SAMPLE.replace(
 			'scope_hash: 4e91a0c',
@@ -160,6 +170,22 @@ suite('M1 task schema', () => {
 		assert.ok(next.includes('scope_hash: 4e91a0c'));
 		assert.ok(next.includes('## Notes\nKeep this unrelated section byte-for-byte.'));
 		assert.ok(next.includes('- existing receipt\n'));
+	});
+
+	test('updateEditableTaskContent preserves nested Markdown headings without duplicating them', () => {
+		const raw = newTaskFile('TASK-144', 'Heading task', {
+			request: '# H1\n\n## H2\nOriginal content',
+		});
+		const next = updateEditableTaskContent(raw, {
+			title: 'Heading task',
+			request: '# H1\n\n## H2\nUpdated content',
+			refined: '',
+			scope: '',
+		});
+		const task = taskFromRaw(next);
+
+		assert.strictEqual(parseTaskDetailSections(task?.body ?? '').Request, '# H1\n\n## H2\nUpdated content');
+		assert.strictEqual((next.match(/^## H2$/gm) ?? []).length, 1);
 	});
 
 	test('updateEditableTaskContent rejects invalid titles before changing content', () => {

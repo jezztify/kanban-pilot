@@ -24,7 +24,7 @@ import {
 	normalizeEditableTaskContent,
 	newTaskFile,
 	parseFile,
-	parseSections,
+	parseTaskDetailSections,
 	parsePendingOutcome,
 	removeTaskAttachmentReferences,
 	replaceTaskAttachmentMarkers,
@@ -319,7 +319,7 @@ export class TaskStore {
 			return [];
 		}
 		const parsed = parseFile(raw);
-		const sections = parseSections(parsed.body);
+		const sections = parseTaskDetailSections(parsed.body);
 		let references: string[];
 		try {
 			references = taskAttachmentReferences(
@@ -925,7 +925,7 @@ export class TaskStore {
 				pending_outcome: undefined,
 			});
 			const existingAttachments = await this.listAttachmentFilesInternal(id);
-			const sections = parseSections(parseFile(updated).body);
+			const sections = parseTaskDetailSections(parseFile(updated).body);
 			const references = new Set(taskAttachmentReferences(
 				id,
 				['Request', 'Refined', 'Scope'].map((name) => sections[name] ?? '').join('\n'),

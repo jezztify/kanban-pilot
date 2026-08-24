@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vm from 'vm';
@@ -23,6 +24,7 @@ import {
 	SETTING_DEFINITIONS,
 	settingsStateFor,
 	settingsValuesFor,
+	renderTaskMarkdown,
 	primaryAction,
 	updateAgentNameOverrides,
 	validateSettingValue,
@@ -31,7 +33,13 @@ import { Executor } from '../chat/executor';
 import { RunManager } from '../chat/runManager';
 import { formatReceipt } from '../chat/receipt';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
-import { encodePendingOutcome, taskAttachmentReference } from '../model/task';
+import {
+	encodePendingOutcome,
+	parseTaskDetailSections,
+	taskAttachmentReference,
+	taskFromRaw,
+	newTaskFile,
+} from '../model/task';
 import { TaskStore } from '../model/taskStore';
 
 const noopExecutor: Executor = {
@@ -42,6 +50,39 @@ const noopExecutor: Executor = {
 		return { ok: false, error: 'unused in Settings tests' };
 	},
 };
+
+const extensionRootForTests = path.resolve(__dirname, '..', '..');
+const extensionUriForTests = vscode.Uri.file(extensionRootForTests);
+
+type MermaidBridgeForTests = {
+	render(root: unknown, styleNonce?: string): Promise<void>;
+};
+
+function loadMermaidBundles(dom: JSDOM): MermaidBridgeForTests {
+	type SvgMeasureNode = { textContent: string | null };
+	type SvgPrototype = {
+		getBBox(this: SvgMeasureNode): { x: number; y: number; width: number; height: number };
+		getComputedTextLength(this: SvgMeasureNode): number;
+	};
+	const svgPrototype = dom.window.SVGElement.prototype as unknown as SvgPrototype;
+	const textWidth = (node: SvgMeasureNode): number => Math.max(8, (node.textContent || '').length * 8);
+	svgPrototype.getBBox = function (this: SvgMeasureNode) {
+		return { x: 0, y: 0, width: textWidth(this), height: 20 };
+	};
+	svgPrototype.getComputedTextLength = function (this: SvgMeasureNode) {
+		return textWidth(this);
+	};
+
+	for (const filename of ['mermaid-runtime.js', 'mermaid-webview.js']) {
+		vm.runInContext(
+			fs.readFileSync(path.join(extensionRootForTests, 'dist', filename), 'utf8'),
+			dom.getInternalVMContext(),
+		);
+	}
+	const bridge = (dom.window as unknown as { kanbanPilotMermaid?: MermaidBridgeForTests }).kanbanPilotMermaid;
+	assert.ok(bridge, 'the local Mermaid bridge must initialize');
+	return bridge;
+}
 
 function makeTaskSet(directory: vscode.Uri): TaskSet {
 	return {
@@ -76,6 +117,9 @@ function detailViewFor(task: {
 		request: task.sections.Request ?? '',
 		refined: task.sections.Refined ?? '',
 		scope: task.sections.Scope ?? '',
+		requestHtml: renderTaskMarkdown(task.sections.Request ?? '', task.attachments ?? []),
+		refinedHtml: renderTaskMarkdown(task.sections.Refined ?? '', task.attachments ?? []),
+		scopeHtml: renderTaskMarkdown(task.sections.Scope ?? '', task.attachments ?? []),
 		lastLog: task.sections.Log ?? '',
 		attachments: task.attachments ?? [],
 		moveTargets: [{ id: 'backlog', label: 'Backlog' }],
@@ -129,6 +173,255 @@ async function seedStaleBoardCandidate(store: TaskStore, taskId: string, runId: 
 }
 
 suite('BoardPanel Settings', () => {
+	test('renders task detail Markdown as safe CommonMark/GFM HTML', () => {
+		const source = [
+			'# Heading',
+			'',
+			'## Subheading',
+			'',
+			'Paragraph with **strong**, *emphasis*, ~~deleted~~, and `inline`.',
+			'Preserved as a visible soft line break.',
+			'',
+			'- parent',
+			'  - nested child',
+			'- [ ] open item',
+			'- [x] completed item',
+			'',
+			'> quoted requirement',
+			'',
+			'---',
+			'',
+			'| Name | Value |',
+			'| :--- | ---: |',
+			'| alpha | 42 |',
+			'',
+			'```ts',
+			'const value = "<literal>";',
+			'```',
+			'',
+			'[safe link](https://example.com/docs) [unsafe link](javascript:alert(1))',
+			'',
+			'<script>alert(1)</script>',
+			'',
+			'![valid](TASK-001.attachments/valid.png)',
+			'![missing](TASK-001.attachments/missing.png)',
+			'![cross-task](TASK-999.attachments/other.png)',
+			'![remote](https://example.com/remote.png)',
+		].join('\n');
+		const html = renderTaskMarkdown(source, [{
+			relativePath: 'TASK-001.attachments/valid.png',
+			src: 'vscode-webview-resource://valid.png',
+		}]);
+		const dom = new JSDOM('<div id="markdown">' + html + '</div>');
+		const root = dom.window.document.getElementById('markdown');
+		assert.ok(root);
+		assert.strictEqual(root.querySelector('h1')?.textContent, 'Heading');
+		assert.strictEqual(root.querySelector('h2')?.textContent, 'Subheading');
+		assert.strictEqual(root.querySelector('strong')?.textContent, 'strong');
+		assert.strictEqual(root.querySelector('em')?.textContent, 'emphasis');
+		assert.strictEqual(root.querySelector('s')?.textContent, 'deleted');
+		assert.strictEqual(root.querySelector('code')?.textContent, 'inline');
+		assert.strictEqual(root.querySelectorAll('ul').length >= 2, true, 'nested unordered lists render');
+		assert.strictEqual(root.querySelectorAll('.task-list-item').length, 2);
+		assert.strictEqual(root.querySelectorAll('.task-list-item-checkbox').length, 2);
+		assert.strictEqual(
+			Array.from(root.querySelectorAll('.task-list-item-checkbox')).every((input) => (
+				(input as HTMLInputElement).disabled
+			)),
+			true,
+		);
+		assert.strictEqual(root.querySelector('blockquote')?.textContent?.trim(), 'quoted requirement');
+		assert.ok(root.querySelector('hr'));
+		assert.strictEqual(root.querySelectorAll('table tbody tr').length, 1);
+		assert.strictEqual(root.querySelector('table th')?.textContent, 'Name');
+		assert.strictEqual(root.querySelector('.modal-code-block code')?.textContent, 'const value = "<literal>";\n');
+		assert.ok(root.querySelector('.modal-code-block code.language-ts'));
+		assert.strictEqual(root.querySelector('a')?.getAttribute('href'), 'https://example.com/docs');
+		assert.strictEqual(root.querySelectorAll('a').length, 1, 'unsafe links are not actionable');
+		assert.strictEqual(root.querySelector('script'), null, 'raw HTML cannot create executable elements');
+		assert.match(root.textContent ?? '', /<script>alert\(1\)<\/script>/);
+		assert.strictEqual(root.querySelectorAll('.task-image').length, 1);
+		assert.strictEqual(root.querySelectorAll('.task-image-placeholder').length, 3);
+		assert.strictEqual(root.querySelector('.task-image')?.getAttribute('alt'), 'valid');
+		assert.strictEqual(source.includes('**strong**'), true, 'source Markdown remains unchanged for editing');
+		dom.window.close();
+	});
+
+	test('classifies Mermaid fences in all editable sections without changing ordinary Markdown', () => {
+		const sections = {
+			Request: [
+				'# Request',
+				'',
+				'Before the request chart.',
+				'',
+				'```mermaid',
+				'flowchart TD',
+				'  Request --> Review',
+				'```',
+				'',
+				'```ts',
+				'const value = 1;',
+				'```',
+				'',
+				'After the request chart.',
+			].join('\n'),
+			Refined: [
+				'## Refined',
+				'',
+				'```MERMAID',
+				'sequenceDiagram',
+				'  participant User',
+				'  participant Board',
+				'  User->>Board: Select task',
+				'```',
+			].join('\n'),
+			Scope: [
+				'## Scope',
+				'',
+				'- preserve the task source',
+				'',
+				'```mermaid',
+				'flowchart LR',
+				'  Edit --> Save',
+				'```',
+			].join('\n'),
+		};
+		const html = Object.entries(sections)
+			.map(([label, source]) => '<section id="' + label.toLowerCase() + '">' + renderTaskMarkdown(source) + '</section>')
+			.join('');
+		const dom = new JSDOM(html);
+		const root = dom.window.document.body;
+		const diagrams = Array.from(root.querySelectorAll('[data-mermaid-diagram]'));
+		assert.strictEqual(diagrams.length, 3);
+		assert.strictEqual(root.querySelectorAll('.modal-code-block code.language-ts').length, 1);
+		assert.strictEqual(root.querySelector('#request h1')?.textContent, 'Request');
+		assert.strictEqual(root.querySelector('#refined h2')?.textContent, 'Refined');
+		assert.strictEqual(root.querySelector('#scope h2')?.textContent, 'Scope');
+		assert.match(root.textContent ?? '', /Before the request chart/);
+		assert.match(root.textContent ?? '', /After the request chart/);
+		assert.match(diagrams[0]?.querySelector('.modal-mermaid-source')?.textContent ?? '', /flowchart TD/);
+		assert.match(diagrams[1]?.querySelector('.modal-mermaid-source')?.textContent ?? '', /sequenceDiagram/);
+		assert.match(diagrams[2]?.querySelector('.modal-mermaid-source')?.textContent ?? '', /flowchart LR/);
+		assert.strictEqual(root.querySelectorAll('.modal-mermaid-source').length, 3);
+		assert.strictEqual(Object.values(sections).every((source) => source.includes('```mermaid') || source.includes('```MERMAID')), true);
+		dom.window.close();
+	});
+
+	test('renders flowchart and sequence diagrams through the packaged local Mermaid bridge', async () => {
+		const sections = [
+			['Request', ['flowchart TD', '  Request --> Review']],
+			['Refined', ['sequenceDiagram', '  participant User', '  participant Board', '  User->>Board: Select task']],
+			['Scope', ['flowchart LR', '  Edit --> Save']],
+		] as const;
+		const html = sections.map(([label, source]) => (
+			'<section data-section="' + label + '">' + renderTaskMarkdown('```mermaid\n' + source.join('\n') + '\n```') + '</section>'
+		)).join('');
+		const dom = new JSDOM('<main id="detail">' + html + '</main>', {
+			runScripts: 'outside-only',
+			pretendToBeVisual: true,
+		});
+		try {
+			const bridge = loadMermaidBundles(dom);
+			const root = dom.window.document.getElementById('detail');
+			assert.ok(root);
+			await bridge.render(root, 'test-nonce');
+
+			const diagrams = Array.from(root.querySelectorAll('[data-mermaid-diagram]'));
+			assert.deepStrictEqual(diagrams.map((diagram) => diagram.getAttribute('data-mermaid-state')), [
+				'rendered',
+				'rendered',
+				'rendered',
+			]);
+			assert.strictEqual(root.querySelectorAll('.modal-mermaid-rendered svg').length, 3);
+			assert.strictEqual(root.querySelectorAll('.modal-mermaid-source').length, 0);
+			assert.ok(root.querySelector('.modal-mermaid-rendered svg.flowchart'));
+			assert.ok(root.querySelector('.modal-mermaid-rendered svg[aria-roledescription="sequence"]'));
+		} finally {
+			dom.window.close();
+		}
+	});
+
+	test('isolates invalid Mermaid, removes unsafe generated references, and re-renders replacement content', async () => {
+		const valid = ['flowchart TD', '  A --> B'];
+		const invalid = ['flowchart TD', '  A -->'];
+		const remoteLink = ['flowchart TD', '  A --> B', '  click A "https://example.com"'];
+		const source = [
+			'Before all charts.',
+			'',
+			'```mermaid',
+			...valid,
+			'```',
+			'',
+			'```mermaid',
+			...invalid,
+			'```',
+			'',
+			'```mermaid',
+			...remoteLink,
+			'```',
+			'',
+			'After all charts.',
+		].join('\n');
+		const dom = new JSDOM('<main id="detail">' + renderTaskMarkdown(source) + '</main>', {
+			runScripts: 'outside-only',
+			pretendToBeVisual: true,
+		});
+		try {
+			const bridge = loadMermaidBundles(dom);
+			const root = dom.window.document.getElementById('detail');
+			assert.ok(root);
+			await bridge.render(root, 'test-nonce');
+
+			const diagrams = Array.from(root.querySelectorAll('[data-mermaid-diagram]'));
+			assert.deepStrictEqual(diagrams.map((diagram) => diagram.getAttribute('data-mermaid-state')), [
+				'rendered',
+				'error',
+				'rendered',
+			]);
+			assert.match(diagrams[1]?.querySelector('.modal-mermaid-source')?.textContent ?? '', /flowchart TD/);
+			assert.match(diagrams[1]?.querySelector('.modal-mermaid-message')?.textContent ?? '', /could not be rendered/);
+			assert.match(root.textContent ?? '', /Before all charts/);
+			assert.match(root.textContent ?? '', /After all charts/);
+			const renderedMarkup = diagrams[2]?.querySelector('.modal-mermaid-rendered')?.innerHTML ?? '';
+			assert.doesNotMatch(renderedMarkup, /(?:href|xlink:href)=["']https?:/i);
+			assert.doesNotMatch(renderedMarkup, /<(?:script|foreignobject|iframe|object|embed|image|link)\b/i);
+
+			root.innerHTML = renderTaskMarkdown([
+				'Replacement content.',
+				'',
+				'```mermaid',
+				'sequenceDiagram',
+				'  A->>B: Re-rendered',
+				'```',
+			].join('\n'));
+			await bridge.render(root, 'test-nonce');
+			assert.strictEqual(root.querySelectorAll('[data-mermaid-diagram]').length, 1);
+			assert.strictEqual(root.querySelector('[data-mermaid-diagram]')?.getAttribute('data-mermaid-state'), 'rendered');
+			assert.strictEqual(root.querySelectorAll('.modal-mermaid-message').length, 0);
+			assert.strictEqual(root.querySelectorAll('.modal-mermaid-rendered svg').length, 1);
+			assert.match(root.textContent ?? '', /Replacement content/);
+		} finally {
+			dom.window.close();
+		}
+	});
+
+	test('task detail extraction keeps authored h1 and h2 Markdown inside Request', () => {
+		const raw = newTaskFile('TASK-001', 'Heading task', {
+			request: '# H1\n\n## H2\nH2 content',
+		});
+		const task = taskFromRaw(raw);
+		assert.ok(task);
+
+		const sections = parseTaskDetailSections(task.body);
+		assert.strictEqual(sections.Request, '# H1\n\n## H2\nH2 content');
+		const dom = new JSDOM('<div id="markdown">' + renderTaskMarkdown(sections.Request) + '</div>');
+		const root = dom.window.document.getElementById('markdown');
+		assert.strictEqual(root?.querySelector('h1')?.textContent, 'H1');
+		assert.strictEqual(root?.querySelector('h2')?.textContent, 'H2');
+		assert.strictEqual(root?.textContent?.includes('H2 content'), true);
+		dom.window.close();
+	});
+
 	test('failed timeout cards keep their normal retry action', () => {
 		assert.strictEqual(primaryAction('refine', 'failed'), 'refine');
 		assert.strictEqual(primaryAction('in-progress', 'failed'), 'continue');
@@ -334,8 +627,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		try {
 			const headerMarkup = /<header>([\s\S]*?)<\/header>/.exec(panel.webview.html)?.[0];
@@ -383,7 +676,13 @@ suite('BoardPanel Settings', () => {
 			assert.ok(!panel.webview.html.includes('id="agentNameModal"'));
 			assert.ok(panel.webview.html.includes('taskEditForm'));
 			assert.ok(panel.webview.html.includes('task/editError'));
-			const script = /<script[^>]*>([\s\S]*)<\/script>/.exec(panel.webview.html)?.[1];
+			assert.ok(fs.existsSync(path.join(extensionRootForTests, 'dist', 'mermaid-runtime.js')));
+			assert.ok(fs.existsSync(path.join(extensionRootForTests, 'dist', 'mermaid-webview.js')));
+			assert.match(panel.webview.html, /<meta http-equiv="Content-Security-Policy" content="[^"]*default-src 'none'/);
+			assert.match(panel.webview.html, /<script nonce="[^"]+" data-kanban-pilot-mermaid-runtime src="[^"]*mermaid-runtime\.js"><\/script>/);
+			assert.match(panel.webview.html, /<script nonce="[^"]+" data-kanban-pilot-mermaid src="[^"]*mermaid-webview\.js"><\/script>/);
+			assert.doesNotMatch(panel.webview.html, /data-kanban-pilot-mermaid(?:-runtime)?[^>]+src="[^"]*(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com|raw\.githubusercontent\.com)/i);
+			const script = /<script[^>]*data-kanban-pilot-board[^>]*>([\s\S]*)<\/script>/.exec(panel.webview.html)?.[1];
 			assert.ok(script, 'generated webview script is present');
 			assert.doesNotThrow(() => new vm.Script(script), 'generated webview script must parse in the browser');
 			assert.match(script, /input\.checked = gates\[gate\.key\] === 'auto';/);
@@ -486,8 +785,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		try {
 			const task = await store.create('Before edit', { request: 'Original request' });
@@ -571,8 +870,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		let dom: JSDOM | undefined;
 		try {
@@ -841,7 +1140,7 @@ suite('BoardPanel Settings', () => {
 		assert.ok(cardLabels[1]?.includes('Type: Bug.'));
 		assert.match(panel.webview.html, /\.badge-task-type\.bug \{ border-style: dashed; \}/);
 		assert.strictEqual(document.querySelector('#detail .modal-title')?.textContent, 'Saved title #123');
-		assert.strictEqual(document.querySelector('#detail .modal-section-body')?.textContent, 'Saved request with Markdown');
+		assert.strictEqual(document.querySelector('#detail .modal-section-body')?.textContent?.trim(), 'Saved request\nwith Markdown');
 
 		dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor(edited, false) });
 		const unavailable = Array.from(document.querySelectorAll('button'))
@@ -891,8 +1190,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		let dom: JSDOM | undefined;
 		try {
 			const task = await store.create('Saved image detail', {
@@ -1131,13 +1430,13 @@ suite('BoardPanel Settings', () => {
 					vscode.ViewColumn.One,
 					{ enableScripts: true },
 				);
-				const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-				const board = new constructor(panel, host);
+				const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+				const board = new constructor(panel, host, extensionUriForTests);
 				let dom: JSDOM | undefined;
 				try {
 					assert.deepStrictEqual(
 						panel.webview.options.localResourceRoots?.map((uri) => uri.toString()),
-						[variant.directory.toString()],
+						[extensionUriForTests.toString(), variant.directory.toString()],
 					);
 					const attachments = saved.map((attachment) => ({
 						name: attachment.name,
@@ -1209,8 +1508,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		let dom: JSDOM | undefined;
 		try {
 			dom = new JSDOM(panel.webview.html, {
@@ -1377,8 +1676,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		let dom: JSDOM | undefined;
 		try {
 			const task = await store.create('Pending Develop completion');
@@ -1529,8 +1828,8 @@ suite('BoardPanel Settings', () => {
 			vscode.ViewColumn.One,
 			{ enableScripts: true },
 		);
-		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost) => BoardPanel;
-		const board = new constructor(panel, host);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		let dom: JSDOM | undefined;
 		try {

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import MarkdownIt = require('markdown-it');
 import {
   CopilotAgentOption,
   discoverCopilotAgents,
@@ -21,12 +22,134 @@ import {
   TaskAttachmentChanges,
   TASK_TYPE_LABELS,
   normalizeEditableTaskContent,
+  parseTaskDetailSections,
 } from '../model/task';
 import { gateForId, GATE_CATALOG } from '../model/gates';
 import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
 import { TASK_ACTIONS, TaskAction } from './stateMachine';
+
+const markdownItTaskLists = require('markdown-it-task-lists') as (
+  markdown: MarkdownIt,
+  options?: { enabled?: boolean; label?: boolean },
+) => void;
+
+export interface TaskMarkdownAttachment {
+  relativePath: string;
+  src: string;
+}
+
+const TASK_ATTACHMENT_REFERENCE = /^TASK-\d+\.attachments\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const WEBVIEW_IMAGE_SOURCE = [
+  /^vscode-webview-resource:/i,
+  /^https:\/\/file(?:%2b|\+)\.vscode-resource\.vscode-cdn\.net\//i,
+];
+
+function escapeMarkdownHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function isSafeHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && !!url.hostname;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeWebviewImageSource(value: string): boolean {
+  return WEBVIEW_IMAGE_SOURCE.some((pattern) => pattern.test(value));
+}
+
+function imageAltText(value: string | null): string {
+  const clean = String(value || '').replace(/[\[\]\r\n]/g, ' ').trim();
+  return clean || 'Task image';
+}
+
+/** Renders task specification Markdown before it crosses the webview boundary. */
+export function renderTaskMarkdown(
+  source: string,
+  attachments: readonly TaskMarkdownAttachment[] = [],
+): string {
+  const attachmentMap = new Map(attachments.map((attachment) => [attachment.relativePath, attachment]));
+  const markdown = new MarkdownIt({
+    html: false,
+    breaks: true,
+    linkify: false,
+    typographer: false,
+  });
+  // Keep link tokens available for the output policy below. This also lets
+  // unsupported image references reach the unavailable-image placeholder
+  // instead of silently losing their authored text.
+  markdown.validateLink = () => true;
+  markdown.use(markdownItTaskLists, { enabled: false, label: true });
+  markdown.core.ruler.push('suppress-unsafe-task-links', (state) => {
+    for (const token of state.tokens) {
+      if (token.type !== 'inline' || !token.children) { continue; }
+      let suppressLink = false;
+      for (const child of token.children) {
+        if (child.type === 'link_open') {
+          suppressLink = !isSafeHttpUrl(child.attrGet('href') || '');
+          if (suppressLink) { child.meta = { unsafeTaskLink: true }; }
+        } else if (child.type === 'link_close') {
+          if (suppressLink) { child.meta = { unsafeTaskLink: true }; }
+          suppressLink = false;
+        }
+      }
+    }
+  });
+  markdown.renderer.rules.link_open = (tokens, index, options, env, renderer) => (
+    tokens[index].meta?.unsafeTaskLink ? '' : renderer.renderToken(tokens, index, options)
+  );
+  markdown.renderer.rules.link_close = (tokens, index, options, env, renderer) => (
+    tokens[index].meta?.unsafeTaskLink ? '' : renderer.renderToken(tokens, index, options)
+  );
+
+  markdown.renderer.rules.image = (tokens, index) => {
+    const token = tokens[index];
+    const href = token.attrGet('src') || '';
+    const attachment = TASK_ATTACHMENT_REFERENCE.test(href) ? attachmentMap.get(href) : undefined;
+    const alt = imageAltText(token.children?.map((child) => child.content).join('') || token.attrGet('alt'));
+    if (!attachment || !isSafeWebviewImageSource(attachment.src)) {
+      const escapedAlt = escapeMarkdownHtml(alt);
+      return '<span class="task-image-placeholder" role="img" aria-label="Image unavailable: ' +
+        escapedAlt + '">Image unavailable: ' + escapedAlt + '</span>';
+    }
+    return '<img class="task-image" loading="lazy" src="' + escapeMarkdownHtml(attachment.src) +
+      '" alt="' + escapeMarkdownHtml(alt) + '">';
+  };
+
+  markdown.renderer.rules.fence = (tokens, index) => {
+    const token = tokens[index];
+    const language = token.info.trim().split(/\s+/)[0] || '';
+    if (language.toLowerCase() === 'mermaid') {
+      return '<div class="modal-mermaid" data-mermaid-diagram role="group" aria-label="Mermaid diagram">' +
+        '<pre class="modal-mermaid-source" aria-label="Mermaid source">' +
+        escapeMarkdownHtml(token.content) + '</pre></div>\n';
+    }
+    const className = /^[A-Za-z0-9_-]+$/.test(language)
+      ? ' class="language-' + escapeMarkdownHtml(language) + '"'
+      : '';
+    return '<pre class="modal-code-block"><code' + className + '>' +
+      escapeMarkdownHtml(token.content) + '</code></pre>\n';
+  };
+  markdown.renderer.rules.code_block = (tokens, index) => (
+    '<pre class="modal-code-block"><code>' +
+    escapeMarkdownHtml(tokens[index].content) +
+    '</code></pre>\n'
+  );
+  markdown.renderer.rules.table_open = () => '<div class="modal-table-wrap"><table>\n';
+  markdown.renderer.rules.table_close = () => '</table></div>\n';
+
+  return source ? markdown.render(source) : '';
+}
 
 /**
  * The board webview (PRD §6.11).
@@ -765,6 +888,7 @@ export class BoardPanel {
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
     private readonly host: BoardTaskSetHost,
+    private readonly extensionUri: vscode.Uri,
 	) {
     this.configureWebview();
 		this.panel.webview.html = this.html();
@@ -812,7 +936,7 @@ export class BoardPanel {
   private configureWebview(): void {
     this.panel.webview.options = {
       enableScripts: true,
-      localResourceRoots: [this.store.directory],
+      localResourceRoots: [this.extensionUri, this.store.directory],
     };
   }
 
@@ -847,7 +971,7 @@ export class BoardPanel {
 		});
 		panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'activity-icon.svg');
 
-    BoardPanel.current = new BoardPanel(panel, host);
+    BoardPanel.current = new BoardPanel(panel, host, extensionUri);
 		return BoardPanel.current;
 	}
 
@@ -1271,8 +1395,20 @@ export class BoardPanel {
 			return;
 		}
 
-		const logLines = (task.sections['Log'] ?? '').trim().split(/\r?\n/).filter(Boolean);
+    const detailSections = parseTaskDetailSections(task.body);
+    const request = detailSections['Request'] ?? task.sections['Request'] ?? '';
+    const refined = detailSections['Refined'] ?? task.sections['Refined'] ?? '';
+    const scope = detailSections['Scope'] ?? task.sections['Scope'] ?? '';
+    const log = detailSections['Log'] ?? task.sections['Log'] ?? '';
+		const logLines = log.trim().split(/\r?\n/).filter(Boolean);
     const attachments = await this.store.listAttachments(task.id);
+    const attachmentViews = attachments.map((attachment) => ({
+      name: attachment.name,
+      relativePath: attachment.relativePath,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      src: this.panel.webview.asWebviewUri(attachment.uri).toString(),
+    }));
     const staleCompletions: StaleCompletionCandidate[] = await this.runManager.listStaleCompletionCandidates(task.id);
 
 		await this.panel.webview.postMessage({
@@ -1286,18 +1422,15 @@ export class BoardPanel {
 				stateLabel: COLUMN_LABELS[task.state],
 				status: task.status,
         canEdit: task.status !== 'running',
-				request: task.sections['Request'] ?? '',
-				refined: task.sections['Refined'] ?? '',
-				scope: task.sections['Scope'] ?? '',
+        request,
+        refined,
+        scope,
+        requestHtml: renderTaskMarkdown(request, attachmentViews),
+        refinedHtml: renderTaskMarkdown(refined, attachmentViews),
+        scopeHtml: renderTaskMarkdown(scope, attachmentViews),
 				lastLog: logLines.at(-1) ?? '',
 				originTask: task.originTask,
-        attachments: attachments.map((attachment) => ({
-          name: attachment.name,
-          relativePath: attachment.relativePath,
-          mimeType: attachment.mimeType,
-          size: attachment.size,
-          src: this.panel.webview.asWebviewUri(attachment.uri).toString(),
-        })),
+        attachments: attachmentViews,
         pending: pendingView(task),
         staleCompletions,
         moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
@@ -1382,10 +1515,16 @@ export class BoardPanel {
 			),
 		).join('');
 
-		const csp = [
+    const mermaidRuntimeUri = this.panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'dist', 'mermaid-runtime.js'),
+    ).toString();
+    const mermaidBridgeUri = this.panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'dist', 'mermaid-webview.js'),
+    ).toString();
+    const csp = [
 			"default-src 'none'",
 			`style-src 'nonce-${nonce}'`,
-			`script-src 'nonce-${nonce}'`,
+      `script-src 'nonce-${nonce}' ${this.panel.webview.cspSource}`,
       `img-src ${this.panel.webview.cspSource} data:`,
 		].join('; ');
 
@@ -2255,6 +2394,8 @@ export class BoardPanel {
     background: linear-gradient(180deg, var(--col), var(--col-to, var(--col)));
   }
   .modal-section-body {
+    min-width: 0;
+    overflow-wrap: anywhere;
     font-size: 15px; line-height: 1.65; color: var(--vscode-foreground);
   }
   /* Latest log is a receipt line (§6.3's grammar), not prose — kept as literal
@@ -2273,8 +2414,13 @@ export class BoardPanel {
   .modal-section-body p:first-child { margin-top: 0; }
   .modal-section-body ul, .modal-section-body ol { margin: 8px 0; padding-left: 20px; }
   .modal-section-body li { margin: 3px 0; }
-  .modal-section-body ul.modal-md-checklist { list-style: none; padding-left: 0; }
-  .modal-section-body ul.modal-md-checklist label { display: inline-flex; align-items: center; gap: 8px; }
+  .modal-section-body ul.contains-task-list { list-style: none; padding-left: 0; }
+  .modal-section-body ul.contains-task-list ul { list-style: none; padding-left: 22px; }
+  .modal-section-body li.task-list-item { list-style: none; }
+  .modal-section-body li.task-list-item > label {
+    display: inline-flex; align-items: flex-start; gap: 8px;
+  }
+  .modal-section-body .task-list-item-checkbox { margin: 5px 0 0; flex: none; }
   .modal-section-body blockquote {
     margin: 10px 0; border-left: 3px solid var(--col);
     padding: 4px 0 4px 12px; color: var(--vscode-descriptionForeground);
@@ -2292,7 +2438,44 @@ export class BoardPanel {
     border: 1px solid var(--vscode-panel-border); border-radius: 8px;
   }
   .modal-section-body pre.modal-code-block code { border: none; background: none; padding: 0; }
-  .modal-section-body a { color: var(--vscode-textLink-foreground); }
+  .modal-section-body .modal-mermaid {
+    max-width: 100%; margin: 10px 0; overflow: hidden;
+    background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-panel-border); border-radius: 8px;
+  }
+  .modal-section-body .modal-mermaid-rendered {
+    max-width: 100%; overflow-x: auto; padding: 10px 12px;
+  }
+  .modal-section-body .modal-mermaid-rendered svg {
+    display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto;
+  }
+  .modal-section-body .modal-mermaid-source {
+    margin: 0; padding: 10px 12px; max-width: 100%; overflow-x: auto;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+    font-family: "IBM Plex Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
+    font-size: .86em; line-height: 1.5;
+  }
+  .modal-section-body .modal-mermaid-message {
+    padding: 10px 12px 0; color: var(--vscode-descriptionForeground); font-size: 13px;
+  }
+  .modal-section-body .modal-table-wrap { max-width: 100%; overflow-x: auto; margin: 10px 0; }
+  .modal-section-body table { border-collapse: collapse; min-width: 100%; }
+  .modal-section-body th, .modal-section-body td {
+    border: 1px solid var(--vscode-panel-border); padding: 6px 9px; text-align: left;
+    vertical-align: top;
+  }
+  .modal-section-body th { background: color-mix(in srgb, var(--col) 10%, transparent); font-weight: 700; }
+  .modal-section-body .task-image {
+    display: block; max-width: 100%; height: auto; margin: 10px 0;
+    border: 1px solid var(--vscode-panel-border); border-radius: 8px;
+  }
+  .modal-section-body .task-image-placeholder {
+    display: inline-block; max-width: 100%; color: var(--vscode-descriptionForeground);
+    border: 1px dashed var(--vscode-panel-border); border-radius: 5px; padding: 2px 7px;
+  }
+  .modal-section-body a { color: var(--vscode-textLink-foreground); overflow-wrap: anywhere; }
   .modal-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .modal-link {
     font-size: 13px; color: var(--vscode-textLink-foreground); cursor: pointer;
@@ -2300,6 +2483,8 @@ export class BoardPanel {
   }
   .modal-link:hover { text-decoration: underline; }
 </style>
+<script nonce="${nonce}" data-kanban-pilot-mermaid-runtime src="${escapeMarkdownHtml(mermaidRuntimeUri)}"></script>
+<script nonce="${nonce}" data-kanban-pilot-mermaid src="${escapeMarkdownHtml(mermaidBridgeUri)}"></script>
 </head>
 <body>
 <header>
@@ -2436,7 +2621,7 @@ export class BoardPanel {
   <div class="modal" id="detail" role="dialog" aria-modal="true"></div>
 </div>
 
-<script nonce="${nonce}">
+<script nonce="${nonce}" data-kanban-pilot-board>
   const vscode = acquireVsCodeApi();
   const ACTION_LABELS = ${actionLabelsJson};
   const GATES = ${gatesJson};
@@ -2479,172 +2664,6 @@ export class BoardPanel {
       card.focus();
       pendingFocusTaskId = null;
     }
-  }
-
-  /*
-   * Hand-rolled markdown → HTML, deliberately not a dependency: the same call
-   * made for renderTemplate's mustache-lite (chat/promptTemplates.ts) — the
-   * vocabulary needed is small and fixed (this only ever renders what our own
-   * refine/develop/validate prompts ask an agent to write: headings,
-   * checklists, bold/italic, inline code, fenced code, links, blockquotes),
-   * so a full CommonMark parser is dependency weight without a matching need.
-   * Always escapes literal text; never passes raw HTML through — the agent
-   * content this renders is not fully trusted input.
-   */
-  function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
-  function isSafeUrl(href) {
-    return /^https?:\\/\\//i.test(href);
-  }
-
-  function isTaskAttachmentReference(value) {
-    return /^TASK-\\d+\\.attachments\\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
-  }
-
-  // asWebviewUri used the custom scheme in older VS Code releases and uses
-  // the special file-resource CDN host in current releases. Both forms are
-  // still constrained to resources produced by the host under local roots.
-  function isSafeImageSource(src) {
-    return typeof src === 'string' && (
-      /^vscode-webview-resource:/i.test(src) ||
-      /^https:\\/\\/file(?:%2b|\\+)\\.vscode-resource\\.vscode-cdn\\.net\\//i.test(src)
-    );
-  }
-
-  function taskImageAlt(value) {
-    const clean = String(value || '').replace(/[\\[\\]\\r\\n]/g, ' ').trim();
-    return clean || 'Task image';
-  }
-
-  function renderInline(raw, attachments) {
-    const codeTokens = [];
-    let masked = raw.replace(/\`([^\`]+)\`/g, (_m, code) => {
-      codeTokens.push(code);
-      return '' + (codeTokens.length - 1) + '';
-    });
-    const attachmentMap = new Map((attachments || []).map((attachment) => [attachment.relativePath, attachment]));
-    const imageTokens = [];
-    masked = masked.replace(/!\\[([^\\]\\r\\n]*)\\]\\(([^)\\s]+)\\)/g, (_m, alt, href) => {
-      imageTokens.push({ alt: taskImageAlt(alt), href });
-      return 'I' + (imageTokens.length - 1) + '';
-    });
-    const linkTokens = [];
-    masked = masked.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (_m, label, href) => {
-      linkTokens.push({ label, href });
-      return 'L' + (linkTokens.length - 1) + '';
-    });
-
-    let out = escapeHtml(masked);
-    out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
-    out = out.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
-    out = out.replace(/L(\\d+)/g, (_m, i) => {
-      const link = linkTokens[Number(i)];
-      return isSafeUrl(link.href)
-        ? '<a href="' + escapeHtml(link.href) + '">' + escapeHtml(link.label) + '</a>'
-        : escapeHtml(link.label);
-    });
-    out = out.replace(/I(\\d+)/g, (_m, i) => {
-      const image = imageTokens[Number(i)];
-      const attachment = isTaskAttachmentReference(image.href) ? attachmentMap.get(image.href) : undefined;
-      if (!attachment || !isSafeImageSource(attachment.src)) {
-        return '<span class="task-image-placeholder" role="img" aria-label="Image unavailable: ' + escapeHtml(image.alt) + '">Image unavailable: ' + escapeHtml(image.alt) + '</span>';
-      }
-      return '<img class="task-image" loading="lazy" src="' + escapeHtml(attachment.src) + '" alt="' + escapeHtml(image.alt) + '">';
-    });
-    out = out.replace(/(\\d+)/g, (_m, i) => '<code>' + escapeHtml(codeTokens[Number(i)]) + '</code>');
-    return out;
-  }
-
-  function renderMarkdown(src, attachments) {
-    if (!src) { return ''; }
-    const lines = src.replace(/\\r\\n/g, '\\n').split('\\n');
-    const out = [];
-    let listType = null;
-    function closeList() {
-      if (listType) { out.push('</' + (listType === 'ol' ? 'ol' : 'ul') + '>'); listType = null; }
-    }
-
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
-
-      if (/^\`\`\`/.test(line)) {
-        closeList();
-        const codeLines = [];
-        i++;
-        while (i < lines.length && !/^\`\`\`/.test(lines[i])) { codeLines.push(lines[i]); i++; }
-        i++;
-        out.push('<pre class="modal-code-block"><code>' + escapeHtml(codeLines.join('\\n')) + '</code></pre>');
-        continue;
-      }
-
-      const heading = line.match(/^(#{1,4})\\s+(.*)$/);
-      if (heading) {
-        closeList();
-        const level = heading[1].length;
-        out.push('<h' + level + '>' + renderInline(heading[2].trim(), attachments) + '</h' + level + '>');
-        i++;
-        continue;
-      }
-
-      if (/^>\\s?/.test(line)) {
-        closeList();
-        const quoteLines = [];
-        while (i < lines.length && /^>\\s?/.test(lines[i])) {
-          quoteLines.push(lines[i].replace(/^>\\s?/, ''));
-          i++;
-        }
-        out.push('<blockquote>' + renderInline(quoteLines.join(' '), attachments) + '</blockquote>');
-        continue;
-      }
-
-      const checklist = line.match(/^[-*]\\s+\\[([ xX])\\]\\s+(.*)$/);
-      if (checklist) {
-        if (listType !== 'checklist') { closeList(); out.push('<ul class="modal-md-checklist">'); listType = 'checklist'; }
-        const checked = checklist[1].toLowerCase() === 'x';
-        out.push(
-          '<li><label><input type="checkbox" disabled' + (checked ? ' checked' : '') + '><span>' +
-            renderInline(checklist[2], attachments) + '</span></label></li>',
-        );
-        i++;
-        continue;
-      }
-
-      const bullet = line.match(/^[-*]\\s+(.*)$/);
-      if (bullet) {
-        if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
-        out.push('<li>' + renderInline(bullet[1], attachments) + '</li>');
-        i++;
-        continue;
-      }
-
-      const numbered = line.match(/^\\d+\\.\\s+(.*)$/);
-      if (numbered) {
-        if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
-        out.push('<li>' + renderInline(numbered[1], attachments) + '</li>');
-        i++;
-        continue;
-      }
-
-      if (line.trim() === '') {
-        closeList();
-        i++;
-        continue;
-      }
-
-      closeList();
-      const paraLines = [line];
-      i++;
-      while (i < lines.length && lines[i].trim() !== '' && !/^(#{1,4}\\s|\`\`\`|>|[-*]\\s|\\d+\\.\\s)/.test(lines[i])) {
-        paraLines.push(lines[i]);
-        i++;
-      }
-      out.push('<p>' + renderInline(paraLines.join(' '), attachments) + '</p>');
-    }
-    closeList();
-    return out.join('');
   }
 
   const chatIconSvg =
@@ -3249,6 +3268,37 @@ export class BoardPanel {
     vscode.postMessage({ type: 'task/deselect' });
   }
 
+  function markMermaidUnavailable(root) {
+    const diagrams = root.querySelectorAll('[data-mermaid-diagram]');
+    for (const diagram of diagrams) {
+      if (diagram.dataset.mermaidState) { continue; }
+      diagram.dataset.mermaidState = 'unavailable';
+      diagram.setAttribute('role', 'group');
+      diagram.setAttribute('aria-label', 'Mermaid renderer unavailable');
+      const message = el('div', 'modal-mermaid-message', 'Mermaid renderer unavailable; source is shown below.');
+      message.setAttribute('role', 'status');
+      diagram.insertBefore(message, diagram.firstChild);
+    }
+  }
+
+  function renderMermaidInDetail(root) {
+    const renderer = window.kanbanPilotMermaid;
+    if (!renderer || typeof renderer.render !== 'function') {
+      markMermaidUnavailable(root);
+      return;
+    }
+    const runtimeScript = document.querySelector('script[data-kanban-pilot-mermaid]');
+    const styleNonce = runtimeScript ? runtimeScript.getAttribute('nonce') || '' : '';
+    let renderResult;
+    try {
+      renderResult = renderer.render(root, styleNonce);
+    } catch {
+      markMermaidUnavailable(root);
+      return;
+    }
+    Promise.resolve(renderResult).catch(() => markMermaidUnavailable(root));
+  }
+
   function renderDetail(task) {
     const backdrop = document.getElementById('detailBackdrop');
     const modal = document.getElementById('detail');
@@ -3352,11 +3402,15 @@ export class BoardPanel {
     if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
     body.appendChild(links);
 
-    for (const [label, text] of [['Request', task.request], ['Refined', task.refined], ['Scope', task.scope]]) {
+    for (const [label, rendered] of [
+      ['Request', task.requestHtml],
+      ['Refined', task.refinedHtml],
+      ['Scope', task.scopeHtml],
+    ]) {
       const section = el('div');
       section.appendChild(el('div', 'modal-section-label', label));
       const sectionBody = el('div', 'modal-section-body');
-      sectionBody.innerHTML = renderMarkdown(text, task.attachments || []);
+      sectionBody.innerHTML = typeof rendered === 'string' ? rendered : '';
       section.appendChild(sectionBody);
       body.appendChild(section);
     }
@@ -3369,6 +3423,7 @@ export class BoardPanel {
     }
 
     modal.appendChild(body);
+    renderMermaidInDetail(modal);
   }
 
   let editingTaskId = null;
