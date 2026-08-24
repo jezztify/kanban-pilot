@@ -8,6 +8,21 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.3.3] - 2026-08-24
+
+### Added
+
+- Safe CommonMark/GFM rendering in Task Details for the Request, Refined, and Scope sections,
+	including headings, lists, checklists, tables, code, links, and task-local images.
+- Mermaid fenced blocks now render as charts through the extension's locally packaged runtime.
+
+### Fixed
+
+- Invalid Mermaid diagrams now show a readable source fallback without preventing the rest of the
+	task details from rendering. Authored Markdown remains available for editing, while unsafe links
+	and unavailable or remote images are not loaded; existing task-local attachment handling and
+	modal actions remain intact.
+
 ## [0.3.2] - 2026-08-20
 
 ### Added

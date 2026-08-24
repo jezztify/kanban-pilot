@@ -430,6 +430,28 @@ export function parseSections(body: string): Record<string, string> {
 	return sections;
 }
 
+const CANONICAL_TASK_SECTION_NAMES = new Set(['Request', 'Refined', 'Scope', 'Log']);
+
+/**
+ * Extracts the four canonical task sections without treating Markdown h2
+ * headings inside their content as new task sections.
+ */
+export function parseTaskDetailSections(body: string): Record<string, string> {
+	const sections: Record<string, string> = {};
+	const headingPattern = /^##[ \t]+(Request|Refined|Scope|Log)[ \t]*\r?$/gm;
+	const headings = [...body.matchAll(headingPattern)];
+
+	for (let index = 0; index < headings.length; index++) {
+		const heading = headings[index];
+		const name = heading[1];
+		const headingEnd = (heading.index ?? 0) + heading[0].length;
+		const nextHeadingStart = headings[index + 1]?.index ?? body.length;
+		sections[name] = body.slice(headingEnd, nextHeadingStart).trim();
+	}
+
+	return sections;
+}
+
 function isColumn(value: string): value is Column {
 	return (COLUMNS as readonly string[]).includes(value);
 }
@@ -677,6 +699,33 @@ function replaceEditableSection(
 	return leading + value + trailing;
 }
 
+/** Keeps non-canonical body sections that are not part of the editor payload. */
+function preserveUnknownBodySections(segment: string, value: string, newline: string): string {
+	const headingPattern = /^##[ \t]+([^\r\n]+?)[ \t]*\r?$/gm;
+	const headings = [...segment.matchAll(headingPattern)];
+	const unknownSections: string[] = [];
+	const replacementHeadings = new Set(
+		[...value.matchAll(headingPattern)].map((heading) => heading[1].trim()),
+	);
+
+	for (let index = 0; index < headings.length; index++) {
+		const heading = headings[index];
+		const name = heading[1].trim();
+		if (CANONICAL_TASK_SECTION_NAMES.has(name) || replacementHeadings.has(name)) {
+			continue;
+		}
+		const start = heading.index ?? 0;
+		const end = headings[index + 1]?.index ?? segment.length;
+		unknownSections.push(segment.slice(start, end).replace(/(?:\r\n|\n)+$/, ''));
+	}
+
+	if (unknownSections.length === 0) {
+		return value;
+	}
+	const trimmed = value.replace(/(?:\r\n|\n)+$/, '');
+	return trimmed + newline + newline + unknownSections.join(newline + newline);
+}
+
 /**
  * Rewrites the title and the three editable body sections while leaving every
  * other body section, including the append-only Log, untouched.
@@ -689,7 +738,7 @@ export function updateEditableTaskContent(raw: string, value: unknown): string {
 	}
 
 	const newline = parsed.body.includes('\r\n') ? '\r\n' : '\n';
-	const headingPattern = /^##[ \t]+([^\r\n]+?)[ \t]*\r?$/gm;
+	const headingPattern = /^##[ \t]+(Request|Refined|Scope|Log)[ \t]*\r?$/gm;
 	const headings = [...parsed.body.matchAll(headingPattern)];
 	const replacements: Record<EditableSectionName, string> = {
 		Request: content.request,
@@ -708,7 +757,9 @@ export function updateEditableTaskContent(raw: string, value: unknown): string {
 		const name = heading[1].trim() as EditableSectionName;
 		body += parsed.body.slice(cursor, headingEnd);
 		if (Object.prototype.hasOwnProperty.call(replacements, name)) {
-			body += replaceEditableSection(parsed.body.slice(headingEnd, end), replacements[name], newline, end < parsed.body.length);
+			const originalSegment = parsed.body.slice(headingEnd, end);
+			const replacement = preserveUnknownBodySections(originalSegment, replacements[name], newline);
+			body += replaceEditableSection(originalSegment, replacement, newline, end < parsed.body.length);
 			found.add(name);
 		} else {
 			body += parsed.body.slice(headingEnd, end);

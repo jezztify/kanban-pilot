@@ -77,6 +77,12 @@ for the selected card. The header holds the task-set picker and the **Settings**
 Select a card to read its Request, Refined, and Scope sections. **Open Chat** is the explicit
 handoff to that task's private Copilot Chat session.
 
+Task Details renders the Request, Refined, and Scope sections as safe CommonMark/GFM, including
+headings, lists, checklists, tables, code, links, and task-local images. Fenced blocks tagged
+`mermaid` render as charts. If a chart cannot be rendered, its source remains visible in a
+readable fallback and the rest of the modal stays usable. Unsafe links and unavailable or remote
+images are not loaded. Rendering is read-only; choose **Edit task** to edit the authored Markdown.
+
 ## Gates: who decides when a card moves
 
 Every normal pipeline transition has its own **gate**, and all nine gates start out **manual** —
@@ -347,7 +353,12 @@ A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 ## Release notes
 
-The current documented release is **0.3.2**.
+The current documented release is **0.3.3**.
+
+**0.3.3** — Task Details now renders Request, Refined, and Scope as safe CommonMark/GFM,
+including Mermaid charts from fenced blocks, while preserving authored Markdown for editing and
+showing readable source fallbacks for invalid diagrams. Unsafe links and unavailable or remote
+images remain unloaded, and existing task-local attachments and modal actions continue to work.
 
 **0.3.2** — Exact task/run/stage receipt reconciliation with actionable diagnostics and
 idempotent same-run late-result handling; explicit, confirmed stale-completion recovery with
