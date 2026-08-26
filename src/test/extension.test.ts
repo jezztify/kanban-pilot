@@ -35,6 +35,16 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
 	});
 
+	test('defaults outbound turns to safe browser progress narration', () => {
+		const setting = vscode.workspace
+			.getConfiguration('kanbanPilot')
+			.inspect<string>('chat.outboundPreamble');
+
+		assert.strictEqual(setting?.defaultValue, DEFAULT_OUTBOUND_PREAMBLE);
+		assert.match(DEFAULT_OUTBOUND_PREAMBLE, /progress updates.*required/i);
+		assert.match(DEFAULT_OUTBOUND_PREAMBLE, /never include source, secrets, tokens, or absolute file paths/i);
+	});
+
 	test('active task-set switching isolates cards and refuses a running-set switch', async () => {
 		const root = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-context-${Date.now()}-${Math.random().toString(36).slice(2)}`),
