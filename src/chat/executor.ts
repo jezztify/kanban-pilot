@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
 import { Task } from '../model/task';
 import { Stage } from './receipt';
-import { sessionUriForTaskBinding } from './sessionUri';
+import {
+	CHAT_SESSION_SCHEME,
+	parseSessionUri,
+	sessionUriForTaskBinding,
+} from './sessionUri';
 
 /**
  * Confirmed present via the Configure Tools picker (built-in `vscode`
@@ -28,12 +32,169 @@ export interface ExecutorResult {
 	error?: string;
 	/** `metadata.sessionId` from the result — Copilot's own conversation id (§6.9). */
 	sessionId?: string;
+	diagnostic?: ChatCapabilityDiagnostic;
+}
+
+export type CancellationResult =
+	| { kind: 'cancelled' }
+	| { kind: 'no-active-turn' }
+	| { kind: 'failed'; error: string };
+
+export interface CancellationOptions {
+	mode: string;
+	sessionPrefix: string;
+}
+
+/** Built-in VS Code command used by Copilot Chat's own Stop button. */
+export const CHAT_CANCEL_COMMAND = 'workbench.action.chat.cancel';
+
+/**
+ * The fully-assembled outbound turn Kanban Pilot authors for a stage run — the
+ * seven keys handed to `workbench.action.chat.open<mode>`. This is "row 1" of
+ * the hijack matrix (docs/copilot-chat-hijack-spike.md): the one message the
+ * extension legitimately owns and may therefore observe or transform before
+ * injection. `modelSelector` is present only when one is pinned, matching the
+ * shape the command has always received.
+ */
+export interface OutboundPayload {
+	query: string;
+	mode: string;
+	blockOnResponse: boolean;
+	attachFiles: vscode.Uri[];
+	toolsInclude: string[] | undefined;
+	toolsExclude: string[];
+	modelSelector?: { id?: string; vendor?: string };
+}
+
+/** Read-only context describing the run the outbound payload belongs to. */
+export interface OutboundContext {
+	taskId: string;
+	stage: Stage;
+	mode: string;
+	sessionUri: vscode.Uri;
+	attachmentCount: number;
+}
+
+/**
+ * Redacted, structural-only summary of an outbound turn. This is all the
+ * observe hook is ever handed: it deliberately excludes the raw `query`, the
+ * attachment file contents, and any credential/token, per the spike's
+ * security/ToS section. Tool lists are ids only, already den-/allow-listed.
+ */
+export interface OutboundMetadata {
+	taskId: string;
+	stage: Stage;
+	mode: string;
+	toolsInclude?: string[];
+	toolsExclude: string[];
+	attachmentCount: number;
+	queryLength: number;
+}
+
+/**
+ * The observe-and-transform seam around the executor's outbound payload
+ * (TASK-006). Both hooks are optional; the default is an identity no-op that
+ * leaves the injected payload byte-for-byte unchanged.
+ *
+ * - `observe` receives only the redacted {@link OutboundMetadata} — it cannot
+ *   see the raw prompt or file contents, so a logging hook cannot leak them.
+ * - `transform` receives the full {@link OutboundPayload} and returns the
+ *   payload to inject; it must be synchronous and pure (§6.9 narrow window).
+ */
+export interface OutboundPayloadSeam {
+	observe?(metadata: OutboundMetadata): void;
+	transform?(payload: OutboundPayload, context: OutboundContext): OutboundPayload;
+}
+
+/** Structural, non-sensitive projection of a payload for the observe hook. */
+export function outboundPayloadMetadata(payload: OutboundPayload, context: OutboundContext): OutboundMetadata {
+	return {
+		taskId: context.taskId,
+		stage: context.stage,
+		mode: payload.mode,
+		toolsInclude: payload.toolsInclude,
+		toolsExclude: payload.toolsExclude,
+		attachmentCount: payload.attachFiles.length,
+		queryLength: payload.query.length,
+	};
+}
+
+function isValidOutboundPayload(value: unknown): value is OutboundPayload {
+	if (!value || typeof value !== 'object') {
+		return false;
+	}
+	const p = value as Partial<OutboundPayload>;
+	return typeof p.query === 'string'
+		&& typeof p.mode === 'string'
+		&& typeof p.blockOnResponse === 'boolean'
+		&& Array.isArray(p.attachFiles)
+		&& Array.isArray(p.toolsExclude)
+		&& (p.toolsInclude === undefined || Array.isArray(p.toolsInclude));
+}
+
+/**
+ * Apply the observe-and-transform seam to an outbound payload. Fail-safe: a
+ * throwing observe hook is swallowed, and a throwing or invalid transform falls
+ * back to the untransformed payload with a non-fatal warning — a broken seam
+ * can never crash a run (§6.9 / AC7).
+ */
+export function applyOutboundSeam(
+	seam: OutboundPayloadSeam,
+	payload: OutboundPayload,
+	context: OutboundContext,
+): OutboundPayload {
+	if (seam.observe) {
+		try {
+			seam.observe(outboundPayloadMetadata(payload, context));
+		} catch (e) {
+			console.warn(`Kanban Pilot outbound observe hook threw; ignoring: ${describeError(e)}`);
+		}
+	}
+	if (!seam.transform) {
+		return payload;
+	}
+	try {
+		const next = seam.transform(payload, context);
+		if (!isValidOutboundPayload(next)) {
+			console.warn('Kanban Pilot outbound transform returned an invalid payload; injecting the original.');
+			return payload;
+		}
+		return next;
+	} catch (e) {
+		console.warn(`Kanban Pilot outbound transform threw; injecting the original: ${describeError(e)}`);
+		return payload;
+	}
+}
+
+function describeError(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+export type ChatCapability = 'vscode.open' | 'mode-specific-chat-command' | 'vscode-chat-session-uri';
+
+export interface ChatCapabilityDiagnostic {
+	code: 'missing-vscode-open' | 'missing-chat-command' | 'unsupported-chat-session-uri';
+	capability: ChatCapability;
+	mode: string;
+	remoteName?: string;
+	message: string;
+	remediation: string;
+}
+
+export interface ChatCapabilities {
+	mode: string;
+	remoteName?: string;
+	hasVscodeOpen: boolean;
+	chatCommand?: string;
+	supportsChatSessionUri: boolean;
 }
 
 export interface Executor {
 	isAvailable(): Promise<boolean>;
 	/** Opens the task's session and injects `prompt`, resolving at terminal state. */
 	run(task: Task, taskFileUri: vscode.Uri, prompt: string, stage: Stage, options: RunOptions): Promise<ExecutorResult>;
+	/** Cancels the active turn in this task's bound session, when one exists. */
+	cancel?(task: Task, options: CancellationOptions): Promise<CancellationResult>;
 }
 
 /** Copilot receives the Markdown task first, followed by images in reference order. */
@@ -52,6 +213,10 @@ interface ChatAgentResultish {
 export interface ChatCommandApi {
 	getCommands(includeInternal?: boolean): Thenable<string[]>;
 	executeCommand<T>(command: string, ...args: unknown[]): Thenable<T>;
+}
+
+export interface ChatCapabilityProbe {
+	supportsChatSessionUri?(uri: vscode.Uri): boolean | Promise<boolean>;
 }
 
 /** Serializes injections process-wide (§6.9) — two card actions can never race for focus. */
@@ -107,12 +272,22 @@ export function taskChatOpenOptions(openBeside: boolean): vscode.TextDocumentSho
  * the session and injecting, and a process-wide mutex serializes the pair.
  */
 export class ChatSessionExecutor implements Executor {
-	constructor(private readonly commands: ChatCommandApi = vscode.commands) {}
+	private readonly activeTurns = new Set<string>();
+	private readonly pendingTurns = new Set<string>();
+	private readonly cancellationRequested = new Set<string>();
+
+	constructor(
+		private readonly commands: ChatCommandApi = vscode.commands,
+		private readonly capabilityProbe: ChatCapabilityProbe = {},
+		private readonly seam: OutboundPayloadSeam = {},
+	) {}
 
 	async isAvailable(mode = 'agent'): Promise<boolean> {
-		const openCommand = await this.resolveAgentOpenCommand(mode);
-		const all = await this.commands.getCommands(true);
-		return !!openCommand && all.includes('vscode.open');
+		const capabilities = await this.detectCapabilities(mode);
+		// Some VS Code clients do not advertise vscode.open through
+		// getCommands(true), even though the command is executable. Treat the
+		// inventory bit as advisory and probe it at the actual open boundary.
+		return !!capabilities.chatCommand && capabilities.supportsChatSessionUri;
 	}
 
 	async run(
@@ -122,10 +297,47 @@ export class ChatSessionExecutor implements Executor {
 		stage: Stage,
 		options: RunOptions,
 	): Promise<ExecutorResult> {
-		const openCommand = await this.resolveAgentOpenCommand(options.mode);
-		if (!openCommand) {
-			return this.clipboardFallback(task, prompt, options);
+		const sessionUri = sessionUriForTaskBinding(task, options.sessionPrefix, task.setId);
+		const activeTurnKey = sessionUri.toString();
+		this.pendingTurns.add(activeTurnKey);
+		const capabilities = await this.detectCapabilities(options.mode, task, options.sessionPrefix);
+		if (this.cancellationRequested.has(activeTurnKey)) {
+			this.pendingTurns.delete(activeTurnKey);
+			this.cancellationRequested.delete(activeTurnKey);
+			return { ok: false, error: 'Copilot Chat turn cancelled before injection.' };
 		}
+		// A few supported clients omit vscode.open from their command inventory
+		// even though the command remains executable. Probe it at the narrow
+		// open-and-inject boundary instead of taking the inventory as a hard
+		// preflight failure.
+		const diagnostic = capabilityDiagnostic(capabilities, false);
+		if (diagnostic) {
+			try {
+				return await this.clipboardFallback(task, prompt, options, diagnostic);
+			} finally {
+				this.pendingTurns.delete(activeTurnKey);
+			}
+		}
+		const openCommand = capabilities.chatCommand!;
+
+		const payload: OutboundPayload = {
+			query: prompt,
+			mode: options.mode,
+			blockOnResponse: true,
+			attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
+			toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
+			toolsExclude: options.toolsExclude,
+			...(options.modelSelector && Object.keys(options.modelSelector).length
+				? { modelSelector: options.modelSelector }
+				: {}),
+		};
+		const context: OutboundContext = {
+			taskId: task.id,
+			stage,
+			mode: options.mode,
+			sessionUri,
+			attachmentCount: payload.attachFiles.length,
+		};
 
 		try {
 			// Open immediately before injecting, with nothing awaited in
@@ -133,43 +345,126 @@ export class ChatSessionExecutor implements Executor {
 			// focus to move. The command's terminal response is returned as a
 			// value so the mutex releases before blockOnResponse settles.
 			const pending = await injectionMutex.run(async () => {
+				if (this.cancellationRequested.has(activeTurnKey)) {
+					return { response: Promise.resolve(undefined), cancelled: true };
+				}
 				await this.commands.executeCommand(
 					'vscode.open',
-					sessionUriForTaskBinding(task, options.sessionPrefix, task.setId),
+					sessionUri,
 					taskChatOpenOptions(options.openBeside === true),
 				);
+				if (this.cancellationRequested.has(activeTurnKey)) {
+					return { response: Promise.resolve(undefined), cancelled: true };
+				}
 
-				return {
-					response: this.commands.executeCommand<ChatAgentResultish | undefined>(openCommand, {
-						query: prompt,
-						mode: options.mode,
-						blockOnResponse: true,
-						attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
-						toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
-						toolsExclude: options.toolsExclude,
-						...(options.modelSelector && Object.keys(options.modelSelector).length
-							? { modelSelector: options.modelSelector }
-							: {}),
-					}),
-				};
+				// Observe-and-transform seam (row 1, TASK-006): the extension
+				// authors this payload, so it may log or adjust it here. Runs
+				// synchronously with no await before injection to keep the
+				// §6.9 narrow window intact; a throwing/invalid seam falls
+				// back to the untransformed payload.
+				const finalPayload = applyOutboundSeam(this.seam, payload, context);
+
+				const response = this.commands.executeCommand<ChatAgentResultish | undefined>(openCommand, finalPayload);
+				this.activeTurns.add(activeTurnKey);
+				return { response, cancelled: false };
 			});
+			if (pending.cancelled) {
+				return { ok: false, error: 'Copilot Chat turn cancelled before injection.' };
+			}
 
-			const result = await pending.response;
-			const sessionId = result?.metadata?.sessionId;
-			return { ok: true, sessionId };
+			try {
+				const result = await pending.response;
+				const sessionId = result?.metadata?.sessionId;
+				return { ok: true, sessionId };
+			} finally {
+				this.activeTurns.delete(activeTurnKey);
+			}
 		} catch (e) {
-			return { ok: false, error: e instanceof Error ? e.message : String(e) };
+			return {
+				ok: false,
+				error: e instanceof Error ? e.message : String(e),
+				...(!capabilities.hasVscodeOpen
+					? { diagnostic: capabilityDiagnostic(capabilities, true) }
+					: {}),
+			};
+		} finally {
+			this.pendingTurns.delete(activeTurnKey);
+			this.cancellationRequested.delete(activeTurnKey);
 		}
 	}
 
-	private async resolveAgentOpenCommand(mode: string): Promise<string | undefined> {
+	async cancel(task: Task, options: CancellationOptions): Promise<CancellationResult> {
+		const sessionUri = sessionUriForTaskBinding(task, options.sessionPrefix, task.setId);
+		const activeTurnKey = sessionUri.toString();
+		const isPending = this.pendingTurns.has(activeTurnKey);
+		if (!isPending && !this.activeTurns.has(activeTurnKey)) {
+			return { kind: 'no-active-turn' };
+		}
+
+		const commands = await this.commands.getCommands(true);
+		if (!commands.includes(CHAT_CANCEL_COMMAND)) {
+			return {
+				kind: 'failed',
+				error: `Copilot Chat cancellation command ${CHAT_CANCEL_COMMAND} is unavailable.`,
+			};
+		}
+		if (isPending && !this.activeTurns.has(activeTurnKey)) {
+			this.cancellationRequested.add(activeTurnKey);
+			return { kind: 'cancelled' };
+		}
+
+		try {
+			await injectionMutex.run(async () => {
+				// The cancellation command operates on the focused chat widget. Open
+				// the deterministic task session under the same mutex used for prompt
+				// injection so another task cannot steal focus between these commands.
+				await this.commands.executeCommand(
+					'vscode.open',
+					sessionUri,
+					taskChatOpenOptions(false),
+				);
+				await this.commands.executeCommand(CHAT_CANCEL_COMMAND);
+			});
+			return { kind: 'cancelled' };
+		} catch (e) {
+			return {
+				kind: 'failed',
+				error: e instanceof Error ? e.message : String(e),
+			};
+		}
+	}
+
+	async detectCapabilities(mode: string, task?: Task, sessionPrefix?: string): Promise<ChatCapabilities> {
 		const all = await this.commands.getCommands(true);
+		const sessionUri = task
+			? sessionUriForTaskBinding(task, sessionPrefix ?? 'kanban-pilot-', task.setId)
+			: undefined;
+		const probedSupport = sessionUri && this.capabilityProbe.supportsChatSessionUri
+			? await this.capabilityProbe.supportsChatSessionUri(sessionUri)
+			: undefined;
+		return {
+			mode,
+			remoteName: vscode.env.remoteName || undefined,
+			hasVscodeOpen: all.includes('vscode.open'),
+			chatCommand: this.findAgentOpenCommand(all, mode),
+			supportsChatSessionUri: probedSupport ?? (sessionUri
+				? sessionUri.scheme === CHAT_SESSION_SCHEME && !!parseSessionUri(sessionUri)
+				: true),
+		};
+	}
+
+	private findAgentOpenCommand(all: readonly string[], mode: string): string | undefined {
 		const expected = `workbench.action.chat.open${mode}`.toLowerCase();
 		return all.find((id) => id.toLowerCase() === expected);
 	}
 
 	/** §6.6: on failure, session binding still holds and the board still tracks state via the receipt. */
-	private async clipboardFallback(task: Task, prompt: string, options: RunOptions): Promise<ExecutorResult> {
+	private async clipboardFallback(
+		task: Task,
+		prompt: string,
+		options: RunOptions,
+		diagnostic?: ChatCapabilityDiagnostic,
+	): Promise<ExecutorResult> {
 		try {
 			await this.commands.executeCommand(
 				'vscode.open',
@@ -180,9 +475,56 @@ export class ChatSessionExecutor implements Executor {
 			void vscode.window.showWarningMessage(
 				`Kanban Pilot couldn't inject automatically — the prompt for ${task.id} is on your clipboard. Paste it into the opened chat.`,
 			);
-			return { ok: false, error: 'chat.open<Mode> unavailable; used clipboard fallback' };
+			return {
+				ok: false,
+				error: 'chat.open<Mode> unavailable; used clipboard fallback',
+				diagnostic,
+			};
 		} catch (e) {
-			return { ok: false, error: e instanceof Error ? e.message : String(e) };
+			return {
+				ok: false,
+				error: e instanceof Error ? e.message : String(e),
+				diagnostic,
+			};
 		}
 	}
+}
+
+export function capabilityDiagnostic(
+	capabilities: ChatCapabilities,
+	includeOpenCapability = true,
+): ChatCapabilityDiagnostic | undefined {
+	const remote = capabilities.remoteName;
+	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
+	if (includeOpenCapability && !capabilities.hasVscodeOpen) {
+		return {
+			code: 'missing-vscode-open',
+			capability: 'vscode.open',
+			mode: capabilities.mode,
+			...(remote ? { remoteName: remote } : {}),
+			message: `Kanban Pilot cannot open the task chat because vscode.open is unavailable on ${client}.`,
+			remediation: 'Reconnect with a supported VS Code desktop or browser client and keep the Kanban Pilot host workspace open.',
+		};
+	}
+	if (!capabilities.chatCommand) {
+		return {
+			code: 'missing-chat-command',
+			capability: 'mode-specific-chat-command',
+			mode: capabilities.mode,
+			...(remote ? { remoteName: remote } : {}),
+			message: `The Copilot ${capabilities.mode} chat command is unavailable on ${client}.`,
+			remediation: 'Install or enable GitHub Copilot Chat in the connected client, then retry the task action.',
+		};
+	}
+	if (!capabilities.supportsChatSessionUri) {
+		return {
+			code: 'unsupported-chat-session-uri',
+			capability: 'vscode-chat-session-uri',
+			mode: capabilities.mode,
+			...(remote ? { remoteName: remote } : {}),
+			message: `The connected client cannot open deterministic vscode-chat-session URIs for ${client}.`,
+			remediation: 'Use a supported VS Code desktop or browser client with Copilot Chat enabled; clipboard fallback preserves the prompt.',
+		};
+	}
+	return undefined;
 }

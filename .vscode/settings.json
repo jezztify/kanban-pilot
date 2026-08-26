@@ -11,7 +11,9 @@
 	"kanbanPilot.chat.agentNames": {
 		"refine": "Bro Rapid Architect",
 		"in-progress": "Bro Rapid Coder",
-		"validation": "Bro Rapid QA"
+		"validation": "Bro Rapid QA",
+		"scoped": "Bro Rapid Coder",
+		"approved": "Bro Rapid Coder"
 	},
 	"kanbanPilot.gates.validationAutoStart": "manual",
 	"kanbanPilot.gates.approvedToInProgress": "manual",

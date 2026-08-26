@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 
 import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { ChatCommandApi, ChatSessionExecutor, Executor, ExecutorResult, RunOptions } from '../chat/executor';
+import { CancellationResult, ChatCommandApi, ChatSessionExecutor, Executor, ExecutorResult, RunOptions } from '../chat/executor';
 import { closeTaskChatTabs, CommandExecutor, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
@@ -70,7 +70,11 @@ function deferred<T>(): Deferred<T> {
 
 class StubExecutor implements Executor {
 	calls: { task: Task; prompt: string; options: RunOptions }[] = [];
-	constructor(private next: Next) {}
+	cancelCalls: { task: Task; options: { mode: string; sessionPrefix: string } }[] = [];
+	constructor(
+		private next: Next,
+		private readonly cancelResult: CancellationResult = { kind: 'cancelled' },
+	) {}
 
 	async isAvailable(): Promise<boolean> {
 		return true;
@@ -91,6 +95,11 @@ class StubExecutor implements Executor {
 			});
 		}
 		return outcome;
+	}
+
+	async cancel(task: Task, options: { mode: string; sessionPrefix: string }): Promise<CancellationResult> {
+		this.cancelCalls.push({ task, options });
+		return this.cancelResult;
 	}
 }
 
@@ -2182,6 +2191,83 @@ suite('M3 RunManager', () => {
 		});
 	});
 
+	suite('lifecycle events and disposal', () => {
+		test('emits ordered start, pending, promotion, receipt, and completion events', async () => {
+			const task = await store.create('Observe a successful lifecycle');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(okReceipt(store, 'refine'));
+			const runManager = new RunManager(store, executor, folder);
+			const events: { kind: string; taskId?: string; runId?: string; stage?: string }[] = [];
+			const subscription = runManager.onDidChange((change) => events.push(change));
+			try {
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(() => events.some((event) => event.kind === 'completion'));
+				assert.deepStrictEqual(events.map((event) => event.kind), [
+					'start',
+					'pending-outcome',
+					'promotion',
+					'receipt',
+					'completion',
+				]);
+				assert.ok(events.every((event) => event.taskId === task.id));
+				assert.ok(events.filter((event) => event.kind !== 'promotion').every((event) => event.runId));
+				assert.ok(events.filter((event) => event.kind !== 'promotion').every((event) => event.stage === 'refine'));
+				assert.strictEqual((runManager as unknown as { progressTimers: Set<unknown> }).progressTimers.size, 0);
+			} finally {
+				subscription.dispose();
+				runManager.dispose();
+			}
+		});
+
+		test('emits failed before completion when the executor reports an error', async () => {
+			const task = await store.create('Observe a failed lifecycle');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const runManager = new RunManager(store, new StubExecutor(async () => ({ ok: false, error: 'chat unavailable' })), folder);
+			const events: string[] = [];
+			const subscription = runManager.onDidChange((change) => events.push(change.kind));
+			try {
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(() => events.includes('completion'));
+				assert.deepStrictEqual(events, ['start', 'failed', 'completion']);
+			} finally {
+				subscription.dispose();
+				runManager.dispose();
+			}
+		});
+
+		test('disposal clears timers, releases an active reservation, and suppresses late events', async () => {
+			const task = await store.create('Dispose an unresolved lifecycle');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const pending = deferred<ExecutorResult>();
+			const executor = new StubExecutor(() => pending.promise);
+			const runManager = new RunManager(store, executor, folder);
+			const events: string[] = [];
+			const subscription = runManager.onDidChange((change) => events.push(change.kind));
+			try {
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(() => events.includes('start'));
+				await waitUntil(() => (runManager as unknown as { progressTimers: Set<unknown> }).progressTimers.size === 1);
+				await waitUntil(() => executor.calls.length === 1);
+				const coordinator = (runManager as unknown as {
+					concurrency: { active: Set<string> };
+				}).concurrency;
+				assert.strictEqual(coordinator.active.size, 1);
+				const eventsBeforeDispose = [...events];
+
+				runManager.dispose();
+				assert.strictEqual((runManager as unknown as { progressTimers: Set<unknown> }).progressTimers.size, 0);
+				await waitUntil(() => coordinator.active.size === 0);
+
+				pending.resolve({ ok: true, sessionId: 'late-session' });
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				assert.deepStrictEqual(events, eventsBeforeDispose);
+			} finally {
+				subscription.dispose();
+				runManager.dispose();
+			}
+		});
+	});
+
 	suite('stop', () => {
 		test('stop clears the run id, so a resolution that arrives afterward cannot clobber the stop', async () => {
 			const task = await store.create('Set up billing webhook');
@@ -2196,6 +2282,7 @@ suite('M3 RunManager', () => {
 
 			await runManager.handleAction(task.id, 'stop');
 			const stopped = (await store.readAll()).tasks[0];
+			assert.deepStrictEqual(executor.cancelCalls.map((call) => call.task.id), [task.id]);
 			assert.strictEqual(stopped.state, 'refine');
 			assert.strictEqual(stopped.status, 'idle');
 			assert.strictEqual(stopped.run, undefined, 'Stop must clear run — otherwise a late resolution reconciles against a stale id');
@@ -2207,6 +2294,69 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.status, 'idle', 'the late resolution must find no matching run and do nothing');
 			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish').length, 1);
 			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'activity-finish' && event.outcome === 'stopped'));
+		});
+
+		test('a cancellation failure leaves the run active and does not record a false stop', async () => {
+			const task = await store.create('Keep running when cancellation fails');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(
+				() => 'hang',
+				{ kind: 'failed', error: 'cancel command unavailable' },
+			);
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(() => executor.calls.length === 1);
+			const runId = (await store.readAll()).tasks[0].run;
+			await runManager.handleAction(task.id, 'stop');
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.status, 'running');
+			assert.strictEqual(after.run, runId);
+			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish').length, 0);
+			runManager.dispose();
+		});
+
+		test('no active executor turn is an idempotent Stop success', async () => {
+			const task = await store.create('Turn already completed');
+			await store.patch(task.id, { state: 'refine', status: 'idle' });
+			const executor = new StubExecutor(() => 'hang', { kind: 'no-active-turn' });
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'refine');
+			await waitUntil(() => executor.calls.length === 1);
+			await runManager.handleAction(task.id, 'stop');
+
+			const after = (await store.readAll()).tasks[0];
+			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(parseAuditEvents(after.sections['Log']).filter((event) => event.kind === 'activity-finish' && event.outcome === 'stopped').length, 1);
+		});
+
+		test('stopping one concurrent task cancels only its executor turn', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('run.maxParallelTasks', 2, vscode.ConfigurationTarget.Global);
+			try {
+				const first = await store.create('First concurrent run');
+				const second = await store.create('Second concurrent run');
+				await store.patch(first.id, { state: 'refine', status: 'idle' });
+				await store.patch(second.id, { state: 'refine', status: 'idle' });
+				const executor = new StubExecutor(() => 'hang');
+				const runManager = new RunManager(store, executor, folder);
+
+				await runManager.handleAction(first.id, 'refine');
+				await runManager.handleAction(second.id, 'refine');
+				await waitUntil(() => executor.calls.length === 2);
+				await runManager.handleAction(first.id, 'stop');
+
+				assert.deepStrictEqual(executor.cancelCalls.map((call) => call.task.id), [first.id]);
+				const tasks = (await store.readAll()).tasks;
+				assert.strictEqual(tasks.find((candidate) => candidate.id === first.id)?.status, 'idle');
+				assert.strictEqual(tasks.find((candidate) => candidate.id === second.id)?.status, 'running');
+				runManager.dispose();
+			} finally {
+				await cfg.update('run.maxParallelTasks', undefined, vscode.ConfigurationTarget.Global);
+			}
 		});
 
 		test('stop on In Progress bounces to Approved (Stop + reset)', async () => {

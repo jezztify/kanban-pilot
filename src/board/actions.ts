@@ -291,25 +291,32 @@ export async function moveTask(
  */
 /**
  * Deletes a task's file, after confirmation. Card deletion is hard to reverse
- * (no in-app undo), so it goes through `showWarningMessage`'s modal — a
- * destructive action a single stray click shouldn't be able to complete.
+ * (no in-app undo), so it is always gated behind a modal — a destructive
+ * action a single stray click shouldn't be able to complete. Callers that own
+ * a client surface pass their own `confirm` so the dialog appears where the
+ * click happened; command-palette callers get the default editor modal.
  */
 export async function deleteTask(
 	store: TaskStore,
 	taskId: string,
 	title: string,
+	confirm: (taskId: string, title: string) => Promise<boolean> = confirmDeleteInEditor,
 ): Promise<boolean> {
-	const confirmed = await vscode.window.showWarningMessage(
-		`Delete ${taskId} — "${title}"? This removes the task file and cannot be undone.`,
-		{ modal: true },
-		'Delete',
-	);
-	if (confirmed !== 'Delete') {
+	if (!(await confirm(taskId, title))) {
 		return false;
 	}
 
 	await store.delete(taskId);
 	return true;
+}
+
+async function confirmDeleteInEditor(taskId: string, title: string): Promise<boolean> {
+	const confirmed = await vscode.window.showWarningMessage(
+		`Delete ${taskId} — "${title}"? This removes the task file and cannot be undone.`,
+		{ modal: true },
+		'Delete',
+	);
+	return confirmed === 'Delete';
 }
 
 export async function pickTaskFor(

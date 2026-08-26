@@ -28,6 +28,7 @@ import { gateForId, GATE_CATALOG } from '../model/gates';
 import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
 import { deleteTask } from './actions';
+import { BoardSurface, WebviewPanelSurface } from './boardSurface';
 import { TASK_ACTIONS, TaskAction } from './stateMachine';
 
 const markdownItTaskLists = require('markdown-it-task-lists') as (
@@ -382,8 +383,16 @@ interface InMessage {
 }
 
 /** Operations the webview needs from the workspace's active-set controller. */
+export interface BoardTaskSetChange {
+  revision: number;
+  kind: string;
+  taskId?: string;
+  note?: string;
+}
+
 export interface BoardTaskSetHost {
   readonly ready: Promise<void>;
+  readonly revision?: number;
   readonly store: TaskStore;
   readonly runManager: RunManager;
   readonly activeSet: TaskSet;
@@ -392,7 +401,7 @@ export interface BoardTaskSetHost {
   createTaskSet(name: string): Promise<void>;
   renameTaskSet(name: string): Promise<void>;
   deleteTaskSet(): Promise<void>;
-  onDidChange(listener: () => void): vscode.Disposable;
+  onDidChange(listener: (change?: BoardTaskSetChange) => void): vscode.Disposable;
 }
 
 /**
@@ -880,22 +889,25 @@ export class BoardPanel {
 	private static current: BoardPanel | undefined;
 
 	private readonly disposables: vscode.Disposable[] = [];
+  private readonly surface: BoardSurface;
+  private disposed = false;
 	private selectedTaskId: string | undefined;
   private taskWatcher: vscode.Disposable | undefined;
   private webviewReady = false;
   private pendingNewTaskOpen = false;
 
 	private constructor(
-		private readonly panel: vscode.WebviewPanel,
+    surface: BoardSurface | vscode.WebviewPanel,
     private readonly host: BoardTaskSetHost,
     private readonly extensionUri: vscode.Uri,
 	) {
+    this.surface = 'contentSecurityPolicy' in surface ? surface : new WebviewPanelSurface(surface);
     this.configureWebview();
-		this.panel.webview.html = this.html();
+    this.surface.setHtml(this.html());
     this.bindTaskWatcher();
 
 		this.disposables.push(
-			this.panel.webview.onDidReceiveMessage((message: InMessage) => this.onMessage(message)),
+      this.surface.onDidReceiveMessage((message) => this.onMessage(message as InMessage)),
       this.host.onDidChange(() => {
         this.selectedTaskId = undefined;
         this.configureWebview();
@@ -915,7 +927,8 @@ export class BoardPanel {
           }
         }
 			}),
-			this.panel.onDidDispose(() => this.dispose()),
+      this.surface.onDidDispose(() => this.dispose()),
+      this.surface.onDidBecomeVisible(() => void this.pushAll()),
 		);
     void this.host.ready
       .then(() => {
@@ -934,10 +947,7 @@ export class BoardPanel {
   }
 
   private configureWebview(): void {
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.extensionUri, this.store.directory],
-    };
+    this.surface.setLocalResourceRoots([this.extensionUri, this.store.directory]);
   }
 
   /** Opens the canonical attachment-capable New Task modal from a command. */
@@ -945,7 +955,7 @@ export class BoardPanel {
     this.pendingNewTaskOpen = true;
     if (this.webviewReady) {
       this.pendingNewTaskOpen = false;
-      void this.panel.webview.postMessage({ type: 'newTask/open' });
+      void this.surface.postMessage({ type: 'newTask/open' });
     }
   }
 
@@ -960,7 +970,7 @@ export class BoardPanel {
 		column = vscode.ViewColumn.One,
 	): BoardPanel {
 		if (BoardPanel.current) {
-			BoardPanel.current.panel.reveal(column);
+      BoardPanel.current.surface.reveal?.(column);
 			void BoardPanel.current.pushAll();
 			return BoardPanel.current;
 		}
@@ -971,9 +981,14 @@ export class BoardPanel {
 		});
 		panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'activity-icon.svg');
 
-    BoardPanel.current = new BoardPanel(panel, host, extensionUri);
+    BoardPanel.current = new BoardPanel(new WebviewPanelSurface(panel), host, extensionUri);
 		return BoardPanel.current;
 	}
+
+  /** Attaches the shared board document to a non-editor presentation surface. */
+  static attach(surface: BoardSurface, host: BoardTaskSetHost, extensionUri: vscode.Uri): BoardPanel {
+    return new BoardPanel(surface, host, extensionUri);
+  }
 
 	private async onMessage(message: InMessage): Promise<void> {
     if (!message || typeof message !== 'object') {
@@ -986,7 +1001,7 @@ export class BoardPanel {
         this.webviewReady = true;
         if (this.pendingNewTaskOpen) {
           this.pendingNewTaskOpen = false;
-          await this.panel.webview.postMessage({ type: 'newTask/open' });
+          await this.surface.postMessage({ type: 'newTask/open' });
         }
 				return;
 
@@ -1053,7 +1068,7 @@ export class BoardPanel {
       }
 
 			case 'task/open':
-				if (message.taskId) {
+        if (message.taskId && this.surface.hostEditor) {
 					await vscode.window.showTextDocument(this.store.fileFor(message.taskId), {
 						viewColumn: vscode.ViewColumn.Beside,
 						preview: true,
@@ -1076,7 +1091,7 @@ export class BoardPanel {
         await this.pushAll();
         const column = snapshot.columns.find((candidate) => candidate.id === message.column);
         const index = column?.tasks.findIndex((task) => task.id === message.taskId) ?? -1;
-        await this.panel.webview.postMessage({
+        await this.surface.postMessage({
           type: 'task/reorderResult',
           taskId: message.taskId,
           result: outcome.kind,
@@ -1089,7 +1104,7 @@ export class BoardPanel {
 			case 'task/select':
 				this.selectedTaskId = message.taskId;
 				await this.pushDetail();
-				if (message.taskId) {
+        if (message.taskId && this.surface.hostEditor) {
 					// §6.10: off by default — selecting a card only opens the detail
 					// pane. Docking the chat is an explicit act (the pane's "Open
 					// Chat" button, or a stage run's own open+inject), not a side
@@ -1099,7 +1114,7 @@ export class BoardPanel {
 				return;
 
       case 'task/openChat':
-				if (message.taskId) {
+        if (message.taskId && this.surface.hostEditor) {
           void this.runManager.dockTaskChat(message.taskId, { onSelect: false, explicit: true });
 				}
 				return;
@@ -1124,7 +1139,7 @@ export class BoardPanel {
           // The watcher fires from this same write, but selection changed
           // independently of disk state, so push explicitly rather than wait.
           await this.pushAll();
-          await this.panel.webview.postMessage({ type: 'task/createSuccess', taskId: task.id });
+          await this.surface.postMessage({ type: 'task/createSuccess', taskId: task.id });
         } catch (error) {
           await this.reportCreateError(error instanceof Error ? error.message : String(error));
         }
@@ -1374,7 +1389,7 @@ export class BoardPanel {
 		const snapshot = await this.store.snapshot();
     const taskSets = await this.host.listTaskSets();
     const agentNames = this.configuredAgentNames();
-		await this.panel.webview.postMessage({
+    await this.surface.postMessage({
 			type: 'board/state',
       snapshot: this.toView(snapshot, agentNames, taskSets),
 			selectedTaskId: this.selectedTaskId,
@@ -1383,7 +1398,7 @@ export class BoardPanel {
 
 	private async pushDetail(): Promise<void> {
 		if (!this.selectedTaskId) {
-			await this.panel.webview.postMessage({ type: 'task/detail', task: null });
+      await this.surface.postMessage({ type: 'task/detail', task: null });
 			return;
 		}
 
@@ -1391,7 +1406,7 @@ export class BoardPanel {
 		const task = tasks.find((t) => t.id === this.selectedTaskId);
 		if (!task) {
 			this.selectedTaskId = undefined;
-			await this.panel.webview.postMessage({ type: 'task/detail', task: null });
+      await this.surface.postMessage({ type: 'task/detail', task: null });
 			return;
 		}
 
@@ -1407,11 +1422,11 @@ export class BoardPanel {
       relativePath: attachment.relativePath,
       mimeType: attachment.mimeType,
       size: attachment.size,
-      src: this.panel.webview.asWebviewUri(attachment.uri).toString(),
+      src: this.surface.resourceUri(attachment.uri),
     }));
     const staleCompletions: StaleCompletionCandidate[] = await this.runManager.listStaleCompletionCandidates(task.id);
 
-		await this.panel.webview.postMessage({
+    await this.surface.postMessage({
 			type: 'task/detail',
 			task: {
 				id: task.id,
@@ -1443,15 +1458,15 @@ export class BoardPanel {
 
   private async reportEditError(taskId: string | undefined, error: string): Promise<void> {
     void vscode.window.showErrorMessage(error);
-    await this.panel.webview.postMessage({ type: 'task/editError', taskId, error });
+    await this.surface.postMessage({ type: 'task/editError', taskId, error });
   }
 
   private async reportCreateError(error: string): Promise<void> {
-    await this.panel.webview.postMessage({ type: 'task/createError', error });
+    await this.surface.postMessage({ type: 'task/createError', error });
   }
 
   private async reportSettingsError(key: string | undefined, error: string): Promise<void> {
-    await this.panel.webview.postMessage({ type: 'settings/error', key, error });
+    await this.surface.postMessage({ type: 'settings/error', key, error });
   }
 
   private async pushSettings(): Promise<void> {
@@ -1463,7 +1478,7 @@ export class BoardPanel {
       workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => folder.uri),
       additionalLocations: vscode.workspace.getConfiguration('chat').get<unknown>('agentFilesLocations', {}),
     });
-    await this.panel.webview.postMessage({
+    await this.surface.postMessage({
       type: 'settings/state',
       ...settingsStateFor(gates, agentNames, availableAgents, values),
     });
@@ -1497,12 +1512,18 @@ export class BoardPanel {
 	}
 
 	dispose(): void {
-		BoardPanel.current = undefined;
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    if (BoardPanel.current === this) {
+      BoardPanel.current = undefined;
+    }
     this.webviewReady = false;
     this.pendingNewTaskOpen = false;
     this.taskWatcher?.dispose();
     this.taskWatcher = undefined;
-		this.panel.dispose();
+    this.surface.dispose();
 		for (const d of this.disposables) {
 			d.dispose();
 		}
@@ -1515,18 +1536,14 @@ export class BoardPanel {
 			),
 		).join('');
 
-    const mermaidRuntimeUri = this.panel.webview.asWebviewUri(
+    const mermaidRuntimeUri = this.surface.resourceUri(
       vscode.Uri.joinPath(this.extensionUri, 'dist', 'mermaid-runtime.js'),
-    ).toString();
-    const mermaidBridgeUri = this.panel.webview.asWebviewUri(
+    );
+    const mermaidBridgeUri = this.surface.resourceUri(
       vscode.Uri.joinPath(this.extensionUri, 'dist', 'mermaid-webview.js'),
-    ).toString();
-    const csp = [
-			"default-src 'none'",
-			`style-src 'nonce-${nonce}'`,
-      `script-src 'nonce-${nonce}' ${this.panel.webview.cspSource}`,
-      `img-src ${this.panel.webview.cspSource} data:`,
-		].join('; ');
+    );
+    const csp = this.surface.contentSecurityPolicy(nonce);
+    const bootstrapMarkup = this.surface.bootstrapMarkup?.(nonce) ?? '';
 
     const actionLabelsJson = JSON.stringify(ACTION_LABELS);
 		const gatesJson = JSON.stringify(GATES);
@@ -1543,6 +1560,7 @@ export class BoardPanel {
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <title>Kanban Pilot</title>
+${bootstrapMarkup}
 <style nonce="${nonce}">
   /*
    * Tokens below carry the prototype's shape language (radius, shadow depth,
@@ -2644,6 +2662,9 @@ export class BoardPanel {
   let draggedTaskColumn = null;
   let pendingFocusTaskId = null;
   let selectedSettingsCategory = DEFAULT_SETTINGS_CATEGORY;
+  let boardRenderGeneration = 0;
+  let renderedBoardTaskSetId = null;
+  const columnScrollTops = new Map();
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -2850,7 +2871,16 @@ export class BoardPanel {
     columnNode.classList.add('drag-over');
   }
 
+  function restoreColumnScroll(cards, columnId, persist = false) {
+    const requested = columnScrollTops.get(columnId) || 0;
+    const maxScrollTop = Math.max(0, cards.scrollHeight - cards.clientHeight);
+    const restored = Math.min(Math.max(0, requested), maxScrollTop);
+    cards.scrollTop = restored;
+    if (persist) { columnScrollTops.set(columnId, restored); }
+  }
+
   function renderBoard(snapshot, selectedId) {
+    const generation = ++boardRenderGeneration;
     const warn = document.getElementById('warn');
     warn.textContent = '';
     if (snapshot.malformed.length) {
@@ -2858,10 +2888,24 @@ export class BoardPanel {
     }
 
     const board = document.getElementById('board');
+    const taskSetId = typeof snapshot.activeTaskSetId === 'string' ? snapshot.activeTaskSetId : '';
+    if (renderedBoardTaskSetId === taskSetId) {
+      for (const existingColumn of board.querySelectorAll('.column[data-column-id]')) {
+        const existingCards = existingColumn.querySelector('.cards');
+        if (existingCards) {
+          columnScrollTops.set(existingColumn.dataset.columnId, existingCards.scrollTop);
+        }
+      }
+    } else {
+      columnScrollTops.clear();
+    }
+    renderedBoardTaskSetId = taskSetId;
     board.textContent = '';
+    const renderedColumns = [];
 
     for (const column of snapshot.columns) {
       const node = el('div', 'column');
+      node.dataset.columnId = column.id;
       // Everything colored inside the column — rail, tint, dot, count chip,
       // cards, action buttons — derives from this one call.
       applyAccent(node, column.id);
@@ -2918,6 +2962,9 @@ export class BoardPanel {
       node.appendChild(head);
 
       const cards = el('div', 'cards');
+      cards.addEventListener('scroll', () => {
+        columnScrollTops.set(column.id, cards.scrollTop);
+      }, { passive: true });
       const addDropSlot = (beforeTaskId, label, empty = false) => {
         const slot = el('div', 'drop-slot' + (empty ? ' empty-slot' : ''));
         slot.setAttribute('role', 'separator');
@@ -2949,7 +2996,17 @@ export class BoardPanel {
       }
       node.appendChild(cards);
       board.appendChild(node);
+      renderedColumns.push({ id: column.id, cards });
+      restoreColumnScroll(cards, column.id);
     }
+    requestAnimationFrame(() => {
+      if (generation !== boardRenderGeneration) { return; }
+      for (const rendered of renderedColumns) {
+        if (rendered.cards.isConnected !== false) {
+          restoreColumnScroll(rendered.cards, rendered.id, true);
+        }
+      }
+    });
     focusPendingCard();
   }
 

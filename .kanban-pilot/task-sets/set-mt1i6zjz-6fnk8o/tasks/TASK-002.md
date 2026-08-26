@@ -2,11 +2,11 @@
 id: TASK-002
 title: Update README.md and CHANGELOG.md for 0.3.3
 type: feature
-state: validation
+state: done
 status: idle
-position: 0
+position: 2
 created: 2026-08-20T13:08:46Z
-updated: 2026-08-24T00:22:44Z
+updated: 2026-08-24T23:54:30Z
 chat: 349e7a6b-31ee-452d-b843-f0d5365c7c77
 copilot_session_id: 349e7a6b-31ee-452d-b843-f0d5365c7c77
 scope_hash: 255294c
@@ -92,3 +92,4 @@ current implementation, and should not claim unrelated unreleased changes.
 - audit:status-change at:2026-08-23T23:58:46Z task:TASK-002 from:running to:idle action:receipt run:r3p3uqt outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-23T23:58:46Z task:TASK-002 stage:develop action:receipt run:r3p3uqt outcome:ok note:"2026-08-23T23:53:04Z — updated README and CHANGELOG with 0.3.3 Task Details Markdown and Mermaid release documentation"
 - audit:state-change at:2026-08-24T00:22:44Z task:TASK-002 from:in-progress to:validation action:apply-pending run:r3p3uqt outcome:ok note:"State changed from in-progress to validation via apply-pending."
+- audit:state-change at:2026-08-24T23:54:30Z task:TASK-002 from:validation to:done action:move note:"State changed from validation to done via move."
