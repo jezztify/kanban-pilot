@@ -287,8 +287,8 @@
         },
         "kanbanPilot.chat.outboundPreamble": {
           "type": "string",
-          "default": "",
-          "description": "Optional text prepended to every outbound turn Kanban Pilot injects (TASK-006 row-1 seam). Blank by default; set a value to enable safe, coarse progress narration for the browser activity feed. Applies only to the extension's own self-initiated turns, never to what you type into Copilot Chat."
+          "default": "Treat the prompt's \"Optional progress updates\" section as required. Append a concise progress line after each meaningful phase of work, including investigation, editing, testing, and waiting for user action. Never include source, secrets, tokens, or absolute file paths.",
+          "description": "Text prepended to every outbound turn Kanban Pilot injects (TASK-006 row-1 seam). Set an empty value to disable safe, coarse progress narration for the browser activity feed. Applies only to the extension's own self-initiated turns, never to what you type into Copilot Chat."
         },
         "kanbanPilot.chat.observeOutbound": {
           "type": "boolean",
