@@ -7,7 +7,6 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
 	createTaskFromCommandInput,
-	DEFAULT_OUTBOUND_PREAMBLE,
 	WorkspaceTaskSetChange,
 	WorkspaceTaskSetContext,
 } from '../extension';

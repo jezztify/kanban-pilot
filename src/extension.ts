@@ -14,7 +14,7 @@ import { showEndpointSharePanel } from './http/endpointSharePanel';
  * Observe/adjust the executor's own outbound turn — row 1 of the hijack spike
  * (docs/copilot-chat-hijack-spike.md, TASK-006). Both hooks read configuration
  * live so a settings change takes effect on the next run without reloading.
- * Progress narration is on by default; observation remains off by default.
+ * Progress narration is opt-in; observation remains off by default.
  */
 export const DEFAULT_OUTBOUND_PREAMBLE =
 	'Treat the prompt\'s "Optional progress updates" section as required. Append a concise progress line after each meaningful phase of work, including investigation, editing, testing, and waiting for user action. Never include source, secrets, tokens, or absolute file paths.';
