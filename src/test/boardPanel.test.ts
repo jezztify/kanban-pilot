@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as vm from 'vm';
 import * as vscode from 'vscode';
 import { JSDOM } from 'jsdom';
+import { BrowserBoardSurface } from '../http/browserBoardSurface';
 
 import {
 	ALL_KANBAN_SETTING_KEYS,
@@ -629,8 +630,13 @@ suite('BoardPanel Settings', () => {
 		);
 		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
 		const board = new constructor(panel, host, extensionUriForTests);
+		const browserSurface = new BrowserBoardSurface('board-panel-test');
+		const browserBoard = BoardPanel.attach(browserSurface, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		try {
+			assert.match(browserSurface.html, /data-kanban-pilot-board/);
+			assert.match(browserSurface.html, /data-kanban-pilot-bridge/);
+			assert.match(browserSurface.html, /connect-src 'self'/);
 			const headerMarkup = /<header>([\s\S]*?)<\/header>/.exec(panel.webview.html)?.[0];
 			assert.ok(headerMarkup, 'header markup is present');
 			let previousControlOffset = -1;
@@ -745,6 +751,8 @@ suite('BoardPanel Settings', () => {
 				[second.id, first.id],
 			);
 		} finally {
+			browserBoard.dispose();
+			assert.strictEqual(browserSurface.connected, false);
 			board.dispose();
 			try {
 				await vscode.workspace.fs.delete(directory, { recursive: true });
@@ -1089,42 +1097,43 @@ suite('BoardPanel Settings', () => {
 		const edited = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id);
 		assert.ok(edited);
 		dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor(edited) });
+		const renderedBoardSnapshot = {
+			malformed: [],
+			taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+			activeTaskSetId: activeSet.id,
+			activeTaskSetName: activeSet.name,
+			columns: [{
+				id: 'backlog',
+				label: 'Backlog',
+				agent: 'None',
+				stage: null,
+				count: 2,
+				cards: [
+					{
+						id: edited.id,
+						title: edited.title,
+						type: edited.type,
+						typeLabel: 'Feature',
+						status: edited.status,
+						primary: 'accept',
+						canSplit: true,
+					},
+					{
+						id: 'TASK-999',
+						title: 'Bug card',
+						type: 'bug',
+						typeLabel: 'Bug',
+						status: 'idle',
+						primary: 'accept',
+						canSplit: true,
+					},
+				],
+			}],
+		};
 		dispatchWebviewMessage(dom, {
 			type: 'board/state',
 			selectedTaskId: edited.id,
-			snapshot: {
-				malformed: [],
-				taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
-				activeTaskSetId: activeSet.id,
-				activeTaskSetName: activeSet.name,
-				columns: [{
-					id: 'backlog',
-					label: 'Backlog',
-					agent: 'None',
-					stage: null,
-					count: 2,
-					cards: [
-						{
-							id: edited.id,
-							title: edited.title,
-							type: edited.type,
-							typeLabel: 'Feature',
-							status: edited.status,
-							primary: 'accept',
-							canSplit: true,
-						},
-						{
-							id: 'TASK-999',
-							title: 'Bug card',
-							type: 'bug',
-							typeLabel: 'Bug',
-							status: 'idle',
-							primary: 'accept',
-							canSplit: true,
-						},
-					],
-				}],
-			},
+			snapshot: renderedBoardSnapshot,
 		});
 		assert.strictEqual(document.querySelector('.card-title')?.textContent, 'Saved title #123');
 		const typeBadges = Array.from(document.querySelectorAll('.card .badge-task-type'));
@@ -1141,6 +1150,45 @@ suite('BoardPanel Settings', () => {
 		assert.match(panel.webview.html, /\.badge-task-type\.bug \{ border-style: dashed; \}/);
 		assert.strictEqual(document.querySelector('#detail .modal-title')?.textContent, 'Saved title #123');
 		assert.strictEqual(document.querySelector('#detail .modal-section-body')?.textContent?.trim(), 'Saved request\nwith Markdown');
+
+		Object.defineProperty(dom.window.HTMLElement.prototype, 'scrollHeight', {
+			configurable: true,
+			get() { return this.textContent?.includes('Short column') ? 240 : 1000; },
+		});
+		Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', {
+			configurable: true,
+			get() { return 200; },
+		});
+		const initialCards = document.querySelector('.column .cards') as HTMLElement;
+		initialCards.scrollTop = 150;
+		dispatchWebviewMessage(dom, {
+			type: 'board/state',
+			selectedTaskId: edited.id,
+			snapshot: renderedBoardSnapshot,
+		});
+		const refreshedCards = document.querySelector('.column .cards') as HTMLElement;
+		assert.notStrictEqual(refreshedCards, initialCards, 'board refresh must still replace stale column content');
+		assert.strictEqual(refreshedCards.scrollTop, 150, 'board refresh must preserve the column scroll position');
+
+		refreshedCards.scrollTop = 150;
+		dispatchWebviewMessage(dom, {
+			type: 'board/state',
+			selectedTaskId: edited.id,
+			snapshot: {
+				...renderedBoardSnapshot,
+				columns: [{
+					...renderedBoardSnapshot.columns[0],
+					cards: renderedBoardSnapshot.columns[0].cards.map((card, index) => (
+						index === 0 ? { ...card, title: 'Short column' } : card
+					)),
+				}],
+			},
+		});
+		assert.strictEqual(
+			(document.querySelector('.column .cards') as HTMLElement).scrollTop,
+			40,
+			'board refresh must clamp the column scroll position when content shrinks',
+		);
 
 		dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor(edited, false) });
 		const unavailable = Array.from(document.querySelectorAll('button'))

@@ -8,6 +8,39 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.4.0] - 2026-08-26
+
+### Added
+
+- An optional token-authenticated real-time HTTP endpoint that serves the canonical Kanban Pilot
+	board in a browser, exposes authoritative board snapshots and validated task actions, and sends
+	live updates over server-sent events without creating a second task store or run manager.
+- Independent browser-board sessions with the editor board's task details, editing, attachments,
+	Mermaid rendering, Settings, gates, agent assignments, task sets, dialogs, and safe resource
+	delivery while keeping selection and other client-local state isolated per browser.
+- Coarse agent progress summaries in Task Details as a bounded, read-only activity feed that
+	updates connected browser boards without mirroring the private Copilot Chat transcript.
+- Status-bar sharing with a scannable QR code and copyable token-bearing URL. Wildcard
+	`0.0.0.0`/`::` binds select a reachable LAN IPv4 when available, retain a localhost fallback,
+	and allow an explicit `http.publicUrl` for reverse-proxy deployments.
+
+### Changed
+
+- Card-level **Stop** now requests cancellation of the matching task-bound Copilot Chat turn
+	before applying the existing stopped transition, with task/run isolation, stale-result guards,
+	and explicit failure reporting when cancellation is unavailable.
+- Non-loopback endpoint binds now display a security warning that the access token travels in the
+	URL over HTTP without TLS; direct exposure is intended only for trusted networks or behind a TLS
+	reverse proxy.
+
+### Fixed
+
+- Completed the shared board-surface and typed host-change contracts so the browser root serves
+	the same board document as the editor instead of failing compilation or returning a missing
+	`BoardPanel.attach` runtime error.
+- Task Details now preserves and clamps its scroll position during repeated updates for the same
+	task, while new tasks and reopened details still start at the top.
+
 ## [0.3.3] - 2026-08-24
 
 ### Added

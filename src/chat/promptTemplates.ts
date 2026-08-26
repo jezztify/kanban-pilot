@@ -110,6 +110,7 @@ anything. Then:
 	sufficient. This recommendation is advisory only: do not create child task
 	files, add \`propose-task\` lines, invoke the separate \`split\` action, or do
 	implementation work.
+4. Under \`## Refined\`, ensure sure to add \`mermaid diagrams\` to make the task more visual on its intended implementation.
 
 Do not write or edit any code. This stage is scoping only.
 
@@ -173,6 +174,17 @@ otherwise untyped child.
 Only do this for concrete, actionable follow-ups you actually noticed while
 working, not speculative ideas or things already covered by Scope.
 
+### Optional progress updates
+While you work, you may append coarse one-line progress updates to the same
+\`## Log\` section so a remote viewer of the board can follow along before the
+receipt lands:
+- progress run:{{runId}} task:{{id}} at:<UTC timestamp> note:"<one-line summary>"
+These are optional and never replace the completion receipt below. Write short
+summaries only (e.g. "editing the parser", "running tests", "waiting for
+approval in VS Code") — never source, secrets, file paths, or tokens, since the
+feed can be shared over a token-gated HTTP surface. Use the same UTC
+second-precision timestamp format as the receipt.
+
 ### Completion
 After completing the implementation work, append this line to the \`## Log\`
 section of the attached active task file at {{taskFilePath}}:
@@ -224,6 +236,16 @@ parent task's type. Use only feature or bug; do not file an invalid or
 otherwise untyped child.
 Only do this for concrete, actionable follow-ups you actually noticed while
 checking, not speculative ideas.
+
+### Optional progress updates
+While you work, you may append coarse one-line progress updates to the same
+\`## Log\` section so a remote viewer of the board can follow along before the
+receipt lands:
+- progress run:{{runId}} task:{{id}} at:<UTC timestamp> note:"<one-line summary>"
+These are optional and never replace the completion receipt below. Write short
+summaries only (e.g. "reviewing the parser", "running tests") — never source,
+secrets, file paths, or tokens, since the feed can be shared over a token-gated
+HTTP surface. Use the same UTC second-precision timestamp format as the receipt.
 
 ### Completion
 When validation reaches a pass/fail verdict, append exactly one of these

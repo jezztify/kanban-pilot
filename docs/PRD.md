@@ -1,7 +1,7 @@
 # Kanban Pilot — Product Requirements Document
 
-**Status:** Draft v1.34 — the board now fits the panel viewport exactly, no page-level scroll (§6.11)
-**Last updated:** 2026-08-14
+**Status:** Draft v2.0 — authenticated real-time extension-host endpoint is documented (§6.19)
+**Last updated:** 2026-08-25
 **Design reference:** https://flourished-costs-247065.framer.app/
 **API findings verified against:** `microsoft/vscode@main` — `chat/browser/actions/chatActions.ts`,
 `chat/common/model/chatUri.ts`, `chat/common/chatSessionsService.ts`, `base/common/network.ts`
@@ -13,7 +13,8 @@
 
 Coding agents today are driven from a chat prompt: a linear, ephemeral, single-threaded
 surface with no memory of what you asked it to do yesterday and no notion of "not yet."
-Everything is either happening right now or forgotten.
+Everything is either happening right now or forgotten. Kanban Pilot supports a VS Code extension
+runtime with an optional real-time HTTP transport for its existing board state and actions.
 
 Kanban Pilot inverts the relationship. **The board is the control plane; the chat is the
 execution surface.** Work is durable, reviewable, and parked between stages. You interact
@@ -55,6 +56,8 @@ advances tasks by editing those files, which is also exactly how a human advance
   the card; moving the card rewrites the file.
 - **G6** — **Every task owns a private chat session. No two tasks ever share one.** Context
   never bleeds between tasks, and resuming a paused task re-enters its own conversation.
+- **G7** — An authenticated, real-time HTTP endpoint exposes the extension host's existing
+  board snapshots and validated task actions without creating a second state store or interface.
 
 ### Non-Goals (explicitly out of scope for v1)
 
@@ -62,7 +65,9 @@ advances tasks by editing those files, which is also exactly how a human advance
 - Parallel agent execution via git worktrees *(deferred — see §8.4)*.
 - GitHub Issues / Jira / Linear sync.
 - Non-Copilot model backends *(the executor is abstracted for this, but only one is shipped)*.
-- Remote or headless execution.
+- Multi-user collaboration, shared editing conflict resolution, and tenant isolation.
+- Mirroring or scraping the private VS Code Copilot transcript.
+- Treating an LLM response as proof that repository code changed.
 - Time tracking, estimation, burndown, or any reporting surface.
 - **Re-rendering the chat transcript inside the board webview.** The real chat is docked beside
   it instead — see §6.10 for why a mirror is both unbuildable and undesirable.
@@ -219,74 +224,60 @@ This table reproduces the design exactly and is the authoritative spec for card 
 > whenever the column/status combination makes splitting legal (Backlog/idle, Refine/idle,
 > blocked,failed, Scoped/idle).
 
-### 5.3 Column header
+        C2["vscode-chat-session://local/…TASK-151"]
+ * Wait to resolve the command until the chat response reaches a terminal state
+### 6.19 Authenticated real-time extension-host endpoint
 
-Each column header shows its title, a live count of contained cards, and a per-column **Agent**
-badge — `Backlog 6 / Agent None`, `Refine 2 / Agent Bro Refiner`, `Scoped 3 / Agent None`,
-`Approved 2 / Agent None`, `In Progress 2 / Agent Bro Coder`, `Validation 2 / Agent Bro QA`,
-`Done 5 / Agent None`. The badge is the effective value from the shared column-assignment
-resolver (`chat/agentNames.ts`), so the three runnable columns tell you exactly which persona
-the next Refine, Develop, or Validate prompt will address. Every column has an active pencil;
-clicking it opens the combined Settings surface (§6.17) with that column's assignment focused.
-Assignments on resting columns are display labels only and do not create or dispatch runs.
-
----
-
-## 6. Architecture
-
-### 6.1 Component overview
+The optional HTTP endpoint is a transport over the existing VS Code extension host. It does not
+create a browser product, task store, run manager, LLM provider, worker, or chat transcript.
+`TaskStore`, task Markdown, `RunManager`, Copilot session bindings, receipts, gates, and the
+existing `BoardPanel` remain authoritative.
 
 ```mermaid
-flowchart TB
-    subgraph W["Webview — Board UI"]
-        UI["Columns · Cards · New Task"]
-    end
-    subgraph E["Extension Host"]
-        BC["BoardController<br/><i>action → transition</i>"]
-        SM["StateMachine<br/><i>legal moves + gates</i>"]
-        TS["TaskStore<br/><i>read/write markdown</i>"]
-        RUN["RunManager<br/><i>launch · watch · timeout</i>"]
-        EX["ChatSessionExecutor<br/><i>bind session · inject · await</i>"]
-        FW["FileWatcher"]
-    end
-    subgraph D["Disk — source of truth"]
-        MD[".kanban-pilot/tasks/*.md"]
-    end
-    subgraph C["Copilot Chat — one session per task"]
-        C1["vscode-chat-session://local/…TASK-142"]
-        C2["vscode-chat-session://local/…TASK-151"]
-    end
-
-    UI -- "action/invoke" --> BC
-    BC -- "board/state" --> UI
-    BC --> SM
-    SM --> TS
-    BC --> RUN
-    RUN --> EX
-    EX -- "vscode.open + chat.openAgent" --> C1
-    EX -- "" --> C2
-    C1 -- "edits task file + repo" --> MD
-    C1 -. "blockOnResponse resolves" .-> EX
-    TS <--> MD
-    MD --> FW
-    FW -- "receipt detected" --> RUN
-    RUN -- "run complete" --> BC
+flowchart LR
+  C["Authenticated HTTP client"] <--> E["Extension-host HTTP + SSE endpoint"]
+  E <--> R["Existing TaskStore + RunManager"]
+  R <--> F["Task Markdown and attachments"]
+  R <--> P["Existing Copilot Chat sessions"]
+  V["Existing VS Code BoardPanel"] <--> R
 ```
 
-### 6.2 Closing the loop: two independent completion signals
+**One board, two surfaces.** A browser on the endpoint is served the extension's own board
+webview, not a second board. `BoardPanel` renders through a `BoardSurface`, which is the only
+seam that differs between clients: how a bundled file becomes a loadable URL, what the
+Content-Security-Policy must allow, and how messages cross the boundary. `WebviewPanelSurface`
+backs the editor panel; `BrowserBoardSurface` backs a browser, substituting a bridge for
+`acquireVsCodeApi` and endpoint-served paths for `asWebviewUri`. The board's markup, styling,
+state machine, and message protocol have exactly one implementation, so the two surfaces cannot
+drift apart. Each browser tab is its own `BoardPanel` bound to its own surface, keeping
+per-client state such as card selection per-client while the workspace stays shared.
 
-Injection is **not** fire-and-forget. `IChatViewOpenOptions` exposes:
+**Dialogs and editor-bound actions.** Board dialogs are rendered by the board rather than by
+`vscode.window`, so a prompt appears to whoever raised it instead of on the host's screen.
+Actions that operate on the editor rather than the board — opening a task file, docking a task's
+chat — are declared by the surface (`hostEditor`) and hidden on clients that do not share the
+host's editor.
 
-```ts
-/**
- * Wait to resolve the command until the chat response reaches a terminal state
+**Authentication and deployment.** The endpoint starts only when it is enabled and an access
+token is configured in the board's **HTTP endpoint** Settings category. Its host, port, token,
+and optional public URL are workspace settings and changes take effect immediately. It binds to loopback by
  * (complete, error, or pending user confirmation, etc.).
  */
 blockOnResponse?: boolean;
+
+**API and synchronization.** `GET /` serves the board webview and starts a board session, which
+then speaks the board's own message protocol over `GET /session/events` and
+`POST /session/messages`; `GET /resource/:root/*` serves bundled assets and task attachments,
+constrained to the same roots the editor webview is granted. Sessions are reclaimed once their
+event stream has been gone past a grace period, so a reconnecting browser keeps its board.
+`GET /api/board` returns the current active task-set snapshot.
+`GET /api/events` is an SSE stream that sends an immediate full snapshot, then a full snapshot on
 ```
 
 and the action resolves with `IChatAgentResult & { type?: 'confirmation' }`. So the primary
 completion signal is simply **awaiting the command**.
+
+**Chat boundary.** HTTP task actions can invoke Refine, Split, Develop, Continue, or Validate
 
 **M0 confirmed this**: the same prompt took **2754 ms** with the flag and **19 ms** without. The
 resolved value is richer than assumed — `timings`, `metadata.promptTokens` / `outputTokens`,
@@ -494,6 +485,27 @@ watcher can observe the new value but cannot reliably infer the old value or ini
 Those edits remain supported, but only extension-controlled transitions are guaranteed to have
 audit entries.
 
+**Progress grammar (optional activity feed)** — a coarse, agent-emitted companion line the
+agent may append to `## Log` *while a stage runs*, before its terminal receipt, so a remote
+viewer of the browser board (§6.10) can watch the work happen rather than only watch the card's
+column change:
+
+```
+- progress run:<runId> task:<taskId> at:<UTC timestamp> note:"<one-line summary>"
+```
+
+A progress line is deliberately **not** a receipt: it carries no `stage`/`result`, so it never
+completes or moves a task, and the receipt and `audit:` parsers ignore it (distinct `progress`
+prefix). Like a receipt, a line whose `task:` disagrees with the file it appears in is ignored
+(§6.9); `at:` follows the same UTC ISO 8601 second-precision rule as audit timestamps. The board
+projects the most recent `K = 20` progress lines of the selected task into the task detail as a
+bounded, read-only activity feed, re-derived from the task file on every projection so a
+reconnecting browser re-syncs for free. This is the source-D slice recommended by the
+browser-chat-proxy spike (`docs/browser-chat-proxy-spike.md`): notes are human/agent-authored
+summaries — never source, secrets, paths, or tokens — because the feed can ride a shared,
+token-gated HTTP surface, and a `blocked` run is surfaced honestly ("action required at the
+host") since a remote viewer cannot act on it.
+
 ### 6.4 Run lifecycle
 
 ```mermaid
@@ -559,11 +571,16 @@ cooperative protocol with a non-deterministic party:
 - **`result:blocked`** → status `blocked`, the note surfaces on the card face. For validate
   specifically, three outcomes exist, not two — see §6.3's grammar note and §5's new
   `Validation → InProgress` edge for what `result:failed` does there.
-- **Stop** → run abandoned. *Correction:* an earlier draft said this leaves status `paused`; it
-  doesn't. Refine and Validation cancel in place (status → `idle`); In Progress bounces all the
-  way back to Approved ("Stop + reset," §5's diagram). Either way `run` is explicitly cleared,
-  not just `status` — otherwise a resolution that arrives after the stop could still overwrite
-  it, since the reconciliation guard below keys off `run`, not `status`.
+- **Stop** → the executor opens the task's deterministic chat-session URI and invokes VS Code's
+  `workbench.action.chat.cancel` command under the same process-wide focus mutex used for prompt
+  injection. This targets only the clicked task's active Copilot turn; another card's concurrent
+  turn is not cancelled. A turn that already finished is an idempotent no-op. If the cancellation
+  capability is unavailable or the command fails, the error is surfaced and the card remains
+  `running` rather than falsely claiming the Copilot work stopped. After successful cancellation,
+  Refine and Validation cancel in place (status → `idle`); In Progress bounces all the way back
+  to Approved ("Stop + reset," §5's diagram). Either way `run` is explicitly cleared, not just
+  `status` — otherwise a resolution that arrives after the stop could still overwrite it, since
+  the reconciliation guard below keys off `run`, not `status`.
 - **Window reload mid-run** → the await is lost. On activation, `RunManager` reconciles every
   `running` task against its receipt on disk. This is why both signals are kept.
 - **A run resolves after it's been superseded** (by Stop, by `markRunComplete`, or by a newer
@@ -774,7 +791,7 @@ exists specifically to name it:
 | `develop` | Launches `develop` | One click both moves Approved → In Progress and starts the run |
 | `continue` | Launches `develop` | In Progress's retry action after `blocked`/`failed` |
 | `validate` | Launches `validate` | One click, in place — Validation never has an idle-and-waiting sibling action |
-| `stop` | Pure gate | Also clears `run` on the task file — closes a real gap: without it, a run that resolves *after* Stop could still overwrite the stop, since §6.9's staleness guard keys off `run`, not `status` |
+| `stop` | Cancels, then gates | Cancels the clicked task's active Copilot turn before applying the existing state transition and clearing `run`; cancellation failure leaves the run active and visible rather than recording a false stop |
 | `reopen` | Pure gate | Done → Approved |
 
 Every "launches a run" row follows the same two-phase shape (§6.4): `invokeTaskAction` applies
@@ -869,7 +886,7 @@ the gate.
 | **First run** (Accept) | `vscode.open` mints the session; tab titled after the task |
 | **Later runs** (Refine, Continue) | Same URI → same conversation, full history intact |
 | **Approve** | Conversation cleared, URI unchanged — the implementation phase starts clean (§6.8) |
-| **Stop** | Session left untouched; `Continue` resumes it in place |
+| **Stop** | Active response/tool execution is cancelled in this task's focused session; conversation history remains and `Continue` resumes in place |
 | **Done** | Tab closed via `window.tabGroups.close`; session persists in VS Code's session list |
 | **Reopen** | Same derived URI — the original conversation comes back |
 
@@ -1688,8 +1705,6 @@ and those images afterward. Prompt defaults and custom-template fallback guidanc
 as read-only task context unless Scope explicitly permits modification. Text-only runs and the
 clipboard fallback remain unchanged.
 
----
-
 ## 7. Configuration
 
 Defaults are chosen to reproduce the design's behaviour exactly: all human gates manual.
@@ -1858,10 +1873,11 @@ parameter so that can remain additive.
 | **M4** | Develop safety net | ⬜ **Not started — skipped ahead of M5 at the user's request** | Checkpointing; `revertToCheckpoint`; single-slot *enforcement* (currently only a UI expectation — §8.4). `gates.approvedToInProgress`'s `auto` mode (M5) now depends on this gap more than a purely manual workflow ever did — see §6.15 |
 | **M5** | Gates and Settings | ✅ **Done** | Nine independent `manual \| auto` settings cover stage starts and receipt completions (§6.15); `RunManager.applyGatePolicies()` uses the shared stage and promotion paths, swept on activation and on every store change; retries, Stop, Reopen, and arbitrary moves never auto-fire; a hand-rolled single-slot check stands in for M4's real enforcement under `approvedToInProgress` specifically. Board-side Settings UI (§6.17) combines the gate switches with seven column assignments, legacy-compatible prompt resolution, workspace persistence, direct configuration refresh, durable manual pending completions, and resting-column display labels |
 | **M6** | Polish | ⬜ Not started | Panel serialization, theming, keyboard nav, a11y pass, empty states, README/demo |
+| **M7** | Real-time extension-host endpoint | 🟡 **In progress** | Authenticated endpoint startup, authoritative board snapshots, monotonic SSE refreshes, validated existing task actions, reconnect behavior, and endpoint smoke validation without a second board or task store |
 
 **Status legend:** ⬜ Not started · 🟡 In progress · ✅ Done · ⛔ Blocked (see Risks)
 
-**M0 detail** — headless half complete ([findings](m0-findings.md)); the half needing a
+**M0 detail** — command/API probe half complete ([findings](m0-findings.md)); the half needing a
 signed-in Copilot host is outstanding:
 
 | Probe | Status | Result |
@@ -1993,6 +2009,11 @@ session?), which decides §6.8 layer 1 rather than the executor choice.
 | **R5** | Board and disk drift under rapid edits | **Medium** | Disk is authoritative; watcher-driven re-read; webview never holds state; writes are atomic (temp + rename) |
 | **R6** | Chat panel is busy with an unrelated conversation | **Low** | Injection is user-initiated; warn if a run is already in flight |
 | **R7** | Multi-root workspaces | **Low** | v1 binds the board to the first workspace folder; document the limitation |
+| **R13** | Remote client or VS Code release lacks a private command or deterministic chat-session URI | **Medium** | Probe capabilities at runtime, keep the Executor seam, report the exact missing capability, support clipboard fallback where the session can open, and re-check the declared client matrix per release |
+| **R14** | Tunnel or webview disconnect leaves the operator looking at stale board state | **Medium** | Host files remain authoritative; publish syncing/stale/disconnected status, reject old revisions, serialize refreshes, and perform a full snapshot resync after restoration or reconnect. A disconnect never counts as success |
+| **R15** | Extension-host endpoint is exposed without a durable secret or TLS | **High** | Require explicit token and port configuration, default to loopback, use a high-entropy bearer token, and place any remote exposure behind a TLS reverse proxy |
+| **R16** | Hosted LLM claims or worker reports work without repository evidence | **High** | Keep provider and worker credentials server-side; require the authenticated worker contract, stage-specific result, summary, and durable receipt; unavailable workers resolve to `blocked` |
+| **R17** | Browser disconnects or retries duplicate a stage run | **Medium** | Server-owned monotonic revisions, SSE full-snapshot resync, serialized store transactions, run-capacity checks, and bounded `Idempotency-Key` action deduplication |
 
 ---
 
@@ -2009,6 +2030,7 @@ session?), which decides §6.8 layer 1 rather than the executor choice.
 | Chat panel keystrokes per completed task | ≈ 0 | Direct measure of G1 |
 | Tasks reaching Done without revert | ≥ 80% | Agent output is trustworthy at the develop stage |
 | Time from New Task to Scoped | < 5 min | Refinement has to be cheap or nobody uses it |
+| Authenticated hosted smoke pass | 1 browser/API pass per release, plus a worker-backed implementation pass when configured | Confirms login, board load, server-authoritative updates, reconnect behavior, gated actions, hosted chat/provider errors, and worker-backed run evidence without claiming an unconfigured worker changed code |
 
 ---
 

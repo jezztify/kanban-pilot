@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -140,6 +140,11 @@
       {
         "command": "kanban-pilot.seedSampleTasks",
         "title": "Seed Sample Tasks",
+        "category": "Kanban Pilot"
+      },
+      {
+        "command": "kanban-pilot.showEndpointConnection",
+        "title": "Show HTTP Endpoint Connection",
         "category": "Kanban Pilot"
       }
     ],
@@ -280,6 +285,16 @@
           "default": {},
           "description": "Optional {id, vendor} to pin a model per run."
         },
+        "kanbanPilot.chat.outboundPreamble": {
+          "type": "string",
+          "default": "",
+          "description": "Text prepended to every outbound turn Kanban Pilot injects (TASK-006 row-1 seam). The default requires safe, coarse progress narration for the browser activity feed. Set an empty string to disable it. Applies only to the extension's own self-initiated turns, never to what you type into Copilot Chat."
+        },
+        "kanbanPilot.chat.observeOutbound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log redacted structural metadata (task id, stage, mode, tool ids, attachment count, query length — never the raw prompt or file contents) for each outbound turn to the 'Kanban Pilot' output channel. Off by default."
+        },
         "kanbanPilot.chat.agentNames": {
           "type": "object",
           "default": {},
@@ -315,6 +330,33 @@
           "type": "boolean",
           "default": true,
           "description": "Let develop and validate runs file follow-up work as new backlog tasks (§6.12) via a propose-task log line, capped at 5 per run. Off disables the capability entirely — any propose-task lines an agent writes are simply ignored."
+        },
+        "kanbanPilot.http.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the authenticated real-time HTTP endpoint backed by this extension host."
+        },
+        "kanbanPilot.http.host": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "description": "Bind host for the real-time HTTP endpoint. Keep loopback (127.0.0.1) unless a TLS reverse proxy is configured. Set 0.0.0.0 or :: to bind all interfaces for LAN sharing — the share URL/QR then use the machine's LAN IP, but the access token travels in plain text over HTTP with no TLS, so only do this on trusted networks."
+        },
+        "kanbanPilot.http.port": {
+          "type": "number",
+          "default": 4173,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "TCP port for the real-time HTTP endpoint."
+        },
+        "kanbanPilot.http.token": {
+          "type": "string",
+          "default": "kanban-pilot",
+          "description": "Bearer token required by the real-time HTTP endpoint. Stored in workspace settings; use a high-entropy secret."
+        },
+        "kanbanPilot.http.publicUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute http or https URL shown in the status-bar QR code when a reverse proxy fronts the endpoint."
         }
       }
     }
@@ -339,6 +381,7 @@
     "@types/markdown-it": "^14.2.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
+    "@types/qrcode": "^1.5.6",
     "@types/vscode": "^1.125.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
@@ -358,6 +401,7 @@
   "dependencies": {
     "markdown-it": "^14.3.0",
     "markdown-it-task-lists": "^2.1.1",
-    "mermaid": "^11.17.0"
+    "mermaid": "^11.17.0",
+    "qrcode": "^1.5.4"
   }
 }

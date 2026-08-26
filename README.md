@@ -1,16 +1,16 @@
+![Kanban Pilot](docs/media/kanban-pilot-logo.jpeg)
+
 # Kanban Pilot
 
-**A Kanban board for VS Code that drives GitHub Copilot Chat for you.**
+**A Kanban board for VS Code with an optional real-time HTTP endpoint.**
 
-You work the board — create a card, accept it, refine it, approve it, ship it. At each step
-Kanban Pilot writes the right prompt and hands it to Copilot Chat in that card's own private
-conversation, then records the result back on the card.
+You work the board — create a card, accept it, refine it, approve it, ship it. The VS Code
+extension drives GitHub Copilot Chat in the workspace. Its optional HTTP endpoint exposes that
+same board state and those same validated actions in real time.
 
-Every task is a plain Markdown file in your repo, so your work is readable, reviewable, and
-diffable in git. Edit a file by hand and the card moves. Move the card and the file updates.
-
-> Kanban Pilot doesn't replace Copilot Chat or write the code itself. It decides *what* should
-> happen next; Copilot Chat does the work.
+Every task is a plain Markdown file in your repo. The endpoint reads that existing task store and
+routes mutations through the existing run manager; it does not mirror or scrape a VS Code Copilot
+transcript.
 
 ## Why you might want it
 
@@ -19,13 +19,70 @@ diffable in git. Edit a file by hand and the card moves. Move the card and the f
 - **One conversation per task.** No context bleeding between unrelated pieces of work.
 - **You stay in control.** Every step waits for a click by default. Turn on auto-advance only
   where you want it.
-- **Your tasks are just files.** No database, no cloud, no lock-in — everything lives in
-  `.kanban-pilot/` in your repo.
+- **Your tasks are durable.** Task Markdown remains in `.kanban-pilot/`; the endpoint does not add
+   another state store.
 
-## Requirements
+## VS Code extension
 
 - VS Code 1.125.0 or later
 - GitHub Copilot Chat, installed and signed in
+
+## Real-time HTTP endpoint
+
+Kanban Pilot can expose the **existing extension host** through an authenticated HTTP endpoint.
+It does not create another board, task store, state machine, or run manager: task Markdown and
+the current `TaskStore` remain authoritative, while mutations use the existing `RunManager`.
+
+Opening the endpoint in a browser serves **the extension's own board webview** — the same
+document, markup, styling, and message protocol `BoardPanel` renders in the editor — rather than a
+second, reduced board. A browser client therefore gets drag-and-drop reordering, the task detail
+and edit panes, attachments, Mermaid rendering, Settings, gates, agent assignment, and task sets,
+and any change to the board reaches both clients at once. Each connected browser holds its own
+board session, so one person's card selection does not move anybody else's.
+
+The endpoint is opt-in. Open **Kanban Pilot Settings** from the board, select **HTTP endpoint**,
+and enable it. Settings take effect immediately; no VS Code restart is required.
+
+| Setting | Required | Meaning |
+| --- | --- | --- |
+| `kanbanPilot.http.token` | Yes | Bearer token required by every endpoint. Use a high-entropy secret. |
+| `kanbanPilot.http.port` | Yes | TCP port from 1 through 65535. |
+| `kanbanPilot.http.host` | No | Bind address; defaults to `0.0.0.0`. A wildcard bind (`0.0.0.0` or `::`) makes the share URL/QR use the machine's LAN IPv4 when available. Use only on trusted networks or behind a TLS reverse proxy. |
+| `kanbanPilot.http.publicUrl` | No | Public `http` or `https` URL shown by the status-bar QR code; set this when a reverse proxy fronts the endpoint. |
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/` | `GET` | The board webview itself. Each load starts a board session. |
+| `/session/events` | `GET` | That session's board message stream. |
+| `/session/messages` | `POST` | One board message from that session. |
+| `/resource/:root/*` | `GET` | Bundled assets and task attachments the board references. |
+| `/health` | `GET` | Endpoint liveness, current revision, and live session count. |
+| `/api/board` | `GET` | Current authoritative board snapshot and active task set. |
+| `/api/events` | `GET` | Server-sent events. Sends a full snapshot immediately and on every task, attachment, configuration, task-set, or run update. |
+| `/api/tasks/:taskId/actions` | `POST` | Runs an existing validated card action. Body: `{ "action": "develop" }`. |
+| `/api/tasks/:taskId/pending` | `POST` | Applies the existing pending completion gate. |
+
+The share URL authenticates with its `token` query parameter. API clients can instead send
+`Authorization: Bearer <kanbanPilot.http.token>` on every request, including the event stream.
+Consumers must treat `revision` as monotonic, only apply newer snapshots, and reconnect to obtain
+the immediate full snapshot.
+
+This is a real-time transport for the existing board and actions, not a replacement UI. The
+current `BoardPanel` remains canonical — it is what a browser runs. Existing Copilot Chat sessions
+remain VS Code editor sessions; task actions over HTTP still use the existing `RunManager`, but
+the private Copilot transcript is not scraped or mirrored over HTTP.
+
+Two board actions act on the editor rather than the board — **Open task file** and **Open Chat** —
+so they are hidden on browser clients instead of silently operating on the host's screen.
+Dialogs that were VS Code modals (new/rename/delete task set, delete task, recover a stale
+completion) are now rendered by the board itself, so they appear for whoever clicked them.
+
+When the endpoint starts, click **Kanban Pilot: Share** in VS Code's status bar to display a
+scannable QR code and a copyable live board URL. Both include the bearer token as a `token` query
+parameter, so treat them as secrets and do not expose them in logs, screenshots, or insecure
+channels. A non-loopback bind also triggers a warning because direct HTTP provides no TLS and the
+token travels in the URL; use a trusted LAN or set `kanbanPilot.http.publicUrl` for a TLS reverse
+proxy. If a wildcard bind has no usable LAN IPv4, the generated URL falls back to `localhost`.
 
 ## Get started
 
@@ -288,6 +345,16 @@ rejected or malformed lines produce a diagnostic instead of silently completing 
 edits you make directly to a task file are fully supported, but they won't produce audit lines: a
 file watcher can't tell what the old value was or who changed it.
 
+Agents can also append coarse `- progress ...` summaries while a run is active. Task Details
+shows this activity read-only, and connected browser boards receive updates through the same live
+board projection. Progress is deliberately not a Copilot transcript: summaries must not contain
+source, secrets, paths, or tokens, and they cannot complete a run or approve an action. If a task
+is blocked, return to the host VS Code window for any Copilot Chat interaction or tool approval.
+
+Clicking **Stop** requests cancellation of the matching task-bound Copilot turn before applying
+the card's existing stopped transition. Cancellation is isolated by task and run; if the host
+cannot cancel the turn, Kanban Pilot reports the failure instead of claiming that it stopped.
+
 ## Install the agent skill
 
 The repository ships the canonical Kanban Pilot skill at `.claude/skills/kanban-pilot/SKILL.md`.
@@ -335,6 +402,11 @@ Every option lives under `kanbanPilot.*` and can be edited from the board's **Se
 | `board.openOnStartup` | `false` | Open the board automatically when the workspace loads. |
 | `layout.dockChat` | `true` | Open the selected task's chat beside the board. |
 | `layout.dockChatOnSelect` | `false` | Dock the chat as soon as you select a card. |
+| `http.enabled` | `false` | Enable the authenticated real-time HTTP endpoint. |
+| `http.host` | `0.0.0.0` | Bind address. Wildcard binds share on all interfaces and derive a LAN address for the URL/QR; use a trusted network or TLS reverse proxy. |
+| `http.port` | `4173` | TCP port for the HTTP endpoint. |
+| `http.token` | `kanban-pilot` | Bearer token required by the endpoint; replace the default with a high-entropy secret. |
+| `http.publicUrl` | empty | Optional public `http` or `https` URL used by the share URL/QR when a reverse proxy fronts the endpoint. |
 
 ## Known issues
 
@@ -353,7 +425,15 @@ A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 ## Release notes
 
-The current documented release is **0.3.3**.
+The current documented release is **0.4.0**.
+
+**0.4.0** — The optional authenticated HTTP endpoint now serves the canonical board in a browser
+with live snapshots, validated actions, isolated per-browser sessions, task attachments, and
+read-only agent progress. Sharing supports QR/copyable URLs, wildcard LAN binds, and public URLs
+for reverse proxies while retaining explicit token and non-TLS warnings. This release also makes
+card-level Stop cancel the matching Copilot turn, repairs the shared editor/browser board surface,
+and keeps Task Details at the reader's position during same-task updates. Browser clients still do
+not mirror or control the private Copilot Chat transcript; editor-only actions remain in VS Code.
 
 **0.3.3** — Task Details now renders Request, Refined, and Scope as safe CommonMark/GFM,
 including Mermaid charts from fenced blocks, while preserving authored Markdown for editing and

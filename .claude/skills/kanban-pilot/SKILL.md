@@ -284,6 +284,31 @@ The supported `split` stage follows the same rule: append any
 `stage:split` receipt describing the child tasks created, or the concrete
 reason the split could not proceed.
 
+## Progress updates (REQUIRED!)
+
+While a stage is running you may append coarse, one-line **progress** updates
+to `## Log` *before* your terminal receipt, so a remote viewer of the board
+can watch the work happen rather than only watch the column change. The line
+is a companion, not a receipt:
+
+```
+- progress run:<runId> task:<taskId> at:<UTC timestamp> note:"<one-line summary>"
+```
+
+- It is **required** but never replaces the stage receipt — it carries no
+  `stage`/`result`, so it never completes or moves the task. Still append
+  exactly one receipt when the stage ends.
+- `task:` must match the file you write it into, exactly like a receipt; a
+  mismatched line is ignored.
+- `at:` is a UTC ISO 8601 timestamp with second precision and a trailing `Z`
+  (`YYYY-MM-DDTHH:mm:ssZ`), generated immediately before you append the line —
+  the same format the receipt note uses.
+- Write **summaries only** — e.g. "editing the parser", "running tests",
+  "waiting for approval in VS Code". Never put source, secrets, file paths, or
+  tokens in the note: this feed can be shared over a token-gated HTTP surface.
+- Append-only, same as receipts: add each line at the end of `## Log`, never
+  edit or reorder earlier ones.
+
 ## Filing follow-up tasks (develop and validate only)
 
 If you notice clearly out-of-scope follow-up work — not something to do now,

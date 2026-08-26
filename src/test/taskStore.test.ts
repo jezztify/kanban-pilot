@@ -73,6 +73,20 @@ const WEBP = new Uint8Array([
 	0x57, 0x45, 0x42, 0x50,
 ]);
 
+async function waitForStoreChange(
+	changes: readonly { taskId?: string; kind: string }[],
+	predicate: (change: { taskId?: string; kind: string }) => boolean,
+	timeoutMs = 3000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!changes.some(predicate)) {
+		if (Date.now() >= deadline) {
+			throw new Error('Timed out waiting for a task-store change.');
+		}
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+}
+
 suite('M1 task schema', () => {
 	test('parses frontmatter and body sections', () => {
 		const task = taskFromRaw(SAMPLE);
@@ -952,6 +966,82 @@ suite('M1 task store', () => {
 		const snapshot = await store.snapshot();
 		assert.deepStrictEqual(snapshot.malformed, []);
 		assert.ok(snapshot.columns.every((c) => c.tasks.length === 0));
+	});
+
+	test('watchChanges normalizes task, attachment, and position-only events with increasing revisions', async () => {
+		const changes: Array<{ taskId?: string; kind: string; revision: number; uri: vscode.Uri }> = [];
+		const watcher = store.watchChanges((change) => changes.push(change));
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const first = await store.create('Watched first');
+			await waitForStoreChange(changes, (change) => change.taskId === first.id && change.kind === 'other');
+
+			const second = await store.create('Watched second');
+			await waitForStoreChange(changes, (change) => change.taskId === second.id && change.kind === 'other');
+
+			await store.reorder(second.id, 'backlog', { beforeTaskId: first.id });
+			await waitForStoreChange(changes, (change) => change.taskId === second.id && change.kind === 'position-only');
+			await waitForStoreChange(changes, (change) => change.taskId === first.id && change.kind === 'position-only');
+
+			await store.edit(first.id, {
+				title: first.title,
+				request: '![evidence](attachment://evidence)',
+				refined: '',
+				scope: '',
+			}, {
+				add: [{ id: 'evidence', name: 'evidence.png', mimeType: 'image/png', data: PNG }],
+			});
+			await waitForStoreChange(changes, (change) => change.taskId === first.id && change.kind === 'attachment');
+
+			const revisions = changes.map((change) => change.revision);
+			assert.ok(revisions.every((revision, index) => index === 0 || revision > revisions[index - 1]));
+			assert.ok(changes.some((change) => change.kind === 'position-only' && change.uri.path.includes(first.id)));
+			assert.ok(changes.some((change) => change.kind === 'attachment' && change.uri.path.includes(`${first.id}.attachments`)));
+		} finally {
+			watcher.dispose();
+		}
+	});
+
+	test('watchChanges ignores atomic temporary artifacts', async () => {
+		const changes: Array<{ uri: vscode.Uri }> = [];
+		const watcher = store.watchChanges((change) => changes.push(change));
+		try {
+			const temporary = vscode.Uri.joinPath(dir, 'TASK-999.md.tmp');
+			await vscode.workspace.fs.writeFile(temporary, Buffer.from('temporary', 'utf8'));
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			assert.strictEqual(changes.some((change) => change.uri.toString() === temporary.toString()), false);
+		} finally {
+			watcher.dispose();
+		}
+	});
+
+	test('watchChanges observes the first task when its directory is created after watcher registration', async () => {
+		const absentDirectory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-absent-watch-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const absentStore = new TaskStore(absentDirectory, 'absent-watch');
+		const changes: Array<{ taskId?: string; kind: string }> = [];
+		const watcher = absentStore.watchChanges((change) => changes.push(change));
+		try {
+			// Wait for the asynchronous watcher setup and its initial
+			// reconciliation before exercising the first real task write.
+			await waitForStoreChange(changes, () => true);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const initialChangeCount = changes.length;
+			const task = await absentStore.create('First task after watcher registration');
+			await waitForStoreChange(
+				changes,
+				(change) => changes.length > initialChangeCount && change.taskId === task.id && change.kind === 'other',
+			);
+			assert.strictEqual((await absentStore.readAll()).tasks[0]?.id, task.id);
+		} finally {
+			watcher.dispose();
+			try {
+				await vscode.workspace.fs.delete(absentDirectory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
 	});
 });
 

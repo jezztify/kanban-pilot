@@ -53,7 +53,9 @@ export interface BoardSnapshot {
 	columns: { id: Column; tasks: Task[] }[];
 	/** Files that parsed badly — surfaced rather than silently dropped (R4). */
 	malformed: string[];
-	}
+	/** Monotonic store-local freshness token for ordered board projections. */
+	revision: number;
+}
 
 /** A stable target for a within-column reorder. Exactly one member is used. */
 export interface ReorderTarget {
@@ -68,7 +70,18 @@ export type StoreReorderOutcome =
 	| { kind: 'not-found' }
 	| { kind: 'stale' };
 
-export type TaskChangeKind = 'position-only' | 'other';
+export type TaskChangeKind = 'position-only' | 'other' | 'attachment';
+
+/** A normalized filesystem change emitted after the provider reports an event. */
+export interface TaskStoreChange {
+	taskId?: string;
+	kind: TaskChangeKind;
+	uri: vscode.Uri;
+	setId: string;
+	revision: number;
+}
+
+export type TaskStoreChangeListener = (change: TaskStoreChange) => void;
 
 interface AtomicWrite {
 	uri: vscode.Uri;
@@ -208,6 +221,19 @@ function taskIdFromUri(uri: vscode.Uri): string | undefined {
 	return TASK_FILE.exec(name)?.[1];
 }
 
+function taskIdFromAttachmentUri(uri: vscode.Uri): string | undefined {
+	const segment = uri.path
+		.split('/')
+		.filter(Boolean)
+		.find((part) => /^TASK-\d+\.attachments$/.test(part));
+	return segment?.slice(0, -'.attachments'.length);
+}
+
+function isTransientStoreUri(uri: vscode.Uri): boolean {
+	const name = uri.path.split('/').pop() ?? '';
+	return name.endsWith('.tmp') || /\.reorder\.[^/]+\.(?:tmp|bak)$/.test(name);
+}
+
 function isColumn(value: unknown): value is Column {
 	return typeof value === 'string' && (COLUMNS as readonly string[]).includes(value);
 }
@@ -229,6 +255,7 @@ export class TaskStore {
 	private mutationTail: Promise<void> = Promise.resolve();
 	private typeMigrationTail: Promise<void> = Promise.resolve();
 	private readonly pendingPositionOnlyChanges = new Map<string, ReturnType<typeof setTimeout>>();
+	private revisionValue = 0;
 
 	constructor(
 		private readonly tasksDir: vscode.Uri,
@@ -246,6 +273,11 @@ export class TaskStore {
 
 	get directory(): vscode.Uri {
 		return this.tasksDir;
+	}
+
+	/** The latest monotonic freshness token observed or written by this store. */
+	get revision(): number {
+		return this.revisionValue;
 	}
 
 	fileFor(id: string): vscode.Uri {
@@ -432,6 +464,7 @@ export class TaskStore {
 		const { tasks, malformed } = await this.readAll();
 
 		return {
+			revision: this.revisionValue,
 			columns: COLUMNS.map((id) => ({
 				id,
 				tasks: orderTasks(tasks.filter((t) => t.state === id)),
@@ -463,6 +496,7 @@ export class TaskStore {
 		const temp = uri.with({ path: `${uri.path}.tmp` });
 		await vscode.workspace.fs.writeFile(temp, Buffer.from(content, 'utf8'));
 		await this.renameFile(temp, uri, { overwrite: true });
+		this.revisionValue += 1;
 	}
 
 	/**
@@ -552,6 +586,7 @@ export class TaskStore {
 				}
 			}
 			committed = true;
+			this.revisionValue += 1;
 		} catch (error) {
 			// A provider can fail after one or more renames have succeeded. Restore
 			// every target whose replacement was attempted, including the target
@@ -1128,24 +1163,70 @@ export class TaskStore {
 				}
 			}
 			await vscode.workspace.fs.delete(this.fileFor(id));
+			this.revisionValue += 1;
 		});
 	}
 
 	/** Fires on any change under the task folder. Disk is the source of truth. */
-	watch(onChange: (taskId?: string, changeKind?: TaskChangeKind) => void): vscode.Disposable {
-		const watcher = vscode.workspace.createFileSystemWatcher(
-			new vscode.RelativePattern(this.tasksDir, '*.md'),
-		);
+	watch(onChange: (taskId?: string, changeKind?: TaskChangeKind, change?: TaskStoreChange) => void): vscode.Disposable {
+		let watcher: vscode.FileSystemWatcher | undefined;
+		let disposed = false;
 		const notify = (uri: vscode.Uri): void => {
-			const taskId = taskIdFromUri(uri);
-			const positionOnly = taskId !== undefined && this.pendingPositionOnlyChanges.has(taskId);
-			onChange(taskId, positionOnly ? 'position-only' : 'other');
+			if (isTransientStoreUri(uri)) {
+				return;
+			}
+			const taskFileId = taskIdFromUri(uri);
+			const attachmentTaskId = taskIdFromAttachmentUri(uri);
+			const taskId = taskFileId ?? attachmentTaskId;
+			const positionOnly = taskFileId !== undefined && this.pendingPositionOnlyChanges.has(taskFileId);
+			const kind: TaskChangeKind = positionOnly
+				? 'position-only'
+				: attachmentTaskId !== undefined
+					? 'attachment'
+					: 'other';
+			const change: TaskStoreChange = {
+				taskId,
+				kind,
+				uri,
+				setId: this.setId,
+				revision: ++this.revisionValue,
+			};
+			onChange(taskId, kind, change);
 		};
 
-		watcher.onDidCreate(notify);
-		watcher.onDidChange(notify);
-		watcher.onDidDelete(notify);
+		const attach = async (): Promise<void> => {
+			await this.ensureDirectory();
+			if (disposed) {
+				return;
+			}
+			watcher = vscode.workspace.createFileSystemWatcher(
+				new vscode.RelativePattern(this.tasksDir, '**/*'),
+			);
+			watcher.onDidCreate(notify);
+			watcher.onDidChange(notify);
+			watcher.onDidDelete(notify);
+			// A mutation can finish while the directory is being created and before
+			// the provider has installed its watcher. Reconcile once after attach so
+			// the first task is not lost on providers that do not watch absent roots.
+			notify(this.tasksDir);
+		};
+		void attach().catch(() => {
+			// A provider that cannot create the task directory cannot provide a
+			// useful watcher; the next authoritative read will surface the error.
+		});
 
-		return watcher;
+		return new vscode.Disposable(() => {
+			disposed = true;
+			watcher?.dispose();
+		});
+	}
+
+	/** Preferred normalized watcher API for host synchronization coordinators. */
+	watchChanges(onChange: TaskStoreChangeListener): vscode.Disposable {
+		return this.watch((_taskId, _changeKind, change) => {
+			if (change) {
+				onChange(change);
+			}
+		});
 	}
 }

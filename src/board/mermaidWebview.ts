@@ -22,6 +22,7 @@ type DiagramHost = {
   innerHTML: string;
   className: string;
   dataset: Record<string, string>;
+  isConnected?: boolean;
 };
 
 type SourceNode = {
@@ -185,8 +186,12 @@ function appendFallback(host: DiagramHost, source: string, message: string): voi
   host.appendChild(sourceNode);
 }
 
+function isDetached(host: DiagramHost): boolean {
+  return host.isConnected === false;
+}
+
 async function renderOne(host: DiagramHost, styleNonce: string): Promise<void> {
-  if (host.dataset.mermaidState === 'rendered') {
+  if (host.dataset.mermaidState === 'rendered' || isDetached(host)) {
     return;
   }
   const source = sourceFor(host);
@@ -196,6 +201,9 @@ async function renderOne(host: DiagramHost, styleNonce: string): Promise<void> {
     const id = 'kanbanPilotMermaid' + String(++renderSequence);
     const result = await mermaid.render(id, source);
     const safeSvg = sanitizeSvg(result.svg, styleNonce);
+    if (isDetached(host)) {
+      return;
+    }
     const document = globalObject.document;
     if (!document) {
       throw new Error('A document is required to render Mermaid diagrams.');
@@ -210,6 +218,9 @@ async function renderOne(host: DiagramHost, styleNonce: string): Promise<void> {
     rendered.innerHTML = safeSvg;
     host.appendChild(rendered);
   } catch {
+    if (isDetached(host)) {
+      return;
+    }
     appendFallback(host, source, 'Mermaid diagram could not be rendered. The source is shown below.');
   }
 }
