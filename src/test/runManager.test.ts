@@ -1229,6 +1229,7 @@ suite('M3 RunManager', () => {
 				const task = await store.create('Recover late develop proposals');
 				await store.patch(task.id, { state: 'approved', status: 'idle' });
 				let runId = '';
+				const lateWrite = deferred<void>();
 				const executor = new StubExecutor(async (t, prompt) => {
 					runId = runIdFromPrompt(prompt);
 					setTimeout(() => {
@@ -1238,7 +1239,8 @@ suite('M3 RunManager', () => {
 								t.id,
 								formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'late completion with proposal' }),
 							);
-						})();
+							lateWrite.resolve();
+						})().catch((error) => lateWrite.reject(error));
 					}, 900);
 					return new Promise<ExecutorResult>(() => {
 						/* the chat turn outlives the extension timeout */
@@ -1247,16 +1249,17 @@ suite('M3 RunManager', () => {
 				const runManager = new RunManager(store, executor, folder);
 
 				await runManager.handleAction(task.id, 'develop');
-				await waitUntilSettled(store, task.id);
-				await waitUntil(async () => {
-					const after = (await store.readAll()).tasks;
-					return after.some((candidate) => candidate.id === task.id && candidate.state === 'validation' && candidate.status === 'idle');
-				});
-				await runManager.reconcileTaskChange(task.id);
-				await runManager.reconcileTaskChange(task.id);
+				const failed = await waitUntilSettled(store, task.id);
+				assert.strictEqual(failed.status, 'failed');
+				runManager.dispose();
+				await lateWrite.promise;
+				const reconciliationManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+				await reconciliationManager.reconcileTaskChange(task.id);
+				await reconciliationManager.reconcileTaskChange(task.id);
 
 				const { tasks } = await store.readAll();
 				assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Late follow-up').length, 1);
+				assert.strictEqual(tasks.find((candidate) => candidate.id === task.id)?.state, 'validation');
 				assert.strictEqual(parseReceipts(tasks.find((candidate) => candidate.id === task.id)!.sections['Log']).filter((receipt) => receipt.runId === runId).length, 2);
 			} finally {
 				await cfg.update('run.timeoutMinutes', undefined, vscode.ConfigurationTarget.Global);
