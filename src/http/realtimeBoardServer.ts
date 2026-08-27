@@ -235,11 +235,11 @@ function hostRevision(host: RealtimeBoardHost): number {
 	return typeof host.revision === 'number' && Number.isFinite(host.revision) ? host.revision : 0;
 }
 
-async function projection(host: RealtimeBoardHost): Promise<Record<string, unknown>> {
+async function projection(host: RealtimeBoardHost, change?: BoardTaskSetChange): Promise<Record<string, unknown>> {
 	await host.ready;
 	const snapshot = await host.store.snapshot();
 	return {
-		revision: Math.max(hostRevision(host), snapshot.revision),
+		revision: Math.max(hostRevision(host), snapshot.revision, change?.revision ?? 0),
 		activeTaskSet: host.activeSet,
 		snapshot,
 	};
@@ -280,16 +280,16 @@ interface BoardSession {
 export async function startRealtimeBoardServer(options: RealtimeBoardServerOptions): Promise<RealtimeBoardServer> {
 	const { host, extensionUri, port, token, bindAddress = '127.0.0.1' } = options;
 	await host.ready;
-	const listeners = new Set<ServerResponse>();
+	const listeners = new Map<ServerResponse, () => void>();
 	const sessions = new Map<string, BoardSession>();
 
 	const publish = async (change?: BoardTaskSetChange): Promise<void> => {
 		if (!listeners.size) {
 			return;
 		}
-		const board = await projection(host);
+		const board = await projection(host, change);
 		const payload = JSON.stringify({ type: 'board', change, board });
-		for (const response of listeners) {
+		for (const response of listeners.keys()) {
 			if (!response.writableEnded) {
 				response.write(`event: board\ndata: ${payload}\n\n`);
 			}
@@ -455,16 +455,29 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 				response.setHeader('content-type', 'text/event-stream; charset=utf-8');
 				response.setHeader('cache-control', 'no-cache, no-transform');
 				response.setHeader('connection', 'keep-alive');
-				listeners.add(response);
-				await publish();
-				const heartbeat = setInterval(() => {
+				let heartbeat: ReturnType<typeof setInterval> | undefined;
+				let closed = false;
+				const close = (): void => {
+					if (closed) {
+						return;
+					}
+					closed = true;
+					listeners.delete(response);
+					if (heartbeat) {
+						clearInterval(heartbeat);
+					}
+				};
+				listeners.set(response, close);
+				request.once('close', close);
+				const board = await projection(host);
+				if (closed) {
+					return;
+				}
+				response.write(`event: board\ndata: ${JSON.stringify({ type: 'board', board })}\n\n`);
+				heartbeat = setInterval(() => {
 					if (!response.writableEnded) { response.write(': heartbeat\n\n'); }
 				}, 20_000);
 				heartbeat.unref?.();
-				request.on('close', () => {
-					listeners.delete(response);
-					clearInterval(heartbeat);
-				});
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/tasks') {
@@ -545,7 +558,8 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 			for (const session of [...sessions.values()]) {
 				dropSession(session);
 			}
-			for (const response of listeners) {
+			for (const [response, close] of listeners) {
+				close();
 				response.end();
 			}
 			listeners.clear();

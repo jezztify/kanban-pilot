@@ -135,6 +135,8 @@ suite('Browser board surface', () => {
 		assert.match(markup, /<script nonce="abc123" data-kanban-pilot-bridge>/);
 		assert.match(markup, /window\.acquireVsCodeApi = function/);
 		assert.match(markup, /var session = "session-1"/);
+		assert.match(markup, /new EventSource\(endpoint\('\/session\/events'\)\)/);
+		assert.doesNotMatch(markup, /\/api\/board/);
 	});
 
 	test('supplies the theme tokens VS Code injects, in both colour schemes', () => {

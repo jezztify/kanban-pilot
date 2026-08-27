@@ -109,18 +109,24 @@ function fakeHost(snapshot: BoardSnapshot, sink: { actions: string[] }): BoardTa
 function observableHost(snapshot: BoardSnapshot, sink: { actions: string[] }): {
 	host: BoardTaskSetHost;
 	emit(change: { revision: number; kind: string; taskId?: string; note?: string }): void;
+	subscriptionDisposals(): number;
 } {
 	let listener: ((change?: { revision: number; kind: string; taskId?: string; note?: string }) => void) | undefined;
+	let subscriptionDisposals = 0;
 	const host = fakeHost(snapshot, sink);
 	return {
 		host: {
 			...host,
 			onDidChange: (next) => {
 				listener = next;
-				return new vscode.Disposable(() => { listener = undefined; });
+				return new vscode.Disposable(() => {
+					subscriptionDisposals += 1;
+					listener = undefined;
+				});
 			},
 		},
 		emit: (change) => listener?.(change),
+		subscriptionDisposals: () => subscriptionDisposals,
 	};
 }
 
@@ -238,7 +244,7 @@ suite('Realtime board HTTP endpoint integration', () => {
 		}
 	});
 
-	test('publishes typed host changes and revisions to connected browser clients', async () => {
+	test('subscribes API clients with an initial board then typed revisioned host changes', async () => {
 		const observable = observableHost(snapshot, { actions: [] });
 		const server = await startRealtimeBoardServer({
 			port: 0,
@@ -256,10 +262,12 @@ suite('Realtime board HTTP endpoint integration', () => {
 				observable.emit({ revision: 10, kind: 'task', taskId: 'TASK-001', note: 'updated' });
 			}, 50);
 			const events = await eventsPromise;
+			assert.match(events, /event: board\ndata: \{"type":"board","board":\{"revision":9/);
 			assert.match(events, /"change":\{"revision":10,"kind":"task","taskId":"TASK-001","note":"updated"\}/);
-			assert.match(events, /"revision":9/);
+			assert.match(events, /"board":\{"revision":10/);
 		} finally {
 			server.dispose();
+			assert.strictEqual(observable.subscriptionDisposals(), 1);
 		}
 	});
 });

@@ -72,19 +72,30 @@ function cssVariable(name: string, fallback: string): string {
 }
 
 function initializeMermaid(): void {
+  const flowchartFill = cssVariable('--vscode-button-secondaryBackground', '#3a3d41');
+  const flowchartText = cssVariable('--vscode-button-secondaryForeground', '#f0f0f0');
+  const flowchartBorder = cssVariable('--vscode-focusBorder', '#007acc');
+  const flowchartLine = cssVariable('--vscode-descriptionForeground', '#c5c5c5');
+  const edgeLabelBackground = cssVariable('--vscode-editorWidget-background', '#252526');
+
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: 'strict',
     suppressErrorRendering: true,
     theme: 'base',
     themeVariables: {
-      background: cssVariable('--vscode-editorWidget-background', '#252526'),
-      primaryColor: cssVariable('--vscode-textCodeBlock-background', '#1e1e1e'),
-      primaryTextColor: cssVariable('--vscode-foreground', '#cccccc'),
-      primaryBorderColor: cssVariable('--vscode-focusBorder', '#007acc'),
-      lineColor: cssVariable('--vscode-descriptionForeground', '#9d9d9d'),
+      background: edgeLabelBackground,
+      primaryColor: flowchartFill,
+      primaryTextColor: flowchartText,
+      primaryBorderColor: flowchartBorder,
+      lineColor: flowchartLine,
       secondaryColor: cssVariable('--vscode-editor-background', '#1e1e1e'),
-      tertiaryColor: cssVariable('--vscode-editorWidget-background', '#252526'),
+      tertiaryColor: edgeLabelBackground,
+      mainBkg: flowchartFill,
+      nodeBorder: flowchartBorder,
+      nodeTextColor: flowchartText,
+      defaultLinkColor: flowchartLine,
+      edgeLabelBackground,
       fontFamily: cssVariable('--vscode-font-family', 'Arial, sans-serif'),
     },
     flowchart: {
@@ -95,6 +106,15 @@ function initializeMermaid(): void {
       useMaxWidth: true,
     },
   });
+}
+
+function hasUnsafeStyleContent(styleText: string): boolean {
+  if (/@import|expression\s*\(|javascript\s*:/i.test(styleText)) {
+    return true;
+  }
+
+  const urls = styleText.match(/url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi) || [];
+  return urls.some((url) => !/^url\s*\(\s*['"]?\s*#/i.test(url));
 }
 
 function sanitizeSvg(svg: string, styleNonce: string): string {
@@ -136,7 +156,7 @@ function sanitizeSvg(svg: string, styleNonce: string): string {
         const unsafeEvent = name.startsWith('on');
         const unsafeUrl = ['src', 'action', 'formaction'].includes(name) ||
           (['href', 'xlink:href'].includes(name) && !value.startsWith('#'));
-        const unsafeStyle = name === 'style' && /url\s*\(|expression\s*\(|javascript\s*:/i.test(value);
+        const unsafeStyle = name === 'style' && hasUnsafeStyleContent(value);
         if (unsafeEvent || unsafeUrl || unsafeStyle) {
           element.removeAttribute(attribute.name);
         }
@@ -144,7 +164,7 @@ function sanitizeSvg(svg: string, styleNonce: string): string {
     }
     if (tagName === 'style') {
       const styleText = element.textContent || '';
-      if (/url\s*\(|@import|expression\s*\(|javascript\s*:/i.test(styleText)) {
+      if (hasUnsafeStyleContent(styleText)) {
         element.remove();
       } else if (styleNonce) {
         element.setAttribute('nonce', styleNonce);

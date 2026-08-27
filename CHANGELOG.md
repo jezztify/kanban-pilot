@@ -8,6 +8,29 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.4.1] - 2026-08-27
+
+### Added
+
+- Added the `kanbanPilot.chat.agentDirectories` setting for ordered additional
+	custom-agent directories. Settings accepts absolute, `~/`-relative, and
+	workspace-relative entries while preserving the established discovery priority.
+
+### Changed
+
+- Board and Task Details refreshes now coalesce task-store updates, keep the selected task current,
+	preserve active New Task and Settings dialogs, and retain or clamp board, column, and detail
+	scroll positions as content changes.
+- Mermaid flowcharts now use VS Code theme colors more consistently, and SVG sanitization retains
+	safe fragment-only style references while rejecting external style content.
+
+### Fixed
+
+- Real-time board projections now retain a monotonic revision across host and change snapshots, and
+	server-sent-event connections clean up their listeners and heartbeat timers when clients disconnect.
+- Narrow board cards now constrain wrapping titles and controls within the available column width
+	and scrollbar gutter.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

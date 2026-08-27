@@ -59,6 +59,8 @@ suite('Copilot custom-agent discovery', () => {
 		const root = await makeDirectory('workspace');
 		const githubAgents = vscode.Uri.joinPath(root, '.github', 'agents');
 		const claudeAgents = vscode.Uri.joinPath(root, '.claude', 'agents');
+		const configuredDirectoriesFirst = await makeDirectory('configured-directories-first');
+		const configuredDirectoriesSecond = await makeDirectory('configured-directories-second');
 		const configured = await makeDirectory('configured');
 		const user = await makeDirectory('user');
 		const userClaude = await makeDirectory('user-claude');
@@ -78,6 +80,9 @@ suite('Copilot custom-agent discovery', () => {
 			await writeFile(vscode.Uri.joinPath(claudeAgents, 'claude-reviewer.md'), '---\nname: Claude Reviewer\n---\n');
 			await writeFile(vscode.Uri.joinPath(claudeAgents, 'subagent.md'), '---\ninfer: false\n---\n');
 
+			await writeFile(vscode.Uri.joinPath(configuredDirectoriesFirst, 'directory.agent.md'), '---\nname: Directory First\n---\n');
+			await writeFile(vscode.Uri.joinPath(configuredDirectoriesFirst, 'review.agent.md'), '---\nname: Review\ndescription: Directory copy\n---\n');
+			await writeFile(vscode.Uri.joinPath(configuredDirectoriesSecond, 'second.agent.md'), '---\nname: Directory Second\n---\n');
 			await writeFile(
 				vscode.Uri.joinPath(configured, 'review.agent.md'),
 				'---\nname: Review\ndescription: Configured copy\n---\n',
@@ -89,15 +94,24 @@ suite('Copilot custom-agent discovery', () => {
 
 			const agents = await discoverCopilotAgents({
 				workspaceFolders: [root],
+				agentDirectories: [
+					configuredDirectoriesFirst.fsPath,
+					configuredDirectoriesSecond.fsPath,
+					configuredDirectoriesFirst.fsPath,
+					path.join(os.tmpdir(), 'kanban-pilot-missing-agent-directory'),
+					'',
+				],
 				additionalLocations: { [configured.fsPath]: true },
 				userAgentsDirectory: user,
 				userClaudeAgentsDirectory: userClaude,
 			});
-			assert.deepStrictEqual(agents.map((agent) => agent.name), ['Claude Reviewer', 'Configured', 'fallback', 'Review', 'User', 'User Claude Reviewer']);
+			assert.deepStrictEqual(agents.map((agent) => agent.name), ['Claude Reviewer', 'Configured', 'Directory First', 'Directory Second', 'fallback', 'Review', 'User', 'User Claude Reviewer']);
 			assert.strictEqual(agents.find((agent) => agent.name === 'Review')?.description, 'Workspace copy');
 			assert.strictEqual(agents.find((agent) => agent.name === 'Review')?.source, 'workspace');
 		} finally {
 			await vscode.workspace.fs.delete(root, { recursive: true });
+			await vscode.workspace.fs.delete(configuredDirectoriesFirst, { recursive: true });
+			await vscode.workspace.fs.delete(configuredDirectoriesSecond, { recursive: true });
 			await vscode.workspace.fs.delete(configured, { recursive: true });
 			await vscode.workspace.fs.delete(user, { recursive: true });
 			await vscode.workspace.fs.delete(userClaude, { recursive: true });
@@ -109,12 +123,21 @@ suite('Copilot custom-agent discovery', () => {
 		const second = vscode.Uri.file(path.join(os.tmpdir(), 'kanban-pilot-no-agents-second'));
 		const locations = resolveCopilotAgentLocations({
 			workspaceFolders: [first, second],
+			agentDirectories: ['relative-agents', '~/.shared-agents', 'relative-agents', 42],
 			additionalLocations: { '~/.shared-agents': true, 'relative-agents': true },
 			userHome: path.join(os.tmpdir(), 'kanban-pilot-no-agents-home'),
 			userAgentsDirectory: vscode.Uri.file(path.join(os.tmpdir(), 'kanban-pilot-no-agents-user')),
 		});
 		assert.strictEqual(locations.filter((location) => location.source === 'workspace').length, 4);
 		assert.strictEqual(locations.filter((location) => location.source === 'configured').length, 3);
+		assert.deepStrictEqual(
+			locations.filter((location) => location.source === 'configured').map((location) => path.normalize(location.uri.fsPath).toLowerCase()),
+			[
+				path.join(first.fsPath, 'relative-agents'),
+				path.join(second.fsPath, 'relative-agents'),
+				path.join(os.tmpdir(), 'kanban-pilot-no-agents-home', '.shared-agents'),
+			].map((location) => path.normalize(location).toLowerCase()),
+		);
 		assert.deepStrictEqual(await discoverCopilotAgents({
 			workspaceFolders: [first],
 			additionalLocations: { [path.join(os.tmpdir(), 'kanban-pilot-no-agents-configured')]: true },

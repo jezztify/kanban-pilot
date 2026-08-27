@@ -1252,6 +1252,8 @@ suite('M3 RunManager', () => {
 					const after = (await store.readAll()).tasks;
 					return after.some((candidate) => candidate.id === task.id && candidate.state === 'validation' && candidate.status === 'idle');
 				});
+				await runManager.reconcileTaskChange(task.id);
+				await runManager.reconcileTaskChange(task.id);
 
 				const { tasks } = await store.readAll();
 				assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Late follow-up').length, 1);

@@ -255,8 +255,10 @@ each column keeps its own **Reset** control before the shared save.
 
 Agent assignments use keyboard-accessible dropdowns populated when Settings opens or refreshes.
 Choices come from workspace `.github/agents` and `.claude/agents` folders, configured agent-file
-locations, and user-level `~/.copilot/agents` and `~/.claude/agents` folders. Workspace choices
-win when names collide, followed by configured and then user-level choices. Existing or legacy
+locations, `chat.agentDirectories`, and user-level `~/.copilot/agents` and `.claude/agents`
+folders. **Additional agent directories** is an ordered newline-separated list in Settings; entries
+may be absolute, `~/`-relative, or workspace-relative. Empty, duplicate, missing, or unreadable
+entries are ignored. Workspace choices win when names collide, followed by configured and then user-level choices. Existing or legacy
 labels remain selectable as a compatibility fallback even when their profile is no longer
 discoverable. The pencil on a column header jumps straight to that column's field. Refine's name
 is also used for **Split**, and names on the resting columns are just labels — they never start a
@@ -392,6 +394,7 @@ Every option lives under `kanbanPilot.*` and can be edited from the board's **Se
 | `chat.sessionPrefix` | `kanban-pilot-` | Prefix for each task's private session id. |
 | `chat.closeTabOnDone` | `true` | Close a task's chat tab when it's finished (the session is kept). |
 | `chat.resetOnApprove` | `false` | Clear the task's conversation at the Approve gate. |
+| `chat.agentDirectories` | `[]` | Ordered additional custom-agent directories. Enter one absolute, `~/`-relative, or workspace-relative path per line; this complements VS Code's `chat.agentFilesLocations`. |
 | `chat.toolsExclude` | `["memory", "resolveMemoryFileUri"]` | Tools blocked on every stage. |
 | `refine.toolsInclude` | `[]` | Optional allowlist of tools available during Refine. |
 | `chat.modelSelector` | `{}` | Pin a model per run with `{id, vendor}`. |
@@ -425,7 +428,16 @@ A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 ## Release notes
 
-The current documented release is **0.4.0**.
+The current documented release is **0.4.1**.
+
+**0.4.1** — Configure additional custom-agent directories from Settings using
+absolute, home-relative, or workspace-relative paths. Board and Task Details
+now absorb live refreshes without disrupting active New Task or Settings
+dialogs, preserve and clamp reader scroll positions, and keep narrow cards'
+content and actions within their columns. Mermaid diagrams better follow the
+active VS Code theme while continuing to reject unsafe external style content.
+The real-time endpoint also keeps its event-stream listeners and revisions
+consistent as clients connect, disconnect, and receive live board updates.
 
 **0.4.0** — The optional authenticated HTTP endpoint now serves the canonical board in a browser
 with live snapshots, validated actions, isolated per-browser sessions, task attachments, and

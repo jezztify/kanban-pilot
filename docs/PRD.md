@@ -1623,7 +1623,10 @@ manifest keys; obsolete documentation-only settings are not rendered.
 **Agent assignments.** Each row is pre-filled with its effective label and has a native,
 keyboard-accessible dropdown, Save, and Reset actions. The dropdown is rebuilt from a fresh
 scan of the active workspace's `.github/agents` and `.claude/agents` directories, the user-level
-`~/.copilot/agents` and `~/.claude/agents` directories, and enabled `chat.agentFilesLocations` entries. It reads only the custom-agent
+`~/.copilot/agents` and `~/.claude/agents` directories, enabled `chat.agentFilesLocations` entries,
+and the ordered `kanbanPilot.chat.agentDirectories` list. Each list entry may be absolute,
+`~/`-relative, or workspace-relative; blank, duplicate, missing, and unreadable entries are
+ignored. It reads only the custom-agent
 frontmatter needed for the picker: `name` (falling back to the `.agent.md`/`.md` filename),
 `description`, `target`, and user-invocation visibility. Profiles that are malformed, unreadable,
 targeted at another environment, or hidden with `user-invocable: false`/legacy `infer: false`
@@ -1641,7 +1644,9 @@ for Refine, Develop/Continue, and Validate. `split` maps to the Refine column an
 inherits its assignment. The four resting-column assignments are stored/displayed labels only;
 they have no stage mapping and cannot launch a chat run by themselves. Opening Settings requests
 another scan, and configuration changes to `chat.agentFilesLocations` refresh the available
-choices without requiring an extension reload.
+choices without requiring an extension reload. Changes to `kanbanPilot.chat.agentDirectories`
+refresh the choices through the normal Kanban Pilot configuration update as well; the setting
+complements rather than changes VS Code's location configuration.
 
 Existing stage-key settings remain compatible: legacy `refine`, `develop`, and `validate` values
 are used as fallbacks when their new column key is absent, while a new column key takes
@@ -1725,6 +1730,7 @@ Defaults are chosen to reproduce the design's behaviour exactly: all human gates
 | `kanbanPilot.chat.sessionPrefix` | `string` | `kanban-pilot-` | Session-id prefix; Default uses `<prefix><taskId>`, while named sets include the stable set id before `<taskId>` (§6.7) |
 | `kanbanPilot.chat.closeTabOnDone` | `boolean` | `true` | Close the task's chat tab when it reaches Done (session is retained) |
 | `kanbanPilot.chat.resetOnApprove` | `boolean` | **`false`** | Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default — Develop and Validate deliberately continue the *same* conversation Refine started; every prompt inlines the current task content regardless, which is the actual mitigation (§6.8) |
+| `kanbanPilot.chat.agentDirectories` | `string[]` | `[]` | Ordered additional custom-agent directories. Each entry may be absolute, `~/`-relative, or workspace-relative; blank, duplicate, missing, and unreadable entries are ignored. This complements VS Code's `chat.agentFilesLocations`. |
 | `kanbanPilot.refine.toolsInclude` | `string[]` | `[]` | Optional allowlist for refine's tools. Empty means no restriction — verify real tool ids via the Configure Tools picker before setting this, since an allowlist missing a file-edit tool blocks refine from writing its own output |
 | `kanbanPilot.chat.toolsExclude` | `string[]` | `["memory","resolveMemoryFileUri"]` | Tools denied on **every** injection, every stage — the R12 mitigation (§6.8 layer 0). Not user-facing hardening; this is a correctness requirement and ships non-empty by default |
 | `kanbanPilot.chat.modelSelector` | `object` | `{}` | Optional `{id, vendor}` to pin a model per run |
