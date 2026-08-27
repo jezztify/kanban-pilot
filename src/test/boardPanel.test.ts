@@ -187,6 +187,7 @@ suite('BoardPanel Settings', () => {
 			'  - nested child',
 			'- [ ] open item',
 			'- [x] completed item',
+			'- [ ] Update `src/http/realtimeBoardServer.ts` to publish changes without collapsing this mixed inline content.',
 			'',
 			'> quoted requirement',
 			'',
@@ -223,13 +224,19 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(root.querySelector('s')?.textContent, 'deleted');
 		assert.strictEqual(root.querySelector('code')?.textContent, 'inline');
 		assert.strictEqual(root.querySelectorAll('ul').length >= 2, true, 'nested unordered lists render');
-		assert.strictEqual(root.querySelectorAll('.task-list-item').length, 2);
-		assert.strictEqual(root.querySelectorAll('.task-list-item-checkbox').length, 2);
+		assert.strictEqual(root.querySelectorAll('.task-list-item').length, 3);
+		assert.strictEqual(root.querySelectorAll('.task-list-item-checkbox').length, 3);
 		assert.strictEqual(
 			Array.from(root.querySelectorAll('.task-list-item-checkbox')).every((input) => (
 				(input as HTMLInputElement).disabled
 			)),
 			true,
+		);
+		const mixedTaskItem = root.querySelectorAll('.task-list-item')[2];
+		assert.ok(mixedTaskItem?.querySelector('code'));
+		assert.strictEqual(
+			mixedTaskItem?.textContent?.trim(),
+			'Update src/http/realtimeBoardServer.ts to publish changes without collapsing this mixed inline content.',
 		);
 		assert.strictEqual(root.querySelector('blockquote')?.textContent?.trim(), 'quoted requirement');
 		assert.ok(root.querySelector('hr'));
@@ -337,6 +344,12 @@ suite('BoardPanel Settings', () => {
 			assert.strictEqual(root.querySelectorAll('.modal-mermaid-source').length, 0);
 			assert.ok(root.querySelector('.modal-mermaid-rendered svg.flowchart'));
 			assert.ok(root.querySelector('.modal-mermaid-rendered svg[aria-roledescription="sequence"]'));
+			const flowchartStyles = root.querySelector('.modal-mermaid-rendered svg.flowchart style')?.textContent ?? '';
+			assert.match(flowchartStyles, /fill:\s*#3a3d41/, 'flowchart nodes use the readable fallback fill');
+			assert.match(flowchartStyles, /fill:\s*#f0f0f0/, 'flowchart labels use the readable fallback text color');
+			assert.match(flowchartStyles, /stroke:\s*#007acc/, 'flowchart nodes use the readable fallback border color');
+			assert.match(flowchartStyles, /stroke:\s*#c5c5c5/, 'flowchart links use the readable fallback line color');
+			assert.match(flowchartStyles, /fill:\s*#252526/, 'flowchart edge labels use the readable fallback background');
 		} finally {
 			dom.window.close();
 		}
@@ -460,8 +473,8 @@ suite('BoardPanel Settings', () => {
 		);
 	});
 
-	test('keeps the in-board catalog aligned with all 24 contributed keys', () => {
-		assert.strictEqual(ALL_KANBAN_SETTING_KEYS.length, 24);
+	test('keeps the in-board catalog aligned with all 25 contributed keys', () => {
+		assert.strictEqual(ALL_KANBAN_SETTING_KEYS.length, 25);
 		assert.deepStrictEqual([...SETTING_DEFINITIONS].map((definition) => definition.key), [...ALL_KANBAN_SETTING_KEYS]);
 		assert.strictEqual(isEditableSettingKey('chat.agentNames'), true);
 		assert.strictEqual(isEditableSettingKey('kanbanPilot.chat.mode'), false);
@@ -476,6 +489,11 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(validateSettingValue('run.maxParallelTasks', 1.5).ok, false);
 		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search', 'edit']).ok, true);
 		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search\nedit']).ok, false);
+		assert.deepStrictEqual(validateSettingValue('chat.agentDirectories', [' .agents ', 'shared/agents']), {
+			ok: true,
+			value: ['.agents', 'shared/agents'],
+		});
+		assert.strictEqual(validateSettingValue('chat.agentDirectories', ['agents\nmore']).ok, false);
 		assert.strictEqual(validateSettingValue('chat.modelSelector', { id: 'gpt', vendor: 'copilot' }).ok, true);
 		assert.strictEqual(validateSettingValue('chat.modelSelector', { unknown: 'value' }).ok, false);
 		assert.strictEqual(validateSettingValue('chat.agentNames', { refine: 'Custom Refiner' }).ok, true);
@@ -492,6 +510,7 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(values['chat.mode'], 'ask');
 		assert.strictEqual(values['run.maxParallelTasks'], 3);
 		assert.deepStrictEqual(values['chat.toolsExclude'], ['memory']);
+		assert.deepStrictEqual(values['chat.agentDirectories'], []);
 		assert.strictEqual(values['chat.closeTabOnDone'], true);
 	});
 
@@ -503,19 +522,19 @@ suite('BoardPanel Settings', () => {
 			},
 		};
 
-		const valid = await persistSetting(configuration, 'chat.toolsExclude', ['memory', 'resolveMemoryFileUri']);
+		const valid = await persistSetting(configuration, 'chat.agentDirectories', ['shared/agents', 'team/agents']);
 		assert.strictEqual(valid.ok, true);
 		assert.deepStrictEqual(writes[0], {
-			key: 'chat.toolsExclude',
-			value: ['memory', 'resolveMemoryFileUri'],
+			key: 'chat.agentDirectories',
+			value: ['shared/agents', 'team/agents'],
 			target: vscode.ConfigurationTarget.Workspace,
 		});
 		const invalid = await persistSetting(configuration, 'run.maxParallelTasks', 0);
 		assert.strictEqual(invalid.ok, false);
 		assert.strictEqual(writes.length, 1);
-		assert.strictEqual(await resetSetting(configuration, 'chat.toolsExclude'), true);
+		assert.strictEqual(await resetSetting(configuration, 'chat.agentDirectories'), true);
 		assert.deepStrictEqual(writes[1], {
-			key: 'chat.toolsExclude',
+			key: 'chat.agentDirectories',
 			value: undefined,
 			target: vscode.ConfigurationTarget.Workspace,
 		});
@@ -597,6 +616,77 @@ suite('BoardPanel Settings', () => {
 		}]);
 	});
 
+	test('publishes selected backend run updates as detail-only updates', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-detail-pubsub-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-detail-pubsub-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		let publishChange: ((change: { revision: number; kind: string; taskId?: string }) => void) | undefined;
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange(listener) {
+				publishChange = listener;
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const surface = new BrowserBoardSurface('detail-pubsub-test');
+		const posted: Record<string, unknown>[] = [];
+		const postMessage = surface.postMessage.bind(surface);
+		surface.postMessage = (message) => {
+			posted.push(message);
+			return postMessage(message);
+		};
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		const internal = board as unknown as {
+			selectedTaskId: string | undefined;
+			pushAll(): Promise<void>;
+			pushDetail(preserveOpenModal?: boolean): Promise<void>;
+		};
+		try {
+			const task = await store.create('Live detail');
+			internal.selectedTaskId = task.id;
+			await internal.pushAll();
+			posted.length = 0;
+			const pushDetail = internal.pushDetail.bind(board);
+			let detailPublication: Promise<void> | undefined;
+			internal.pushDetail = (preserveOpenModal = false) => {
+				detailPublication = pushDetail(preserveOpenModal);
+				return detailPublication;
+			};
+
+			publishChange?.({ revision: 1, kind: 'run', taskId: task.id });
+			await detailPublication;
+
+			assert.deepStrictEqual(
+				posted.map((message) => message.type),
+				['task/detail'],
+				'backend run updates must not publish complete board or settings payloads',
+			);
+			assert.strictEqual(posted[0]?.preserveOpenModal, true);
+		} finally {
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
 	test('renders one Settings entry point and rejects invalid webview messages', async () => {
 		const directory = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-board-${Date.now()}-${Math.random().toString(36).slice(2)}`),
@@ -657,6 +747,26 @@ suite('BoardPanel Settings', () => {
 			assert.match(stylesheet, /header\s*\{[\s\S]*?min-width:\s*0;/);
 			assert.match(stylesheet, /\.header-actions\s*\{[\s\S]*?min-width:\s*0;/);
 			assert.match(stylesheet, /\.task-set-controls\s*\{[\s\S]*?min-width:\s*0;/);
+			assert.match(
+				stylesheet,
+				/\.cards\s*\{[\s\S]*?box-sizing:\s*border-box;[\s\S]*?scrollbar-gutter:\s*stable;/,
+				'overflowing card lists reserve scrollbar space without exceeding their column',
+			);
+			assert.match(
+				stylesheet,
+				/\.card\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?max-width:\s*100%;/,
+				'cards remain constrained to the available scroller width',
+			);
+			assert.match(
+				stylesheet,
+				/\.card-foot\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?flex-wrap:\s*wrap;/,
+				'card footer controls wrap rather than painting into the scrollbar gutter',
+			);
+			assert.match(
+				stylesheet,
+				/\.modal-section-body li\.task-list-item > label\s*\{\s*display:\s*inline;/,
+				'task-list labels preserve normal inline flow for mixed text and inline code',
+			);
 			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?header\s*\{[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
 			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?\.header-actions\s*\{[\s\S]*?flex:\s*1 1 100%;[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
 			assert.match(stylesheet, /@media\s*\(max-width:\s*620px\)[\s\S]*?\.task-set-controls\s*\{[\s\S]*?flex:\s*1 1 100%;[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?\}/);
@@ -920,6 +1030,7 @@ suite('BoardPanel Settings', () => {
 				'chat.sessionPrefix': 'kanban-pilot-',
 				'chat.closeTabOnDone': true,
 				'chat.resetOnApprove': false,
+				'chat.agentDirectories': ['shared/agents'],
 				'refine.toolsInclude': [],
 				'chat.toolsExclude': ['memory'],
 				'chat.modelSelector': { id: 'gpt', vendor: 'copilot' },
@@ -943,7 +1054,8 @@ suite('BoardPanel Settings', () => {
 			1,
 		);
 		assert.strictEqual(settingsDocument.querySelectorAll('.agent-setting-actions button').length, 7);
-		assert.strictEqual(settingsDocument.querySelectorAll('.setting-row').length, 14);
+		assert.strictEqual(settingsDocument.querySelectorAll('.setting-row').length, 15);
+		assert.strictEqual((settingsDocument.getElementById('setting-chat-agentDirectories') as HTMLTextAreaElement).value, 'shared/agents');
 		assert.strictEqual((settingsDocument.getElementById('setting-chat-toolsExclude') as HTMLTextAreaElement).value, 'memory');
 		assert.strictEqual((settingsDocument.getElementById('setting-chat-modelSelector-id') as HTMLInputElement).value, 'gpt');
 		const taskDirInput = settingsDocument.getElementById('setting-tasksDir') as HTMLInputElement;
@@ -1189,6 +1301,52 @@ suite('BoardPanel Settings', () => {
 			40,
 			'board refresh must clamp the column scroll position when content shrinks',
 		);
+		Object.defineProperty(dom.window.HTMLElement.prototype, 'scrollWidth', {
+			configurable: true,
+			get() { return 1000; },
+		});
+		Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', {
+			configurable: true,
+			get() { return 200; },
+		});
+		const initialBoard = document.getElementById('board') as HTMLElement;
+		initialBoard.scrollLeft = 240;
+		dispatchWebviewMessage(dom, {
+			type: 'board/state',
+			selectedTaskId: edited.id,
+			snapshot: renderedBoardSnapshot,
+		});
+		assert.strictEqual(
+			(document.getElementById('board') as HTMLElement).scrollLeft,
+			240,
+			'board refresh must preserve the horizontal board scroll position',
+		);
+
+		const updatedDetail = detailViewFor({
+			...edited,
+			title: 'Live task update',
+			sections: { ...edited.sections, Request: 'Updated while running' },
+		}, false);
+		dispatchWebviewMessage(dom, { type: 'task/detail', task: updatedDetail });
+		assert.ok(document.getElementById('detailBackdrop')?.classList.contains('open'));
+		assert.strictEqual(document.querySelector('#detail .modal-title')?.textContent, 'Live task update');
+
+		clickElement(document.getElementById('settingsToggle'));
+		assert.ok(document.getElementById('settingsBackdrop')?.classList.contains('open'));
+		dispatchWebviewMessage(dom, { type: 'task/detail', task: updatedDetail, preserveOpenModal: true });
+		assert.ok(document.getElementById('settingsBackdrop')?.classList.contains('open'));
+		assert.ok(!document.getElementById('detailBackdrop')?.classList.contains('open'));
+
+		clickElement(document.getElementById('settingsClose'));
+		clickElement(document.getElementById('newTaskToggle'));
+		const newTaskTitle = document.getElementById('newTaskInput') as HTMLInputElement;
+		const newTaskDescription = document.getElementById('newTaskDescription') as HTMLTextAreaElement;
+		newTaskTitle.value = 'Draft task';
+		newTaskDescription.value = 'Keep this draft';
+		dispatchWebviewMessage(dom, { type: 'task/detail', task: updatedDetail, preserveOpenModal: true });
+		assert.ok(document.getElementById('newTaskBackdrop')?.classList.contains('open'));
+		assert.strictEqual(newTaskTitle.value, 'Draft task');
+		assert.strictEqual(newTaskDescription.value, 'Keep this draft');
 
 		dispatchWebviewMessage(dom, { type: 'task/detail', task: detailViewFor(edited, false) });
 		const unavailable = Array.from(document.querySelectorAll('button'))

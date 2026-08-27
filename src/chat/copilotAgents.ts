@@ -18,6 +18,8 @@ export interface CopilotAgentFileSystem {
 export interface CopilotAgentDiscoveryOptions {
 	/** Workspace roots whose default Copilot custom-agent directories should be scanned. */
 	workspaceFolders?: readonly vscode.Uri[];
+	/** The configured `kanbanPilot.chat.agentDirectories` value. */
+	agentDirectories?: unknown;
 	/** The configured `chat.agentFilesLocations` value. */
 	additionalLocations?: unknown;
 	/** Override the default user-level `~/.copilot/agents` directory. */
@@ -59,7 +61,7 @@ const DEFAULT_FILE_SYSTEM: CopilotAgentFileSystem = {
  * user-level Copilot directory when names collide.
  */
 export function resolveCopilotAgentLocations(
-	options: Pick<CopilotAgentDiscoveryOptions, 'workspaceFolders' | 'additionalLocations' | 'userAgentsDirectory' | 'userClaudeAgentsDirectory' | 'userHome'> = {},
+	options: Pick<CopilotAgentDiscoveryOptions, 'workspaceFolders' | 'agentDirectories' | 'additionalLocations' | 'userAgentsDirectory' | 'userClaudeAgentsDirectory' | 'userHome'> = {},
 ): readonly AgentLocation[] {
 	const workspaceFolders = options.workspaceFolders ?? vscode.workspace.workspaceFolders?.map((folder) => folder.uri) ?? [];
 	const userHome = options.userHome ?? os.homedir();
@@ -72,6 +74,10 @@ export function resolveCopilotAgentLocations(
 				source: 'workspace',
 			});
 		}
+	}
+
+	for (const configuredLocation of configuredLocationUris(options.agentDirectories, workspaceFolders, userHome)) {
+		locations.push({ uri: configuredLocation, source: 'configured' });
 	}
 
 	for (const configuredLocation of configuredLocationUris(options.additionalLocations, workspaceFolders, userHome)) {

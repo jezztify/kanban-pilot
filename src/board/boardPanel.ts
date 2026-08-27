@@ -495,6 +495,14 @@ export const SETTING_DEFINITIONS: readonly SettingDefinition[] = [
     defaultValue: false,
   },
   {
+    key: 'chat.agentDirectories',
+    category: 'chat',
+    kind: 'array',
+    label: 'Additional agent directories',
+    description: 'Newline-separated custom-agent directories to scan. Complements VS Code chat.agentFilesLocations.',
+    defaultValue: [],
+  },
+  {
     key: 'refine.toolsInclude',
     category: 'tools',
     kind: 'array',
@@ -588,6 +596,7 @@ export const ALL_KANBAN_SETTING_KEYS: readonly string[] = [
   'chat.sessionPrefix',
   'chat.closeTabOnDone',
   'chat.resetOnApprove',
+  'chat.agentDirectories',
   'refine.toolsInclude',
   'chat.toolsExclude',
   'chat.modelSelector',
@@ -690,7 +699,7 @@ export function validateSettingValue(key: unknown, rawValue: unknown): SettingVa
         return { ok: false, error: `${definition.label} must be a list of text values.` };
       }
       if (rawValue.some((value) => /[\r\n]/.test(value) || value.length > 200)) {
-        return { ok: false, error: `${definition.label} contains an invalid tool ID.` };
+        return { ok: false, error: `${definition.label} contains an invalid value.` };
       }
       return { ok: true, value: rawValue.map((value) => value.trim()).filter(Boolean) };
     case 'modelSelector': {
@@ -895,6 +904,8 @@ export class BoardPanel {
   private taskWatcher: vscode.Disposable | undefined;
   private webviewReady = false;
   private pendingNewTaskOpen = false;
+  private taskRefreshInProgress = false;
+  private taskRefreshPending = false;
 
 	private constructor(
     surface: BoardSurface | vscode.WebviewPanel,
@@ -908,7 +919,13 @@ export class BoardPanel {
 
 		this.disposables.push(
       this.surface.onDidReceiveMessage((message) => this.onMessage(message as InMessage)),
-      this.host.onDidChange(() => {
+      this.host.onDidChange((change) => {
+        if (change?.kind === 'task' || change?.kind === 'attachment' || change?.kind === 'run') {
+          if (change.taskId === this.selectedTaskId) {
+            void this.pushDetail(true);
+          }
+          return;
+        }
         this.selectedTaskId = undefined;
         this.configureWebview();
         this.bindTaskWatcher();
@@ -961,7 +978,28 @@ export class BoardPanel {
 
   private bindTaskWatcher(): void {
     this.taskWatcher?.dispose();
-    this.taskWatcher = this.store.watch(() => void this.pushAll());
+    this.taskWatcher = this.store.watch(() => this.queueTaskRefresh());
+  }
+
+  /** Coalesces disk watcher bursts without resetting unrelated client state. */
+  private queueTaskRefresh(): void {
+    this.taskRefreshPending = true;
+    if (this.taskRefreshInProgress) {
+      return;
+    }
+
+    this.taskRefreshInProgress = true;
+    void (async () => {
+      try {
+        while (this.taskRefreshPending && !this.disposed) {
+          this.taskRefreshPending = false;
+          await this.pushBoard();
+          await this.pushDetail(true);
+        }
+      } finally {
+        this.taskRefreshInProgress = false;
+      }
+    })();
   }
 
 	static show(
@@ -1396,7 +1434,7 @@ export class BoardPanel {
 		});
 	}
 
-	private async pushDetail(): Promise<void> {
+  private async pushDetail(preserveOpenModal = false): Promise<void> {
 		if (!this.selectedTaskId) {
       await this.surface.postMessage({ type: 'task/detail', task: null });
 			return;
@@ -1428,6 +1466,7 @@ export class BoardPanel {
 
     await this.surface.postMessage({
 			type: 'task/detail',
+      preserveOpenModal,
 			task: {
 				id: task.id,
 				title: task.title,
@@ -1476,6 +1515,7 @@ export class BoardPanel {
     const agentNames = this.configuredAgentNames();
     const availableAgents = await discoverCopilotAgents({
       workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => folder.uri),
+      agentDirectories: cfg.get<unknown>('chat.agentDirectories', []),
       additionalLocations: vscode.workspace.getConfiguration('chat').get<unknown>('agentFilesLocations', {}),
     });
     await this.surface.postMessage({
@@ -2100,7 +2140,9 @@ ${bootstrapMarkup}
   .cards {
     display: flex; flex-direction: column; gap: 8px;
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
-    margin: 0 -4px; padding: 0 4px; /* room for the scrollbar without clipping card focus rings */
+    box-sizing: border-box;
+    scrollbar-gutter: stable;
+    margin: 0; padding: 0 4px; /* keep focus rings clear without extending beneath the scrollbar */
   }
   .drop-slot {
     position: relative;
@@ -2163,6 +2205,7 @@ ${bootstrapMarkup}
     box-shadow: var(--kp-shadow-card);
     padding: var(--kp-pad-card) var(--kp-pad-card) var(--kp-pad-card) calc(var(--kp-pad-card) + 5px);
     display: flex; flex-direction: column; gap: var(--kp-gap-card);
+    min-width: 0; max-width: 100%; box-sizing: border-box;
     cursor: pointer;
     transition: transform .13s, box-shadow .13s, border-color .13s;
   }
@@ -2179,7 +2222,7 @@ ${bootstrapMarkup}
   }
   .card:focus-visible { outline: 2px solid var(--col); outline-offset: 2px; }
 
-  .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+  .card-top { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 6px; }
   .card-id-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .card-id {
     font-family: "IBM Plex Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
@@ -2218,10 +2261,10 @@ ${bootstrapMarkup}
   .card-top .icon-btn:hover { color: #f43f5e; background: color-mix(in srgb, #f43f5e 16%, transparent); }
   .icon-btn:focus-visible { outline: 2px solid var(--col); outline-offset: 1px; }
 
-  .card-title { font-size: 13px; font-weight: 600; line-height: 1.35; }
+  .card-title { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; line-height: 1.35; }
 
-  .card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .card-foot-actions { display: flex; gap: 6px; }
+  .card-foot { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-foot-actions { display: flex; min-width: 0; gap: 6px; margin-left: auto; }
 
   /*
    * Status is the one thing on a card that must out-shout the column hue —
@@ -2281,6 +2324,7 @@ ${bootstrapMarkup}
     color: var(--col-text);
     border: 1px solid var(--col-line);
     border-radius: var(--kp-radius-button); padding: 5px 10px;
+    max-width: 100%;
     cursor: pointer; transition: background .13s, color .13s, box-shadow .13s;
   }
   /*
@@ -2436,9 +2480,11 @@ ${bootstrapMarkup}
   .modal-section-body ul.contains-task-list ul { list-style: none; padding-left: 22px; }
   .modal-section-body li.task-list-item { list-style: none; }
   .modal-section-body li.task-list-item > label {
-    display: inline-flex; align-items: flex-start; gap: 8px;
+    display: inline;
   }
-  .modal-section-body .task-list-item-checkbox { margin: 5px 0 0; flex: none; }
+  .modal-section-body .task-list-item-checkbox {
+    margin: 0 8px 0 0; vertical-align: text-top;
+  }
   .modal-section-body blockquote {
     margin: 10px 0; border-left: 3px solid var(--col);
     padding: 4px 0 4px 12px; color: var(--vscode-descriptionForeground);
@@ -2664,6 +2710,7 @@ ${bootstrapMarkup}
   let selectedSettingsCategory = DEFAULT_SETTINGS_CATEGORY;
   let boardRenderGeneration = 0;
   let renderedBoardTaskSetId = null;
+  let boardScrollLeft = 0;
   const columnScrollTops = new Map();
 
   function el(tag, className, text) {
@@ -2879,6 +2926,13 @@ ${bootstrapMarkup}
     if (persist) { columnScrollTops.set(columnId, restored); }
   }
 
+  function restoreBoardScroll(board, persist = false) {
+    const maxScrollLeft = Math.max(0, board.scrollWidth - board.clientWidth);
+    const restored = Math.min(Math.max(0, boardScrollLeft), maxScrollLeft);
+    board.scrollLeft = restored;
+    if (persist) { boardScrollLeft = restored; }
+  }
+
   function renderBoard(snapshot, selectedId) {
     const generation = ++boardRenderGeneration;
     const warn = document.getElementById('warn');
@@ -2890,6 +2944,7 @@ ${bootstrapMarkup}
     const board = document.getElementById('board');
     const taskSetId = typeof snapshot.activeTaskSetId === 'string' ? snapshot.activeTaskSetId : '';
     if (renderedBoardTaskSetId === taskSetId) {
+      boardScrollLeft = board.scrollLeft;
       for (const existingColumn of board.querySelectorAll('.column[data-column-id]')) {
         const existingCards = existingColumn.querySelector('.cards');
         if (existingCards) {
@@ -2898,6 +2953,7 @@ ${bootstrapMarkup}
       }
     } else {
       columnScrollTops.clear();
+      boardScrollLeft = 0;
     }
     renderedBoardTaskSetId = taskSetId;
     board.textContent = '';
@@ -2999,8 +3055,12 @@ ${bootstrapMarkup}
       renderedColumns.push({ id: column.id, cards });
       restoreColumnScroll(cards, column.id);
     }
+    restoreBoardScroll(board);
     requestAnimationFrame(() => {
       if (generation !== boardRenderGeneration) { return; }
+      if (board.isConnected !== false) {
+        restoreBoardScroll(board, true);
+      }
       for (const rendered of renderedColumns) {
         if (rendered.cards.isConnected !== false) {
           restoreColumnScroll(rendered.cards, rendered.id, true);
@@ -3320,7 +3380,9 @@ ${bootstrapMarkup}
 
   function closeDetail() {
     document.getElementById('detailBackdrop').classList.remove('open');
-    document.getElementById('detail').textContent = '';
+    const modal = document.getElementById('detail');
+    modal.textContent = '';
+    delete modal.dataset.taskId;
     editingTaskId = null;
     vscode.postMessage({ type: 'task/deselect' });
   }
@@ -3356,23 +3418,36 @@ ${bootstrapMarkup}
     Promise.resolve(renderResult).catch(() => markMermaidUnavailable(root));
   }
 
-  function renderDetail(task) {
+  function renderDetail(task, preserveOpenModal = false) {
     const backdrop = document.getElementById('detailBackdrop');
     const modal = document.getElementById('detail');
-    modal.textContent = '';
 
     if (!task) {
       backdrop.classList.remove('open');
+      modal.textContent = '';
+      delete modal.dataset.taskId;
       editingTaskId = null;
       return;
     }
+    const detailWasOpen = backdrop.classList.contains('open');
+    const settingsOpen = document.getElementById('settingsBackdrop').classList.contains('open');
+    const newTaskOpen = document.getElementById('newTaskBackdrop').classList.contains('open');
+    // A background refresh must not replace a dialog the user is actively
+    // using. The selected task remains host-side and will refresh when its
+    // detail dialog is next opened.
+    if (preserveOpenModal && !detailWasOpen && (settingsOpen || newTaskOpen)) {
+      return;
+    }
+    const retainedScrollTop = modal.dataset.taskId === task.id
+      ? modal.querySelector('.modal-body')?.scrollTop || 0
+      : 0;
+    modal.textContent = '';
+    modal.dataset.taskId = task.id;
     editingTaskId = null;
     backdrop.classList.add('open');
     // Set on the backdrop, not the modal: the backdrop's radial wash reads the
     // same hue, and .modal inherits it from here.
     applyAccent(backdrop, task.state);
-    document.getElementById('newTaskBackdrop').classList.remove('open'); // mutually exclusive with New Task
-    document.getElementById('settingsBackdrop').classList.remove('open'); // and with Settings
     modal.setAttribute('aria-label', 'Task detail for ' + task.title + ' — ' + task.typeLabel);
 
     const head = el('div', 'modal-head');
@@ -3480,6 +3555,14 @@ ${bootstrapMarkup}
     }
 
     modal.appendChild(body);
+    if (retainedScrollTop) {
+      const restore = () => {
+        if (!body.isConnected) { return; }
+        body.scrollTop = Math.min(retainedScrollTop, Math.max(0, body.scrollHeight - body.clientHeight));
+      };
+      restore();
+      requestAnimationFrame(restore);
+    }
     renderMermaidInDetail(modal);
   }
 
@@ -3965,7 +4048,7 @@ ${bootstrapMarkup}
         pendingFocusTaskId = null;
       }
     } else if (msg.type === 'task/detail') {
-      renderDetail(msg.task);
+      renderDetail(msg.task, msg.preserveOpenModal === true);
     } else if (msg.type === 'task/editError') {
       const error = document.getElementById('taskEditError');
       if (error && (!msg.taskId || msg.taskId === editingTaskId)) {

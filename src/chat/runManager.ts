@@ -41,7 +41,9 @@ import {
 const MAX_PROPOSALS_PER_RUN = 5;
 const RECEIPT_GRACE_MS = 250;
 const RECEIPT_POLL_MS = 10;
-const LATE_RECEIPT_INITIAL_DELAY_MS = 500;
+// The fallback must remain responsive when watcher events are coalesced with
+// the timeout write; defer only long enough to let the usual watcher win.
+const LATE_RECEIPT_INITIAL_DELAY_MS = 50;
 const LATE_RECEIPT_GRACE_MS = 5_000;
 const POST_RECEIPT_PROPOSAL_INITIAL_DELAY_MS = 50;
 const POST_RECEIPT_PROPOSAL_POLL_MS = 50;

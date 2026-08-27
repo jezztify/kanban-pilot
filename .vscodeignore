@@ -11,6 +11,7 @@ dist/board/**
 dist/chat/**
 dist/model/**
 dist/test/**
+dist-test/**
 .gitignore
 .yarnrc
 webpack.config.js

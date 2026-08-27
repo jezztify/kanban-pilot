@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -261,6 +261,14 @@
           "default": false,
           "description": "Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default: Develop and Validate deliberately continue the same conversation Refine started, and every prompt inlines the current task content regardless, which is the actual mitigation for stale agent reasoning."
         },
+        "kanbanPilot.chat.agentDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional custom-agent directories to scan, one path per entry. Complements VS Code's chat.agentFilesLocations setting."
+        },
         "kanbanPilot.refine.toolsInclude": {
           "type": "array",
           "items": {
@@ -366,8 +374,8 @@
     "compile": "webpack",
     "watch": "webpack --watch",
     "package": "webpack --mode production --devtool hidden-source-map",
-    "compile-tests": "tsc -p . --outDir dist",
-    "watch-tests": "tsc -p . -w --outDir dist",
+    "compile-tests": "tsc -p . --outDir dist-test",
+    "watch-tests": "tsc -p . -w --outDir dist-test",
     "install:skill:claude": "node scripts/install-skill.mjs claude",
     "install:skill:copilot": "node scripts/install-skill.mjs copilot",
     "test:install-skill": "node --test scripts/install-skill.test.mjs",
