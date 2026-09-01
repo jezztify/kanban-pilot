@@ -31,12 +31,16 @@ import {
 	validateSettingValue,
 } from '../board/boardPanel';
 import { Executor } from '../chat/executor';
+import { formatProgressLine } from '../chat/progress';
+import { DEFAULT_FEED_LIMIT } from '../chat/transcriptTail';
 import { CommandExecutor, RunManager } from '../chat/runManager';
 import { formatReceipt } from '../chat/receipt';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
 import {
+	Column,
 	encodePendingOutcome,
 	parseTaskDetailSections,
+	Status,
 	taskAttachmentReference,
 	taskFromRaw,
 	newTaskFile,
@@ -98,6 +102,31 @@ function detailViewFor(task: {
 	id: string;
 	title: string;
 	sections: Record<string, string>;
+	state?: Column;
+	stateLabel?: string;
+	status?: Status;
+	primary?: ReturnType<typeof primaryAction>;
+	pending?: {
+		gate: string;
+		label: string;
+		description: string;
+		stage: string;
+		result: string;
+		runId: string;
+	};
+	secondary?: ReturnType<typeof primaryAction>;
+	staleCompletions?: readonly {
+		stage: string;
+		runId: string;
+		latestRunId?: string;
+		summary: string;
+	}[];
+	feed?: readonly {
+		runId: string;
+		taskId: string;
+		at: string;
+		note: string;
+	}[];
 	attachments?: readonly {
 		name: string;
 		relativePath: string;
@@ -111,9 +140,9 @@ function detailViewFor(task: {
 		title: task.title,
 		type: 'feature',
 		typeLabel: 'Feature',
-		state: 'backlog',
-		stateLabel: 'Backlog',
-		status: canEdit ? 'idle' : 'running',
+		state: task.state ?? 'backlog',
+		stateLabel: task.stateLabel ?? 'Backlog',
+		status: task.status ?? (canEdit ? 'idle' : 'running'),
 		canEdit,
 		request: task.sections.Request ?? '',
 		refined: task.sections.Refined ?? '',
@@ -122,9 +151,15 @@ function detailViewFor(task: {
 		refinedHtml: renderTaskMarkdown(task.sections.Refined ?? '', task.attachments ?? []),
 		scopeHtml: renderTaskMarkdown(task.sections.Scope ?? '', task.attachments ?? []),
 		lastLog: task.sections.Log ?? '',
+		feed: task.feed ?? [],
 		attachments: task.attachments ?? [],
 		moveTargets: [{ id: 'backlog', label: 'Backlog' }],
-		secondary: null,
+		primary: task.primary === undefined
+			? primaryAction(task.state ?? 'backlog', task.status ?? (canEdit ? 'idle' : 'running'))
+			: task.primary,
+		pending: task.pending ?? null,
+		staleCompletions: task.staleCompletions ?? [],
+		secondary: task.secondary === undefined ? null : task.secondary,
 	};
 }
 
@@ -698,6 +733,100 @@ suite('BoardPanel Settings', () => {
 				'backend run updates must not publish complete board or settings payloads',
 			);
 			assert.strictEqual(posted[0]?.preserveOpenModal, true);
+			assert.strictEqual((posted[0]?.task as { primary?: string } | undefined)?.primary, 'accept');
+		} finally {
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('projects only the selected task’s latest valid progress entries', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-progress-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-progress-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const surface = new BrowserBoardSurface('progress-test');
+		const posted: Record<string, unknown>[] = [];
+		const postMessage = surface.postMessage.bind(surface);
+		surface.postMessage = (message) => {
+			posted.push(message);
+			return postMessage(message);
+		};
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		const internal = board as unknown as {
+			selectedTaskId: string | undefined;
+			pushAll(): Promise<void>;
+			pushDetail(preserveOpenModal?: boolean): Promise<void>;
+		};
+		try {
+			const task = await store.create('Progress detail');
+			const otherTask = await store.create('Other detail');
+			await internal.pushAll();
+			posted.length = 0;
+
+			// One more than the feed's bound, so the oldest entry is the one dropped.
+			// The count is driven by the shared constant rather than a literal: the
+			// bound moved from 20 to 200 when the feed became a scroll box, and a
+			// hard-coded expectation silently encodes whichever value was current.
+			const base = Date.UTC(2026, 7, 26, 4, 31, 7);
+			const entries = Array.from({ length: DEFAULT_FEED_LIMIT + 1 }, (_, index) => formatProgressLine({
+				runId: `r${index + 1}`,
+				taskId: task.id,
+				at: `${new Date(base + index * 1000).toISOString().slice(0, 19)}Z`,
+				note: `entry ${index + 1}`,
+			}));
+			await store.appendLog(task.id, `- progress run:other task:${otherTask.id} at:2026-08-26T04:31:06Z note:"other task"`);
+			await store.appendLog(task.id, `- progress run:bad task:${task.id} note:"missing timestamp"`);
+			await store.appendLog(task.id, '- progress run:bad task:TASK-999 at:2026-08-26T04:31:05Z note:"misrouted"');
+			for (const entry of entries) {
+				await store.appendLog(task.id, entry);
+			}
+			const latestLog = `- run:r-final task:${task.id} stage:develop result:ok note:"terminal"`;
+			await store.appendLog(task.id, latestLog);
+
+			internal.selectedTaskId = task.id;
+			await internal.pushDetail();
+			const detail = posted.filter((message) => message.type === 'task/detail').at(-1) as {
+				task?: { feed?: { note: string }[]; lastLog?: string };
+			} | undefined;
+			assert.deepStrictEqual(detail?.task?.feed?.map((entry) => entry.note), Array.from(
+				{ length: DEFAULT_FEED_LIMIT },
+				(_, index) => `entry ${index + 2}`,
+			));
+			assert.strictEqual(detail?.task?.lastLog, latestLog);
+
+			posted.length = 0;
+			await store.appendLog(otherTask.id, `- progress run:other task:${otherTask.id} at:2026-08-26T04:31:07Z note:"other only"`);
+			internal.selectedTaskId = otherTask.id;
+			await internal.pushDetail();
+			const otherDetail = posted.filter((message) => message.type === 'task/detail').at(-1) as {
+				task?: { feed?: { note: string }[] };
+			} | undefined;
+			assert.deepStrictEqual(otherDetail?.task?.feed?.map((entry) => entry.note), ['other only']);
 		} finally {
 			board.dispose();
 			try {
@@ -1520,6 +1649,60 @@ suite('BoardPanel Settings', () => {
 		assert.ok(document.getElementById('detailBackdrop')?.classList.contains('open'));
 		assert.strictEqual(document.querySelector('#detail .modal-title')?.textContent, 'Live task update');
 
+		const blockedActivity = detailViewFor({
+			...edited,
+			title: 'Blocked activity',
+			state: 'in-progress',
+			stateLabel: 'In Progress',
+			status: 'blocked',
+			feed: [
+				{
+					runId: 'r1',
+					taskId: edited.id,
+					at: '2026-08-26T04:31:07Z',
+					note: '<button type="button">literal</button><script>bad()</script>',
+				},
+				{
+					runId: 'r2',
+					taskId: edited.id,
+					at: '2026-08-26T04:31:08Z',
+					note: 'second activity',
+				},
+			],
+		});
+		dispatchWebviewMessage(dom, { type: 'task/detail', task: blockedActivity });
+		const activityLabel = Array.from(document.querySelectorAll('#detail .modal-section-label'))
+			.find((label) => label.textContent === 'Activity');
+		assert.ok(activityLabel);
+		const activity = activityLabel?.parentElement;
+		assert.ok(activity);
+		const activityRows = Array.from(activity?.querySelectorAll('.activity-row') ?? []);
+		assert.strictEqual(activityRows.length, 2);
+		assert.deepStrictEqual(activityRows.map((row) => row.querySelector('.activity-note')?.textContent), [
+			'<button type="button">literal</button><script>bad()</script>',
+			'second activity',
+		]);
+		assert.deepStrictEqual(activityRows.map((row) => row.querySelector('time')?.textContent), [
+			'2026-08-26T04:31:07Z',
+			'2026-08-26T04:31:08Z',
+		]);
+		assert.strictEqual(activityRows[0].querySelector('time')?.getAttribute('datetime'), '2026-08-26T04:31:07Z');
+		assert.strictEqual(activity?.querySelector('button, input, select, textarea, a'), null);
+		assert.strictEqual(activity?.querySelector('script'), null);
+		assert.strictEqual(
+			activity?.querySelector('.activity-blocked')?.textContent,
+			'This task is blocked; approval or action is required in the VS Code host.',
+		);
+
+		const emptyActivity = detailViewFor({ ...edited, title: 'No activity' });
+		dispatchWebviewMessage(dom, { type: 'task/detail', task: emptyActivity });
+		const emptyLabel = Array.from(document.querySelectorAll('#detail .modal-section-label'))
+			.find((label) => label.textContent === 'Activity');
+		const emptySection = emptyLabel?.parentElement;
+		assert.ok(emptySection);
+		assert.strictEqual(emptySection?.querySelectorAll('.activity-row').length, 0);
+		assert.strictEqual(emptySection?.querySelector('.activity-empty')?.textContent, 'No activity recorded yet.');
+
 		clickElement(document.getElementById('settingsToggle'));
 		assert.ok(document.getElementById('settingsBackdrop')?.classList.contains('open'));
 		dispatchWebviewMessage(dom, { type: 'task/detail', task: updatedDetail, preserveOpenModal: true });
@@ -2169,6 +2352,7 @@ suite('BoardPanel Settings', () => {
 					lastLog: '',
 					pending: pendingView,
 					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
+					primary: 'continue',
 					secondary: null,
 				},
 			});
@@ -2181,6 +2365,201 @@ suite('BoardPanel Settings', () => {
 				JSON.parse(JSON.stringify(posted.at(-1))),
 				{ type: 'pending/apply', taskId: task.id },
 			);
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('keeps task-detail primary actions ordered and consistent in read and edit modes', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-detail-actions-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-detail-actions-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardDetailActionsTest',
+			'Kanban Pilot Detail Actions Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Detail action task');
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({
+							postMessage(message: unknown) {
+								posted.push(message);
+							},
+						}),
+					});
+				},
+			});
+
+			const actionLabels = () => Array.from(dom!.window.document.querySelectorAll('#detail .modal-actions button'))
+				.map((button) => button.textContent);
+			const buttonWithText = (text: string) => Array.from(dom!.window.document.querySelectorAll('#detail button'))
+				.find((button) => button.textContent === text);
+			const render = (detail: Parameters<typeof detailViewFor>[0], canEdit = true) => {
+				dispatchWebviewMessage(dom!, { type: 'task/detail', task: detailViewFor(detail, canEdit) });
+			};
+			const matrix: readonly {
+				state: Column;
+				stateLabel: string;
+				status: Status;
+				afterChat: readonly string[];
+				canEdit?: boolean;
+				secondary?: ReturnType<typeof primaryAction>;
+			}[] = [
+				{ state: 'backlog', stateLabel: 'Backlog', status: 'idle', afterChat: ['Accept'] },
+				{ state: 'refine', stateLabel: 'Refine', status: 'idle', afterChat: ['Refine'] },
+				{ state: 'refine', stateLabel: 'Refine', status: 'blocked', afterChat: ['Refine'] },
+				{ state: 'refine', stateLabel: 'Refine', status: 'failed', afterChat: ['Refine'] },
+				{
+					state: 'scoped',
+					stateLabel: 'Scoped',
+					status: 'idle',
+					afterChat: ['Approve', 'Refine'],
+					secondary: 'refine',
+				},
+				{ state: 'approved', stateLabel: 'Approved', status: 'idle', afterChat: ['Develop'] },
+				{ state: 'in-progress', stateLabel: 'In Progress', status: 'running', afterChat: ['Stop'], canEdit: false },
+				{ state: 'in-progress', stateLabel: 'In Progress', status: 'idle', afterChat: ['Continue'] },
+				{ state: 'in-progress', stateLabel: 'In Progress', status: 'blocked', afterChat: ['Continue'] },
+				{ state: 'in-progress', stateLabel: 'In Progress', status: 'failed', afterChat: ['Continue'] },
+				{ state: 'validation', stateLabel: 'Validation', status: 'idle', afterChat: ['Validate'] },
+				{ state: 'validation', stateLabel: 'Validation', status: 'blocked', afterChat: ['Validate'] },
+				{ state: 'validation', stateLabel: 'Validation', status: 'failed', afterChat: ['Validate'] },
+				{ state: 'done', stateLabel: 'Done', status: 'idle', afterChat: ['Reopen'], secondary: 'reopen' },
+			];
+
+			for (const scenario of matrix) {
+				render({
+					id: task.id,
+					title: task.title,
+					sections: {},
+					state: scenario.state,
+					stateLabel: scenario.stateLabel,
+					status: scenario.status,
+					secondary: scenario.secondary,
+				}, scenario.canEdit ?? true);
+				const labels = actionLabels();
+				const openChatIndex = labels.indexOf('Open Chat →');
+				assert.ok(openChatIndex >= 0, `${scenario.state}/${scenario.status} includes Open Chat`);
+				assert.deepStrictEqual(labels.slice(openChatIndex + 1), scenario.afterChat);
+			}
+
+			posted.length = 0;
+			render({ id: task.id, title: task.title, sections: {}, state: 'backlog', stateLabel: 'Backlog', status: 'idle' });
+			clickElement(buttonWithText('Accept'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'action/invoke',
+				taskId: task.id,
+				action: 'accept',
+			});
+
+			posted.length = 0;
+			render({
+				id: task.id,
+				title: task.title,
+				sections: {},
+				state: 'scoped',
+				stateLabel: 'Scoped',
+				status: 'idle',
+				secondary: 'refine',
+			});
+			clickElement(buttonWithText('Approve'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'action/invoke',
+				taskId: task.id,
+				action: 'approve',
+			});
+			clickElement(buttonWithText('Refine'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'action/invoke',
+				taskId: task.id,
+				action: 'refine',
+			});
+
+			const pending = {
+				gate: 'refineToScoped',
+				label: 'Refine → Scoped',
+				description: 'Commit a successful Refine receipt into Scoped automatically.',
+				stage: 'refine',
+				result: 'ok',
+				runId: 'r-detail-pending',
+			};
+			const pendingDetail = {
+				id: task.id,
+				title: task.title,
+				sections: {},
+				state: 'refine' as const,
+				stateLabel: 'Refine',
+				status: 'idle' as const,
+				primary: 'refine' as const,
+				pending,
+			};
+			posted.length = 0;
+			render(pendingDetail);
+			let labels = actionLabels();
+			let openChatIndex = labels.indexOf('Open Chat →');
+			assert.deepStrictEqual(labels.slice(openChatIndex + 1), ['Apply Refine → Scoped']);
+			assert.strictEqual(labels.includes('Refine'), false, 'pending Apply replaces the normal primary action');
+			clickElement(buttonWithText('Apply Refine → Scoped'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'pending/apply',
+				taskId: task.id,
+			});
+
+			render({
+				id: task.id,
+				title: task.title,
+				sections: {},
+				state: 'scoped',
+				stateLabel: 'Scoped',
+				status: 'idle',
+				secondary: 'refine',
+			});
+			clickElement(buttonWithText('Edit task'));
+			assert.deepStrictEqual(actionLabels(), ['Open task file →', 'Open Chat →', 'Approve', 'Refine']);
+
+			render(pendingDetail);
+			clickElement(buttonWithText('Edit task'));
+			labels = actionLabels();
+			openChatIndex = labels.indexOf('Open Chat →');
+			assert.deepStrictEqual(labels.slice(openChatIndex + 1), ['Apply Refine → Scoped']);
+			assert.strictEqual(labels.includes('Refine'), false, 'edit mode keeps pending Apply precedence');
 		} finally {
 			dom?.window.close();
 			board.dispose();
@@ -2264,6 +2643,7 @@ suite('BoardPanel Settings', () => {
 					lastLog: candidate.summary,
 					staleCompletions: [candidate],
 					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
+					primary: 'continue',
 					secondary: null,
 				},
 			});

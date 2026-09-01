@@ -18,7 +18,7 @@ import { hashScope } from '../chat/scopeHash';
  * M3 — RunManager orchestration (PRD §6.4, §6.9). Uses a stub `Executor` so
  * these never touch real VS Code chat commands; the injection mechanism
  * itself (vscode.open, chat.open<Mode>, blockOnResponse) is already validated
- * empirically in M0 (docs/m0-findings.md) and re-proving it here would be
+ * empirically in M0 (docs/research/m0-findings.md) and re-proving it here would be
  * slow and redundant, not more rigorous.
  *
  * A stage run's phase 2 is fire-and-forget by design (§6.4 — the board

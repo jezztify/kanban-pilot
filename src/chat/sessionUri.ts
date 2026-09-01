@@ -18,7 +18,7 @@ import * as vscode from 'vscode';
  *
  * M0 confirmed (against VS Code 1.133) that this binding works — two derived
  * URIs open two distinct tabs, and reopening one refocuses it rather than
- * forking a second conversation — see docs/m0-findings.md findings 4–5.
+ * forking a second conversation — see docs/research/m0-findings.md findings 4–5.
  */
 
 export const CHAT_SESSION_SCHEME = 'vscode-chat-session';

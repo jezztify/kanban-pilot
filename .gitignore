@@ -6,3 +6,6 @@ node_modules
 .vscode/
 .github/
 dist-test/
+# Real-time hook feed spool (TASK-015); .kanban-pilot/ itself is deliberately tracked.
+.kanban-pilot/.hook-spool.jsonl
+state/

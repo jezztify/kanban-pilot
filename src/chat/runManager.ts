@@ -12,6 +12,8 @@ import { TaskStore } from '../model/taskStore';
 import { parseAuditEvents } from '../model/taskLog';
 import type { AuditEventInput, AuditOutcome, AuditStage } from '../model/taskLog';
 import { AgentNameOverrides, resolveAgentName } from './agentNames';
+import { TranscriptTailService } from './transcriptTail';
+import type { HookSpoolReceiver } from './hookSpool';
 import { Executor, ExecutorResult } from './executor';
 import { TASK_ATTACHMENT_CONTEXT, loadPromptTemplate, renderTemplate } from './promptTemplates';
 import { proposalFingerprint, proposalsForRun } from './proposals';
@@ -218,6 +220,7 @@ const STAGES_THAT_MAY_PROPOSE: ReadonlySet<Stage> = new Set<Stage>(['develop', '
 
 interface RunManagerConfig {
 	mode: string;
+	transcriptFeed: boolean;
 	sessionPrefix: string;
 	toolsIncludeForRefine: string[];
 	toolsExclude: string[];
@@ -237,6 +240,7 @@ function readConfig(): RunManagerConfig {
 	const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 	return {
 		mode: cfg.get<string>('chat.mode', 'agent'),
+		transcriptFeed: cfg.get<boolean>('chat.transcriptFeed', false),
 		sessionPrefix: cfg.get<string>('chat.sessionPrefix', 'kanban-pilot-'),
 		toolsIncludeForRefine: cfg.get<string[]>('refine.toolsInclude', []),
 		toolsExclude: cfg.get<string[]>('chat.toolsExclude', ['memory', 'resolveMemoryFileUri']),
@@ -466,6 +470,7 @@ export class RunManager {
 	private readonly changed = new vscode.EventEmitter<RunManagerChange>();
 	private readonly progressTimers = new Set<ReturnType<typeof setInterval>>();
 	private disposed = false;
+	private readonly hookFeedSubscription: vscode.Disposable | undefined;
 
 	constructor(
 		private readonly store: TaskStore,
@@ -474,8 +479,18 @@ export class RunManager {
 		private readonly tabGroups: TabGroupsLike = vscode.window.tabGroups,
 		private readonly executeCommand: CommandExecutor = vscode.commands.executeCommand.bind(vscode.commands),
 		private readonly trace: (message: string) => void = () => {},
+		/** Optional read-only transcript tail (TASK-008); absent in tests and when unwired. */
+		readonly transcriptTail?: TranscriptTailService,
+		/** Optional real-time hook feed receiver (TASK-015). */
+		readonly hookSpool?: HookSpoolReceiver,
 	) {
 		this.concurrency = coordinatorFor(workspaceFolder, store);
+		// A hook spool write touches no task file, so nothing would republish the
+		// projection on its own. Re-firing it as a run change routes it through the
+		// same path the board and the browser already listen on.
+		this.hookFeedSubscription = hookSpool?.onDidChange((taskId) => {
+			this.notify({ kind: 'progress', taskId });
+		});
 	}
 
 	onDidChange(listener: (change: RunManagerChange) => void): vscode.Disposable {
@@ -502,6 +517,7 @@ export class RunManager {
 			return;
 		}
 		this.disposed = true;
+		this.hookFeedSubscription?.dispose();
 		for (const { taskId, runId } of this.ownedReservations.values()) {
 			this.releaseReservation(taskId, runId);
 		}
@@ -1223,6 +1239,14 @@ export class RunManager {
 			}
 			const executorRunKey = this.reservationKey(taskId, runId);
 			this.activeExecutorRuns.set(executorRunKey, latest);
+			if (cfg.transcriptFeed) {
+				// A first run has no copilot_session_id yet — it is harvested from the
+				// turn's terminal result — so the tail falls back to watching the
+				// directory for a file that was not there when this run started.
+				await this.transcriptTail?.start(taskId, {
+					...(latest.copilotSessionId ? { sessionId: latest.copilotSessionId } : {}),
+				});
+			}
 			const outcome = await raceWithTimeout(
 				this.executor.run(latest, this.store.fileFor(latest.id), prompt, stage, {
 					mode: cfg.mode,
@@ -1254,6 +1278,7 @@ export class RunManager {
 				result: { ok: false, error: e instanceof Error ? e.message : String(e) },
 			});
 		} finally {
+			this.transcriptTail?.stop(taskId);
 			this.activeExecutorRuns.delete(this.reservationKey(taskId, runId));
 			clearInterval(progressTimer);
 			this.progressTimers.delete(progressTimer);

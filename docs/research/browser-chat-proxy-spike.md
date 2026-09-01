@@ -9,8 +9,8 @@ agent-emitted activity feed as the smallest viable slice.**
 ## Question and boundaries
 
 The realtime **browser view** — the board served over HTTP by
-[`RealtimeBoardServer`](../src/http/realtimeBoardServer.ts) and rendered through
-[`BrowserBoardSurface`](../src/http/browserBoardSurface.ts) — currently shows a remote viewer only
+[`RealtimeBoardServer`](../../src/http/realtimeBoardServer.ts) and rendered through
+[`BrowserBoardSurface`](../../src/http/browserBoardSurface.ts) — currently shows a remote viewer only
 task *frontmatter* (title, id, type, column, status, run id, `pendingOutcome`). While a task runs,
 a remote viewer sees the card flip to `running` and later to `done`/`blocked`, but has **zero
 visibility into the conversation in between**.
@@ -33,7 +33,7 @@ this spike; every code reference below is read-only.
 
 ## Baseline decision: PRD §6.10
 
-[PRD §6.10](./PRD.md) ("Why the webview does not mirror the transcript") already ruled out
+[PRD §6.10](../PRD.md) ("Why the webview does not mirror the transcript") already ruled out
 reproducing the chat **inside the editor board webview**, for three reasons:
 
 | Route | Why it fails (per §6.10) |
@@ -43,13 +43,13 @@ reproducing the chat **inside the editor board webview**, for three reasons:
 | `workbench.action.chat.export` | Opens a `showSaveDialog` — interactive, so unusable for continuous mirroring. |
 
 §6.10's escape hatch is **"dock the real chat"**: the task's actual VS Code chat editor opens
-beside the board (`dockTaskChat()` in [runManager.ts](../src/chat/runManager.ts)). It is not a
+beside the board (`dockTaskChat()` in [runManager.ts](../../src/chat/runManager.ts)). It is not a
 copy of the chat — it *is* the chat, so interactive tool-approval prompts work in place.
 
 **How the browser surface differs — the crux of this spike.** A remote browser cannot open or
 embed a VS Code chat editor tab. The `vscode-chat-session://` editor lives entirely inside the
 desktop VS Code workbench; the browser view is a plain HTML document served over HTTP with a
-`acquireVsCodeApi` shim (see [browserBoardSurface.ts](../src/http/browserBoardSurface.ts) header).
+`acquireVsCodeApi` shim (see [browserBoardSurface.ts](../../src/http/browserBoardSurface.ts) header).
 So the one escape hatch §6.10 relies on is **structurally unavailable** to the browser. The
 browser cannot fall back to "the real chat"; whatever it shows about the conversation, it must
 carry over the wire itself. That is what makes this question genuinely open for the browser and
@@ -74,20 +74,20 @@ Confirmed facts:
 - **The projection carries no chat content.** `projection()` returns only
   `{ revision, activeTaskSet, snapshot }`, where `snapshot` is `host.store.snapshot()` — the task
   frontmatter model. There is no transcript, message, or tool-call field anywhere in it
-  ([realtimeBoardServer.ts](../src/http/realtimeBoardServer.ts) lines 203–210).
+  ([realtimeBoardServer.ts](../../src/http/realtimeBoardServer.ts) lines 203–210).
 - **Broadcast is fan-out to a live `Set<ServerResponse>`** with a 20-second heartbeat; there is
   no server-side replay buffer for board events. If a listener is not currently connected it
   simply misses the write (`if (!response.writableEnded)`), and the next `publish()` sends a
   *full* projection, so a reconnecting browser re-syncs from a complete snapshot rather than a
-  delta log ([realtimeBoardServer.ts](../src/http/realtimeBoardServer.ts) lines 248–260).
+  delta log ([realtimeBoardServer.ts](../../src/http/realtimeBoardServer.ts) lines 248–260).
 - **`OUTBOX_LIMIT = 256` is client→server, not chat.** It lives in
-  [browserBoardSurface.ts](../src/http/browserBoardSurface.ts) (line 7) and bounds the *inbound*
+  [browserBoardSurface.ts](../../src/http/browserBoardSurface.ts) (line 7) and bounds the *inbound*
   message outbox — board UI messages the browser posts back to `POST /session/messages` while it
   is between event streams — not any outbound chat stream. A chat feed would not reuse this
   buffer; it would ride the outbound SSE channel, which today has no per-message replay at all.
 - **Auth is a shared bearer token.** `tokenMatches()` accepts an `Authorization: Bearer`, a
   `?token=` query parameter, or (for GET resources) a cookie, compared with `timingSafeEqual`
-  ([realtimeBoardServer.ts](../src/http/realtimeBoardServer.ts) lines 149–164, 344). The endpoint
+  ([realtimeBoardServer.ts](../../src/http/realtimeBoardServer.ts) lines 149–164, 344). The endpoint
   can bind beyond loopback and be fronted by a `publicUrl`, so anyone with the link/token sees
   everything the stream carries.
 
@@ -97,10 +97,10 @@ Statuses mean **Viable**, **Viable but fragile**, or **Blocked**.
 
 | # | Source | Verdict | Evidence |
 | --- | --- | --- | --- |
-| A | VS Code chat extension API | **Blocked** | No API exposes another participant's/session's turns. `ChatContext.history` is self-only (PRD §6.10). `vscode.chat.createChatParticipant`, `vscode.lm.selectChatModels`, and `LanguageModelChat.sendRequest` are *write* paths (register a participant, issue a fresh model request); none reads the Copilot panel's live transcript. The Copilot executor's `blockOnResponse` returns a terminal result, not a message stream ([executor.ts](../src/chat/executor.ts)). |
-| B | Persisted on-disk chat session | **Viable but fragile** | The session id is derived by [sessionUri.ts](../src/chat/sessionUri.ts) (`kanban-pilot-[set-]TASK-nnn`, or Copilot's concrete `copilotSessionId` once a prompt has run) and persisted under `getChatSessionStorageResource(storageRoot, sessionId)`. It is reachable from the extension host as a file, but §6.10 already records the format is internal/undocumented with no flush-timing guarantee. A file-watch could tail it and forward deltas over SSE, but the shape is unversioned and can change under us; parsing partially-flushed JSON is racy; and lag is unbounded because flush timing is not ours to control. Structurally possible, operationally brittle. |
+| A | VS Code chat extension API | **Blocked** | No API exposes another participant's/session's turns. `ChatContext.history` is self-only (PRD §6.10). `vscode.chat.createChatParticipant`, `vscode.lm.selectChatModels`, and `LanguageModelChat.sendRequest` are *write* paths (register a participant, issue a fresh model request); none reads the Copilot panel's live transcript. The Copilot executor's `blockOnResponse` returns a terminal result, not a message stream ([executor.ts](../../src/chat/executor.ts)). |
+| B | Persisted on-disk chat session | **Viable but fragile** | The session id is derived by [sessionUri.ts](../../src/chat/sessionUri.ts) (`kanban-pilot-[set-]TASK-nnn`, or Copilot's concrete `copilotSessionId` once a prompt has run) and persisted under `getChatSessionStorageResource(storageRoot, sessionId)`. It is reachable from the extension host as a file, but §6.10 already records the format is internal/undocumented with no flush-timing guarantee. A file-watch could tail it and forward deltas over SSE, but the shape is unversioned and can change under us; parsing partially-flushed JSON is racy; and lag is unbounded because flush timing is not ours to control. Structurally possible, operationally brittle. |
 | C | `workbench.action.chat.export` | **Blocked** | Opens an interactive `showSaveDialog` (PRD §6.10). It cannot run headless per-tick, so it is unusable for continuous mirroring. |
-| D | Agent-emitted progress lines | **Viable** | The agent already writes a structured receipt to the task's `## Log` section — see the grammar in [receipt.ts](../src/chat/receipt.ts) and the audit events in [taskLog.ts](../src/model/taskLog.ts). The same append-only channel could carry optional interim `progress` lines (e.g. `progress run:<id> task:<id> note:"…"`). Because the file is the single source of truth and `RunManager.runStage()` already re-reads it ([runManager.ts](../src/chat/runManager.ts)), a file-watch on the task markdown could surface interim lines *before* the terminal receipt, project them into the SSE stream, and render them as a lightweight activity feed. This is fully within the extension's own contract — no private API, no undocumented format. **This is the smallest viable slice.** |
+| D | Agent-emitted progress lines | **Viable** | The agent already writes a structured receipt to the task's `## Log` section — see the grammar in [receipt.ts](../../src/chat/receipt.ts) and the audit events in [taskLog.ts](../../src/model/taskLog.ts). The same append-only channel could carry optional interim `progress` lines (e.g. `progress run:<id> task:<id> note:"…"`). Because the file is the single source of truth and `RunManager.runStage()` already re-reads it ([runManager.ts](../../src/chat/runManager.ts)), a file-watch on the task markdown could surface interim lines *before* the terminal receipt, project them into the SSE stream, and render them as a lightweight activity feed. This is fully within the extension's own contract — no private API, no undocumented format. **This is the smallest viable slice.** |
 | E | Process-backed / alternative executor | **Out of scope (future)** | A non-panel executor (the conditional Claude Agent SDK/CLI route noted in [claude-chat-spike.md](./claude-chat-spike.md)) would own its child process and therefore its stdout/stream, which *could* feed the browser directly. But that is a different execution surface from the current Copilot panel and is explicitly out of scope for this design. Noted for completeness only. |
 
 ## Transport delta (if a feed were built)
@@ -115,7 +115,7 @@ Only source **D** is worth costing, and it is deliberately cheap:
   snapshot re-syncs a late joiner. A chat feed has the same property *if it is modeled as
   "current feed state for the running task"* — the server can re-read the task file's log tail and
   send the current N entries on `/session/events` connect, exactly like `publish()` sends a full
-  board on connect ([realtimeBoardServer.ts](../src/http/realtimeBoardServer.ts) line 424). No new
+  board on connect ([realtimeBoardServer.ts](../../src/http/realtimeBoardServer.ts) line 424). No new
   buffer, no `OUTBOX_LIMIT`-style bound is needed on the outbound side, provided the feed is
   bounded (e.g. last K progress lines) rather than an unbounded token stream.
 - **Why not full transcript.** A token-level transcript *would* need a durable, replayable buffer
@@ -128,9 +128,9 @@ Only source **D** is worth costing, and it is deliberately cheap:
 
 The endpoint is a **shared, token-gated, potentially non-loopback** surface: `bindAddress` may be
 `0.0.0.0`/`::`, a `publicUrl` may front it, and access is a single bearer token shared with anyone
-who holds the link ([realtimeBoardServer.ts](../src/http/realtimeBoardServer.ts) lines 88–100,
+who holds the link ([realtimeBoardServer.ts](../../src/http/realtimeBoardServer.ts) lines 88–100,
 149–164). The share panel simply renders that URL/QR for distribution
-([endpointSharePanel.ts](../src/http/endpointSharePanel.ts)).
+([endpointSharePanel.ts](../../src/http/endpointSharePanel.ts)).
 
 Raw chat content is therefore the wrong thing to push here:
 

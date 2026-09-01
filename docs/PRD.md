@@ -5,7 +5,7 @@
 **Design reference:** https://flourished-costs-247065.framer.app/
 **API findings verified against:** `microsoft/vscode@main` — `chat/browser/actions/chatActions.ts`,
 `chat/common/model/chatUri.ts`, `chat/common/chatSessionsService.ts`, `base/common/network.ts`
-**Measured against:** VS Code 1.133.0 — see [M0 findings](m0-findings.md)
+**Measured against:** VS Code 1.133.0 — see [M0 findings](research/m0-findings.md)
 
 ---
 
@@ -1141,8 +1141,8 @@ no supported way to do that:
 | Route | Why it fails |
 | --- | --- |
 | Extension API | Nothing exposes another participant's session content. `ChatContext.history` gives a participant only *its own* prior turns |
-| Read the persisted session | Sessions do persist (`getChatSessionStorageResource(storageRoot, sessionId)`), but under an internal root in an undocumented format, with no flush-timing guarantee. Scraping it is fragile and laggy |
-| `workbench.action.chat.export` | Opens a `showSaveDialog` — interactive, so unusable for continuous mirroring |
+| Read the persisted session | Sessions persist under `workspaceStorage/<ws>/chatSessions/`; an extension can derive that location from its own `storageUri`, but the data is an undocumented journal. Persistence rides `onWillSaveState` with a default flush interval of about 60 seconds, so scraping is fragile and laggy |
+| `workbench.action.chat.export` | With a target URI, bypasses `showSaveDialog` and writes the export directly; calls without a target remain interactive, and export is not a live mirror |
 
 Even granting the data, a mirror **breaks exactly when it matters**. Tool-approval prompts and
 confirmations are interactive, and they are precisely the moments a run goes `blocked` and needs
@@ -1906,7 +1906,7 @@ parameter so that can remain additive.
 
 **Status legend:** ⬜ Not started · 🟡 In progress · ✅ Done · ⛔ Blocked (see Risks)
 
-**M0 detail** — command/API probe half complete ([findings](m0-findings.md)); the half needing a
+**M0 detail** — command/API probe half complete ([findings](research/m0-findings.md)); the half needing a
 signed-in Copilot host is outstanding:
 
 | Probe | Status | Result |

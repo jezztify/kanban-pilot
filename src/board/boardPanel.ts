@@ -11,7 +11,12 @@ import {
   stageForColumn,
 } from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
+import { DEFAULT_FEED_LIMIT, mergeFeedEntries } from '../chat/transcriptTail';
+import type { FeedEntry } from '../chat/transcriptTail';
+import { suppressDuplicatedTailEntries } from '../chat/hookSpool';
+import type { TranscriptFeedEntry } from '../chat/transcriptTail';
 import type { StaleCompletionCandidate } from '../chat/runManager';
+import { parseProgressEntries } from '../chat/progress';
 import {
   COLUMNS,
   COLUMN_LABELS,
@@ -389,6 +394,9 @@ export interface BoardTaskSetChange {
   taskId?: string;
   note?: string;
 }
+
+/** Most activity rows shown for a task, across both feed sources. */
+const ACTIVITY_FEED_LIMIT = DEFAULT_FEED_LIMIT;
 
 export interface BoardTaskSetHost {
   readonly ready: Promise<void>;
@@ -1442,6 +1450,41 @@ export class BoardPanel {
 		});
 	}
 
+  /**
+   * Tailed Copilot activity, when the user has opted in. A remote viewer needs a
+   * second opt-in: the browser endpoint is shared with everyone holding its
+   * link, so enabling the local pane must not widen what that link exposes.
+   *
+   * The entries are a record, not a live view — Copilot flushes its transcript
+   * in batches, so tool activity can lag by seconds to a minute (TASK-009).
+   */
+  private transcriptFeedEntries(taskId: string): TranscriptFeedEntry[] {
+    const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+    if (!cfg.get<boolean>('chat.transcriptFeed', false)) {
+      return [];
+    }
+    if (!this.surface.hostEditor && !cfg.get<boolean>('chat.transcriptFeedRemote', false)) {
+      return [];
+    }
+    return this.host.runManager.transcriptTail?.entriesFor(taskId, ACTIVITY_FEED_LIMIT) ?? [];
+  }
+
+  /**
+   * Real-time activity reported by the Copilot chat hook, if one is installed
+   * and the feed is enabled. Unlike the transcript tail this arrives at the
+   * moment of the event, which is what lets the browser board keep up.
+   */
+  private hookFeedEntries(taskId: string): FeedEntry[] {
+    const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+    if (!cfg.get<boolean>('chat.hookFeed', false)) {
+      return [];
+    }
+    if (!this.surface.hostEditor && !cfg.get<boolean>('chat.transcriptFeedRemote', false)) {
+      return [];
+    }
+    return this.host.runManager.hookSpool?.entriesFor(taskId, ACTIVITY_FEED_LIMIT) ?? [];
+  }
+
   private async pushDetail(preserveOpenModal = false): Promise<void> {
 		if (!this.selectedTaskId) {
       await this.surface.postMessage({ type: 'task/detail', task: null });
@@ -1462,6 +1505,17 @@ export class BoardPanel {
     const scope = detailSections['Scope'] ?? task.sections['Scope'] ?? '';
     const log = detailSections['Log'] ?? task.sections['Log'] ?? '';
 		const logLines = log.trim().split(/\r?\n/).filter(Boolean);
+    const progressFeed = parseProgressEntries(log, task.id)
+      .map((entry) => ({ ...entry, source: 'progress' as const }));
+    // Hook entries are the real-time source; the transcript tail is 6-53 s behind
+    // and reports the same tool calls, so its duplicates are dropped whenever the
+    // hook feed has anything to say for this task.
+    const hookFeed = this.hookFeedEntries(task.id);
+    const feed = mergeFeedEntries(
+      [...progressFeed, ...hookFeed],
+      suppressDuplicatedTailEntries(this.transcriptFeedEntries(task.id), hookFeed),
+      ACTIVITY_FEED_LIMIT,
+    );
     const attachments = await this.store.listAttachments(task.id);
     const attachmentViews = attachments.map((attachment) => ({
       name: attachment.name,
@@ -1491,11 +1545,13 @@ export class BoardPanel {
         refinedHtml: renderTaskMarkdown(refined, attachmentViews),
         scopeHtml: renderTaskMarkdown(scope, attachmentViews),
 				lastLog: logLines.at(-1) ?? '',
+        feed,
 				originTask: task.originTask,
         attachments: attachmentViews,
         pending: pendingView(task),
         staleCompletions,
         moveTargets: COLUMNS.map((id) => ({ id, label: COLUMN_LABELS[id] })),
+				primary: primaryAction(task.state, task.status),
 				// The card face shows one button (primary); this is where the
 				// prototype's un-rendered secondary action (§5.2) lives instead.
 				secondary: secondaryAction(task.state),
@@ -1987,6 +2043,8 @@ ${bootstrapMarkup}
     .agent-setting-row { grid-template-columns: 1fr; gap: 6px; }
     .agent-setting-actions { justify-content: flex-end; }
     .setting-model-fields { grid-template-columns: 1fr; }
+    .activity-row { grid-template-columns: 1fr; gap: 2px; }
+    .activity-time { white-space: normal; }
   }
 
   /*
@@ -2478,6 +2536,40 @@ ${bootstrapMarkup}
     min-width: 0;
     overflow-wrap: anywhere;
     font-size: 15px; line-height: 1.65; color: var(--vscode-foreground);
+  }
+  .activity-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 280px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 8px 10px;
+    border: 1px solid var(--vscode-panel-border, #454545);
+    border-radius: 4px;
+    background: var(--vscode-editorWidget-background, transparent);
+  }
+  .activity-row.activity-transcript { border-left: 2px solid var(--vscode-panel-border, #454545); padding-left: 6px; opacity: 0.85; }
+  .activity-row {
+    display: grid; grid-template-columns: minmax(150px, max-content) minmax(0, 1fr);
+    gap: 12px; padding: 8px 0; border-top: 1px solid var(--vscode-panel-border);
+  }
+  .activity-row:first-child { padding-top: 0; border-top: none; }
+  .activity-time {
+    color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
+    font-size: 11px; line-height: 1.45; white-space: nowrap;
+  }
+  .activity-note { min-width: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+  .activity-empty {
+    color: var(--vscode-descriptionForeground); font-size: 13px; line-height: 1.45;
+    padding: 8px 10px; border: 1px dashed var(--vscode-panel-border); border-radius: 6px;
+  }
+  .activity-blocked {
+    color: var(--vscode-errorForeground); font-size: 13px; line-height: 1.45;
+    margin-bottom: 8px; padding: 8px 10px;
+    background: color-mix(in srgb, var(--vscode-errorForeground) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--vscode-errorForeground) 45%, transparent);
+    border-radius: 6px;
   }
   /* Latest log is a receipt line (§6.3's grammar), not prose — kept as literal
      preformatted text rather than run through the markdown renderer below. */
@@ -3447,6 +3539,33 @@ ${bootstrapMarkup}
     Promise.resolve(renderResult).catch(() => markMermaidUnavailable(root));
   }
 
+  function appendDetailActions(links, task) {
+    if (task.pending) {
+      const pendingAction = el('button', 'btn-modal-primary', 'Apply ' + task.pending.label);
+      pendingAction.type = 'button';
+      pendingAction.setAttribute('aria-label', 'Apply pending completion: ' + task.pending.label);
+      pendingAction.title = task.pending.description;
+      pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
+      links.appendChild(pendingAction);
+    } else if (task.primary) {
+      links.appendChild(actionButton(task.id, task.primary));
+    }
+    for (const candidate of task.staleCompletions || []) {
+      const recovery = el('button', 'btn-modal-primary', 'Recover ' + candidate.stage + ' completion');
+      recovery.type = 'button';
+      recovery.setAttribute('aria-label', 'Recover stale ' + candidate.stage + ' completion from run ' + candidate.runId);
+      recovery.title = 'Old run ' + candidate.runId + '. Latest run: ' + (candidate.latestRunId || 'none') + '. ' + candidate.summary;
+      recovery.addEventListener('click', () => vscode.postMessage({
+        type: 'stale/recover',
+        taskId: task.id,
+        runId: candidate.runId,
+        stage: candidate.stage,
+      }));
+      links.appendChild(recovery);
+    }
+    if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
+  }
+
   function renderDetail(task, preserveOpenModal = false) {
     const backdrop = document.getElementById('detailBackdrop');
     const modal = document.getElementById('detail');
@@ -3470,6 +3589,16 @@ ${bootstrapMarkup}
     const retainedScrollTop = modal.dataset.taskId === task.id
       ? modal.querySelector('.modal-body')?.scrollTop || 0
       : 0;
+    // The activity feed scrolls independently, and it grows while a run is in
+    // flight. Stick to the newest entry only when the reader was already there;
+    // yanking someone who scrolled up to read an earlier row is worse than
+    // making them scroll down again.
+    const previousFeed = modal.dataset.taskId === task.id
+      ? modal.querySelector('.activity-feed')
+      : null;
+    const retainedFeedScrollTop = previousFeed ? previousFeed.scrollTop : 0;
+    const feedWasAtBottom = !previousFeed
+      || previousFeed.scrollHeight - previousFeed.scrollTop - previousFeed.clientHeight <= 8;
     modal.textContent = '';
     modal.dataset.taskId = task.id;
     editingTaskId = null;
@@ -3539,28 +3668,7 @@ ${bootstrapMarkup}
     const openChatLink = el('button', 'modal-link', 'Open Chat →');
     openChatLink.addEventListener('click', () => vscode.postMessage({ type: 'task/openChat', taskId: task.id }));
     links.appendChild(openChatLink);
-    if (task.pending) {
-      const pendingAction = el('button', 'btn-modal-primary', 'Apply ' + task.pending.label);
-      pendingAction.type = 'button';
-      pendingAction.setAttribute('aria-label', 'Apply pending completion: ' + task.pending.label);
-      pendingAction.title = task.pending.description;
-      pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
-      links.appendChild(pendingAction);
-    }
-    for (const candidate of task.staleCompletions || []) {
-      const recovery = el('button', 'btn-modal-primary', 'Recover ' + candidate.stage + ' completion');
-      recovery.type = 'button';
-      recovery.setAttribute('aria-label', 'Recover stale ' + candidate.stage + ' completion from run ' + candidate.runId);
-      recovery.title = 'Old run ' + candidate.runId + '. Latest run: ' + (candidate.latestRunId || 'none') + '. ' + candidate.summary;
-      recovery.addEventListener('click', () => vscode.postMessage({
-        type: 'stale/recover',
-        taskId: task.id,
-        runId: candidate.runId,
-        stage: candidate.stage,
-      }));
-      links.appendChild(recovery);
-    }
-    if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
+    appendDetailActions(links, task);
     body.appendChild(links);
 
     for (const [label, rendered] of [
@@ -3583,7 +3691,49 @@ ${bootstrapMarkup}
       body.appendChild(section);
     }
 
+    const activitySection = el('div');
+    activitySection.appendChild(el('div', 'modal-section-label', 'Activity'));
+    if (task.status === 'blocked') {
+      const blocked = el('div', 'activity-blocked', 'This task is blocked; approval or action is required in the VS Code host.');
+      blocked.setAttribute('role', 'status');
+      activitySection.appendChild(blocked);
+    }
+    const activityFeed = el('div', 'activity-feed');
+    const feed = Array.isArray(task.feed)
+      ? task.feed.filter((entry) => (
+        entry && typeof entry === 'object' &&
+        typeof entry.at === 'string' && typeof entry.note === 'string'
+      ))
+      : [];
+    if (!feed.length) {
+      activityFeed.appendChild(el('div', 'activity-empty', 'No activity recorded yet.'));
+    } else {
+      for (const entry of feed) {
+        // Copilot's own words and the agent's progress summaries are different
+        // kinds of statement, so they are not rendered as one undifferentiated
+        // list. Tailed rows also lag by seconds to a minute (TASK-009).
+        const source = entry.source === 'transcript' ? 'transcript' : 'progress';
+        const row = el('div', 'activity-row activity-' + source);
+        const time = document.createElement('time');
+        time.className = 'activity-time';
+        time.dateTime = entry.at;
+        time.textContent = entry.at;
+        row.appendChild(time);
+        row.appendChild(el('div', 'activity-note', entry.note));
+        activityFeed.appendChild(row);
+      }
+    }
+    activitySection.appendChild(activityFeed);
+    body.appendChild(activitySection);
+
     modal.appendChild(body);
+    const settleFeedScroll = () => {
+      if (!activityFeed.isConnected) { return; }
+      const maxTop = Math.max(0, activityFeed.scrollHeight - activityFeed.clientHeight);
+      activityFeed.scrollTop = feedWasAtBottom ? maxTop : Math.min(retainedFeedScrollTop, maxTop);
+    };
+    settleFeedScroll();
+    requestAnimationFrame(settleFeedScroll);
     if (retainedScrollTop) {
       const restore = () => {
         if (!body.isConnected) { return; }
@@ -4020,15 +4170,7 @@ ${bootstrapMarkup}
     const openChatLink = el('button', 'modal-link', 'Open Chat →');
     openChatLink.addEventListener('click', () => vscode.postMessage({ type: 'task/openChat', taskId: task.id }));
     links.appendChild(openChatLink);
-    if (task.pending) {
-      const pendingAction = el('button', 'btn-modal-primary', 'Apply ' + task.pending.label);
-      pendingAction.type = 'button';
-      pendingAction.setAttribute('aria-label', 'Apply pending completion: ' + task.pending.label);
-      pendingAction.title = task.pending.description;
-      pendingAction.addEventListener('click', () => vscode.postMessage({ type: 'pending/apply', taskId: task.id }));
-      links.appendChild(pendingAction);
-    }
-    if (task.secondary) { links.appendChild(actionButton(task.id, task.secondary)); }
+    appendDetailActions(links, task);
     body.appendChild(links);
 
     if (task.lastLog) {

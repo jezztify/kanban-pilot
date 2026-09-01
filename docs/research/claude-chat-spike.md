@@ -35,7 +35,7 @@ printing credentials:
 | --- | --- |
 | VS Code CLI | `1.127.0`, commit `4fe60c8b1cdac1c4c174f2fb180d0d758272d713`, x64 |
 | Extension-host test runner | VS Code `1.133.0` from the cached `vscode-test` installation; the host probe is non-invasive and does not require Claude to be installed in that isolated test host |
-| Kanban Pilot engine requirement | `^1.125.0` in [package.json](../package.json) |
+| Kanban Pilot engine requirement | `^1.125.0` in [package.json](../../package.json) |
 | Claude extension | `anthropic.claude-code@2.1.233` |
 | Claude extension engine | `^1.94.0`, from the installed extension manifest |
 | GitHub Copilot extension | Not present in `code --list-extensions --show-versions` in this installation |
@@ -96,16 +96,16 @@ That path is useful for a future executor, but it is outside the target.
 
 The isolated probe is deliberately not imported by the extension entry point:
 
-- [src/spike/claudeChatProbe.ts](../src/spike/claudeChatProbe.ts) reads only a
+- [src/spike/claudeChatProbe.ts](../../src/spike/claudeChatProbe.ts) reads only a
   supplied Claude extension directory, reports manifest/source markers, and
   emits operation findings. It never calls VS Code or Claude.
-- [src/spike/claudeChatHostProbe.ts](../src/spike/claudeChatHostProbe.ts)
+- [src/spike/claudeChatHostProbe.ts](../../src/spike/claudeChatHostProbe.ts)
   inventories `vscode.version`, the installed extension, and registered
   Claude command ids from an extension host. It executes no command and has no
   authentication path.
-- [src/spike/sanitized-task.md](../src/spike/sanitized-task.md) contains only
+- [src/spike/sanitized-task.md](../../src/spike/sanitized-task.md) contains only
   synthetic task markers.
-- [src/test/claudeChatSpike.test.ts](../src/test/claudeChatSpike.test.ts)
+- [src/test/claudeChatSpike.test.ts](../../src/test/claudeChatSpike.test.ts)
   checks deep-link encoding, distinct isolation markers, the blocked critical
   path, and the non-invoking host probe.
 
@@ -157,7 +157,7 @@ claim that the Claude UI itself cannot run.
 
 | Scenario | Result | Evidence / expected check |
 | --- | --- | --- |
-| Copilot baseline | Blocked in this machine | The installed VS Code list had no GitHub Copilot extension, so a live baseline/coexistence run could not be performed. The existing baseline seams were read from [executor.ts](../src/chat/executor.ts), [runManager.ts](../src/chat/runManager.ts), [sessionUri.ts](../src/chat/sessionUri.ts), [promptTemplates.ts](../src/chat/promptTemplates.ts), [receipt.ts](../src/chat/receipt.ts), [extension.ts](../src/extension.ts), and [package.json](../package.json). |
+| Copilot baseline | Blocked in this machine | The installed VS Code list had no GitHub Copilot extension, so a live baseline/coexistence run could not be performed. The existing baseline seams were read from [executor.ts](../../src/chat/executor.ts), [runManager.ts](../../src/chat/runManager.ts), [sessionUri.ts](../../src/chat/sessionUri.ts), [promptTemplates.ts](../../src/chat/promptTemplates.ts), [receipt.ts](../../src/chat/receipt.ts), [extension.ts](../../src/extension.ts), and [package.json](../../package.json). |
 | Claude first run | Blocked | The official deep link can open the panel and pre-fill text, but does not submit it. No supported attachment or terminal-result API exists. Authentication would also require a user sign-in and was not automated. |
 | Claude continuation on same task | Partial / blocked for automation | A known valid Claude UUID can be supplied through `session`; the probe cannot obtain or verify that UUID from the panel, and cannot send the continuation or await its completion. |
 | Two task sessions with distinct identities | Blocked for target automation | The sanitized plan uses `SPIKE-TASK-A`/`CLAUDE_SPIKE_TASK_A` and `SPIKE-TASK-B`/`CLAUDE_SPIKE_TASK_B`. Claude's UI promises separate histories for separate conversations, but no supported API exposes the identity needed to prove the task-to-session binding or detect cross-context leakage. |
@@ -177,19 +177,19 @@ The current integration has guarantees that a panel-only bridge cannot preserve:
 1. `Executor.run()` is awaited by `RunManager` and must return a terminal
    `ExecutorResult`. A timeout races that promise, and failures are reconciled
    into a receipt/status transition.
-2. The agent writes a task-specific receipt described by [receipt.ts](../src/chat/receipt.ts).
+2. The agent writes a task-specific receipt described by [receipt.ts](../../src/chat/receipt.ts).
    `RunManager` re-reads the task file and accepts only the matching
    `run:<id> task:<id>` receipt after the executor returns.
-3. [promptTemplates.ts](../src/chat/promptTemplates.ts) inlines the current
+3. [promptTemplates.ts](../../src/chat/promptTemplates.ts) inlines the current
    task, Refined, and Scope content and asks the agent to write the receipt.
-4. [sessionUri.ts](../src/chat/sessionUri.ts) derives a stable
+4. [sessionUri.ts](../../src/chat/sessionUri.ts) derives a stable
    `vscode-chat-session` URI from the task id. The current Copilot executor
    also passes task-file attachment and tool include/exclude values and reads
    Copilot's returned `metadata.sessionId` for misroute detection.
-5. [runManager.ts](../src/chat/runManager.ts) enforces timeout, staleness after
+5. [runManager.ts](../../src/chat/runManager.ts) enforces timeout, staleness after
    Stop/new runs, reload reconciliation, and per-task receipt handling.
-6. [extension.ts](../src/extension.ts) constructs one Copilot-specific
-   `ChatSessionExecutor`; [package.json](../package.json) has no provider
+6. [extension.ts](../../src/extension.ts) constructs one Copilot-specific
+   `ChatSessionExecutor`; [package.json](../../package.json) has no provider
    setting or executor factory.
 
 The Claude panel cannot currently satisfy items 1, 2, and 4: no submitted-turn
@@ -269,21 +269,21 @@ Agent SDK/CLI.
    provider availability. Do not rely on `primaryEditor.open` argument shapes,
    internal webview messages, or focus automation.
 2. Add a provider-neutral `Executor` factory and an explicit provider setting
-   in [src/chat/executor.ts](../src/chat/executor.ts), [src/extension.ts](../src/extension.ts),
-   and [package.json](../package.json). Keep Copilot as the default and reject
+   in [src/chat/executor.ts](../../src/chat/executor.ts), [src/extension.ts](../../src/extension.ts),
+   and [package.json](../../package.json). Keep Copilot as the default and reject
    unknown providers.
 3. Define a Claude-specific session binding in
-   [src/chat/sessionUri.ts](../src/chat/sessionUri.ts) only after the provider
+   [src/chat/sessionUri.ts](../../src/chat/sessionUri.ts) only after the provider
    supplies a stable, verifiable id. Store provider plus session identity so a
    Claude id cannot be mistaken for `copilot_session_id`.
-4. Extend [src/chat/runManager.ts](../src/chat/runManager.ts) only with a
+4. Extend [src/chat/runManager.ts](../../src/chat/runManager.ts) only with a
    provider-neutral terminal/cancellation contract. Preserve timeout,
    staleness, receipt matching, reload reconciliation, and failure semantics;
    a timeout must cancel the provider turn or record that cancellation was not
    confirmed.
 5. Keep prompt and receipt contracts in
-   [src/chat/promptTemplates.ts](../src/chat/promptTemplates.ts) and
-   [src/chat/receipt.ts](../src/chat/receipt.ts) provider-neutral. Add focused
+   [src/chat/promptTemplates.ts](../../src/chat/promptTemplates.ts) and
+   [src/chat/receipt.ts](../../src/chat/receipt.ts) provider-neutral. Add focused
    executor, run-manager, session-binding, and provider-misroute tests under
    `src/test/` before enabling the setting.
 6. Re-run the full matrix with two task ids, Claude/Copilot coexistence, reload,
