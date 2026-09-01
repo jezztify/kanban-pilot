@@ -4,6 +4,8 @@ import { BoardPanel, BoardTaskSetChange } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
 import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, OutboundPayloadSeam } from './chat/executor';
 import { CommandExecutor, normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
+import { TranscriptTailService } from './chat/transcriptTail';
+import { HookSpoolReceiver, SPOOL_RELATIVE_PATH } from './chat/hookSpool';
 import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore, TaskStoreChange } from './model/taskStore';
@@ -110,6 +112,15 @@ export interface WorkspaceTaskSetChange extends BoardTaskSetChange {
  * context swaps the store and RunManager together, so a task id is never
  * resolved against a different set halfway through an operation.
  */
+/**
+ * Read-only tail of Copilot's session transcript (TASK-008). Built during
+ * activation because it needs this extension's own `storageUri` to reach
+ * Copilot's sibling storage directory. Left undefined when the host provides
+ * no storage, in which case the activity feed simply shows progress lines.
+ */
+let transcriptTail: TranscriptTailService | undefined;
+let hookSpool: HookSpoolReceiver | undefined;
+
 export class WorkspaceTaskSetContext {
 	readonly registry: TaskSetRegistry;
 	private currentSet: TaskSet;
@@ -135,7 +146,7 @@ export class WorkspaceTaskSetContext {
 		this.registry = new TaskSetRegistry(folder, tasksDir);
 		this.currentSet = this.registry.defaultSet;
 		this.currentStore = new TaskStore(this.currentSet.directory, this.currentSet.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
 		this.configurationWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
 			if (event.affectsConfiguration('kanbanPilot') || event.affectsConfiguration('chat.agentFilesLocations')) {
 				this.emitChange('configuration');
@@ -214,7 +225,7 @@ export class WorkspaceTaskSetContext {
 		const previousManager = this.currentRunManager;
 		this.currentSet = set;
 		this.currentStore = new TaskStore(set.directory, set.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
 		if (previousManager !== this.currentRunManager) {
 			previousManager.dispose();
 		}
@@ -580,6 +591,21 @@ function registerActionCommand(
 }
 
 export function activate(context_: vscode.ExtensionContext) {
+	if (context_.storageUri) {
+		transcriptTail = new TranscriptTailService(context_.storageUri);
+		context_.subscriptions.push({ dispose: () => transcriptTail?.dispose() });
+
+		// The hook feed is the only source fast enough for the browser board to keep
+		// up with a run. Its spool write touches no task file, so the receiver has to
+		// raise a change itself or nothing would republish to connected sessions.
+		const folder = vscode.workspace.workspaceFolders?.[0];
+		if (folder) {
+			const spoolPath = vscode.Uri.joinPath(folder.uri, ...SPOOL_RELATIVE_PATH.split('/')).fsPath;
+			hookSpool = new HookSpoolReceiver(spoolPath);
+			hookSpool.start();
+			context_.subscriptions.push({ dispose: () => hookSpool?.dispose() });
+		}
+	}
 	let sharedEndpointUrl: string | undefined;
 	const endpointStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	endpointStatusItem.name = 'Kanban Pilot Connection';

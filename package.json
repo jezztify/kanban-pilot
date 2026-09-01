@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -237,6 +237,21 @@
           "default": "manual",
           "description": "auto retires a successful Split parent after child persistence. manual (default) keeps the parent pending for explicit completion."
         },
+        "kanbanPilot.chat.hookFeed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show Copilot chat activity reported in real time by an installed Kanban Pilot chat hook. Unlike the transcript feed this arrives as events happen, so the browser board can keep up with a run."
+        },
+        "kanbanPilot.chat.transcriptFeed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show Copilot's own session activity in the task activity feed. The transcript is flushed in batches, so tool activity can appear several seconds to a minute after it happened."
+        },
+        "kanbanPilot.chat.transcriptFeedRemote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also send observed Copilot activity — from the transcript feed, the hook feed, or both — to the browser board. The browser endpoint is shared with anyone holding its link."
+        },
         "kanbanPilot.chat.mode": {
           "type": "string",
           "enum": [
@@ -380,6 +395,8 @@
     "install:skill:claude": "node scripts/install-skill.mjs claude",
     "install:skill:copilot": "node scripts/install-skill.mjs copilot",
     "test:install-skill": "node --test scripts/install-skill.test.mjs",
+    "test:watch-transcript": "node --test scripts/watch-transcript.test.mjs",
+    "test:hook": "node --test scripts/kanban-pilot-hook.test.mjs",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",

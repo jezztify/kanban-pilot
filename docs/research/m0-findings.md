@@ -1,7 +1,7 @@
 # M0 Spike — Findings
 
 **Run:** 2026-08-13 · VS Code **1.133.0** (darwin-arm64), headless via `@vscode/test-cli`
-**Probes:** [`src/spike/probes.ts`](../src/spike/probes.ts) · [`src/test/m0.spike.test.ts`](../src/test/m0.spike.test.ts)
+**Probes:** [`src/spike/probes.ts`](../../src/spike/probes.ts) · [`src/test/m0.spike.test.ts`](../../src/test/m0.spike.test.ts)
 **Reproduce:** `npm run compile-tests && npx vscode-test`
 
 > **Update 2026-08-13 (fourth interactive run — M0 closed):** the exclusion mitigation is

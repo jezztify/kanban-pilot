@@ -3,6 +3,7 @@ import * as http from 'node:http';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { BoardTaskSetHost } from '../board/boardPanel';
+import { formatProgressLine } from '../chat/progress';
 import { BoardSnapshot } from '../model/taskStore';
 import { startRealtimeBoardServer } from '../http/realtimeBoardServer';
 
@@ -69,6 +70,13 @@ function stream(port: number, path: string, predicate: (chunk: string) => boolea
 		}, timeoutMs);
 		timer.unref?.();
 	});
+}
+
+function dataMessages(streamBody: string): unknown[] {
+	return streamBody
+		.split('\n\n')
+		.filter((frame) => frame.startsWith('data: '))
+		.map((frame) => JSON.parse(frame.slice('data: '.length).trim()));
 }
 
 function fakeHost(snapshot: BoardSnapshot, sink: { actions: string[] }): BoardTaskSetHost {
@@ -220,6 +228,97 @@ suite('Realtime board HTTP endpoint integration', () => {
 
 			const expired = await post(server.port, '/session/messages?session=nope', 'test-token', { type: 'board/ready' });
 			assert.strictEqual(expired.status, 404);
+		} finally {
+			server.dispose();
+		}
+	});
+
+	test('delivers the selected progress feed on initial, live, and reconnect session streams', async () => {
+		const task = {
+			setId: 'default',
+			id: 'TASK-007',
+			title: 'Browser activity',
+			type: 'feature' as const,
+			state: 'in-progress' as const,
+			status: 'running' as const,
+			chatResetRequired: false,
+			sections: { Request: '', Refined: '', Scope: '', Log: '' },
+			body: '',
+		};
+		const setLog = (lines: readonly string[]): void => {
+			const log = lines.join('\n');
+			task.sections.Log = log;
+			task.body = ['## Request', '', '## Refined', '', '## Scope', '', '## Log', log].join('\n');
+		};
+		const first = formatProgressLine({
+			runId: 'r1', taskId: task.id, at: '2026-08-26T04:31:07Z', note: 'first activity',
+		});
+		const second = formatProgressLine({
+			runId: 'r2', taskId: task.id, at: '2026-08-26T04:31:08Z', note: 'second activity',
+		});
+		setLog([first]);
+
+		const observable = observableHost(snapshot, { actions: [] });
+		const store = observable.host.store as unknown as {
+			readAll: () => Promise<{ tasks: typeof task[]; malformed: string[] }>;
+		};
+		store.readAll = async () => ({ tasks: [task], malformed: [] });
+		const server = await startRealtimeBoardServer({
+			port: 0,
+			token: 'test-token',
+			extensionUri,
+			host: observable.host,
+		});
+		const feedFrom = (body: string): string[] => {
+			const detail = dataMessages(body).filter((message) => (
+				message !== null && typeof message === 'object' &&
+				(message as { type?: unknown }).type === 'task/detail'
+			)).at(-1) as { task?: { feed?: { note: string }[] } } | undefined;
+			assert.ok(detail?.task, 'the session stream should include a selected-task detail');
+			return detail?.task?.feed?.map((entry) => entry.note) ?? [];
+		};
+		try {
+			const page = await request(server.port, '/?token=test-token');
+			const session = /var session = "([^"]+)"/.exec(page.body)?.[1];
+			assert.ok(session);
+			const sessionPath = `/session/events?session=${session}&token=test-token`;
+
+			const initialPromise = stream(
+				server.port,
+				sessionPath,
+				(value) => value.includes('"note":"first activity"'),
+			);
+			const selectionAccepted = new Promise<Reply>((resolve, reject) => {
+				setTimeout(() => {
+					void post(server.port, `/session/messages?session=${session}`, 'test-token', {
+						type: 'task/select', taskId: task.id,
+					}).then(resolve, reject);
+				}, 50);
+			});
+			const initial = await initialPromise;
+			assert.strictEqual((await selectionAccepted).status, 202);
+			assert.match(initial, /^data: \{/m, 'session details use ordinary default data frames');
+			assert.doesNotMatch(initial, /^event:/m, 'session details do not introduce named event frames');
+			assert.deepStrictEqual(feedFrom(initial), ['first activity']);
+
+			const livePromise = stream(
+				server.port,
+				sessionPath,
+				(value) => value.includes('"note":"second activity"'),
+			);
+			setTimeout(() => {
+				setLog([first, second]);
+				observable.emit({ revision: 10, kind: 'task', taskId: task.id, note: 'progress changed' });
+			}, 50);
+			const live = await livePromise;
+			assert.deepStrictEqual(feedFrom(live), ['first activity', 'second activity']);
+
+			const reconnect = await stream(
+				server.port,
+				sessionPath,
+				(value) => value.includes('"note":"second activity"'),
+			);
+			assert.deepStrictEqual(feedFrom(reconnect), ['first activity', 'second activity']);
 		} finally {
 			server.dispose();
 		}

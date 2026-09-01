@@ -8,6 +8,23 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.4.3] - 2026-09-02
+
+### Added
+
+- An optional real-time Copilot hook activity feed, configured manually with
+	`scripts/kanban-pilot-hook.mjs` and writing bounded structural activity to the local
+	`.kanban-pilot/.hook-spool.jsonl` spool. `chat.hookFeed` defaults to `false`.
+- The related `chat.transcriptFeed` and `chat.transcriptFeedRemote` controls. Transcript activity
+	remains delayed, and browser delivery requires the existing authenticated HTTP endpoint plus the
+	separate remote opt-in.
+
+### Changed
+
+- Hook activity stays local to the editor unless remote sharing is explicitly enabled. Tool
+	arguments, tool output, prompt content beyond task attribution, and transcript contents are not
+	exposed; receiver failures are fail-open and do not block Copilot turns.
+
 ## [0.4.2] - 2026-09-01
 
 ### Changed

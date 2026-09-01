@@ -11,7 +11,7 @@ import {
  * Confirmed present via the Configure Tools picker (built-in `vscode`
  * toolset), applied globally to the default agent unless overridden per call.
  * M0 verified on disk that excluding these by name blocks both the write and
- * the read — see docs/m0-findings.md finding 12 (R12).
+ * the read — see docs/research/m0-findings.md finding 12 (R12).
  */
 export const MEMORY_TOOLS = ['memory', 'resolveMemoryFileUri'];
 
