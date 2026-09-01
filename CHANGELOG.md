@@ -8,6 +8,19 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 _No unreleased changes._
 
+## [0.4.2] - 2026-09-01
+
+### Changed
+
+- Moving a task between workflow columns now preserves and reuses its task-bound Copilot Chat
+	conversation instead of opening a new conversation.
+- Stage runs now pass configured custom-agent assignments through to Copilot Chat, so matching
+	installed custom agents are selected rather than the assignment being display-only.
+
+### Fixed
+
+- Mermaid flowchart labels now render with readable contrast and backgrounds across VS Code themes.
+
 ## [0.4.1] - 2026-08-27
 
 ### Added

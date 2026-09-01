@@ -20,11 +20,19 @@ export interface RunOptions {
 	sessionPrefix: string;
 	toolsIncludeForRefine: string[];
 	toolsExclude: string[];
+	/** Create a Copilot Chat conversation through its built-in New Chat action before injection. */
+	newChatBefore?: boolean;
 	/** Validated task-local image files, appended after the Markdown task file. */
 	attachmentUris?: readonly vscode.Uri[];
 	/** Open the task session beside the board before injecting this action's prompt. */
 	openBeside?: boolean;
 	modelSelector?: { id?: string; vendor?: string };
+	/**
+	 * The column agent resolved by `resolveAgentName()`. Sent as the payload's
+	 * `mode`, which the chat open action resolves through `findModeByName` —
+	 * matching a custom agent by name or id. Absent, the configured mode is sent.
+	 */
+	agentName?: string;
 }
 
 export interface ExecutorResult {
@@ -47,6 +55,8 @@ export interface CancellationOptions {
 
 /** Built-in VS Code command used by Copilot Chat's own Stop button. */
 export const CHAT_CANCEL_COMMAND = 'workbench.action.chat.cancel';
+/** Built-in VS Code command that creates a chat inheriting the active UI configuration. */
+export const CHAT_NEW_COMMAND = 'workbench.action.chat.newChat';
 
 /**
  * The fully-assembled outbound turn Kanban Pilot authors for a stage run — the
@@ -170,10 +180,19 @@ function describeError(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }
 
-export type ChatCapability = 'vscode.open' | 'mode-specific-chat-command' | 'vscode-chat-session-uri';
+export type ChatCapability =
+	| 'vscode.open'
+	| 'mode-specific-chat-command'
+	| 'vscode-chat-session-uri'
+	| 'new-chat-command';
 
 export interface ChatCapabilityDiagnostic {
-	code: 'missing-vscode-open' | 'missing-chat-command' | 'unsupported-chat-session-uri';
+	code:
+		| 'missing-vscode-open'
+		| 'missing-chat-command'
+		| 'unsupported-chat-session-uri'
+		| 'missing-new-chat-command'
+		| 'new-chat-command-failed';
 	capability: ChatCapability;
 	mode: string;
 	remoteName?: string;
@@ -186,7 +205,9 @@ export interface ChatCapabilities {
 	remoteName?: string;
 	hasVscodeOpen: boolean;
 	chatCommand?: string;
+	newChatCommand?: string;
 	supportsChatSessionUri: boolean;
+	agentName?: string;
 }
 
 export interface Executor {
@@ -268,8 +289,8 @@ export function taskChatOpenOptions(openBeside: boolean): vscode.TextDocumentSho
 /**
  * The v1 `Executor` (PRD §6.6) — the mechanism proven in
  * `copilot-poc/src/extension.ts`, extended with the session binding of §6.7
- * and the narrow-window protocol of §6.9: nothing is awaited between opening
- * the session and injecting, and a process-wide mutex serializes the pair.
+ * and the narrow-window protocol of §6.9: opening, the optional built-in New
+ * Chat action, and injection are serialized as one focused command sequence.
  */
 export class ChatSessionExecutor implements Executor {
 	private readonly activeTurns = new Set<string>();
@@ -310,7 +331,7 @@ export class ChatSessionExecutor implements Executor {
 		// even though the command remains executable. Probe it at the narrow
 		// open-and-inject boundary instead of taking the inventory as a hard
 		// preflight failure.
-		const diagnostic = capabilityDiagnostic(capabilities, false);
+		const diagnostic = capabilityDiagnostic(capabilities, false, options.newChatBefore === true);
 		if (diagnostic) {
 			try {
 				return await this.clipboardFallback(task, prompt, options, diagnostic);
@@ -320,9 +341,18 @@ export class ChatSessionExecutor implements Executor {
 		}
 		const openCommand = capabilities.chatCommand!;
 
+		// The chat open action resolves its mode as
+		//   opts.mode ? modes.findModeByName(opts.mode) : <the command's own mode>
+		// and findModeByName matches custom agents by name or id. So naming the
+		// assigned agent here is what actually selects it, and it takes precedence
+		// over the command's own mode. Sending the configured chat.mode instead
+		// would resolve back to the built-in agent and silently discard the
+		// assignment. An unassigned column keeps the configured mode unchanged.
+		const selectedMode = options.agentName?.trim() || options.mode;
+
 		const payload: OutboundPayload = {
 			query: prompt,
-			mode: options.mode,
+			mode: selectedMode,
 			blockOnResponse: true,
 			attachFiles: orderedTaskChatAttachments(taskFileUri, options.attachmentUris),
 			toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
@@ -334,19 +364,19 @@ export class ChatSessionExecutor implements Executor {
 		const context: OutboundContext = {
 			taskId: task.id,
 			stage,
-			mode: options.mode,
+			mode: selectedMode,
 			sessionUri,
 			attachmentCount: payload.attachFiles.length,
 		};
 
 		try {
-			// Open immediately before injecting, with nothing awaited in
-			// between (§6.9) — every added await is another window for
-			// focus to move. The command's terminal response is returned as a
-			// value so the mutex releases before blockOnResponse settles.
+			// Open immediately before the optional New Chat action and injection
+			// (§6.9). The whole focused command sequence stays inside the mutex;
+			// the command's terminal response is returned as a value so the mutex
+			// releases before blockOnResponse settles.
 			const pending = await injectionMutex.run(async () => {
 				if (this.cancellationRequested.has(activeTurnKey)) {
-					return { response: Promise.resolve(undefined), cancelled: true };
+					return { kind: 'cancelled' as const };
 				}
 				await this.commands.executeCommand(
 					'vscode.open',
@@ -354,7 +384,21 @@ export class ChatSessionExecutor implements Executor {
 					taskChatOpenOptions(options.openBeside === true),
 				);
 				if (this.cancellationRequested.has(activeTurnKey)) {
-					return { response: Promise.resolve(undefined), cancelled: true };
+					return { kind: 'cancelled' as const };
+				}
+
+				if (options.newChatBefore === true) {
+					try {
+						await this.commands.executeCommand(capabilities.newChatCommand!);
+					} catch (e) {
+						return {
+							kind: 'new-chat-failed' as const,
+							diagnostic: newChatCommandFailureDiagnostic(capabilities, e),
+						};
+					}
+					if (this.cancellationRequested.has(activeTurnKey)) {
+						return { kind: 'cancelled' as const };
+					}
 				}
 
 				// Observe-and-transform seam (row 1, TASK-006): the extension
@@ -366,10 +410,13 @@ export class ChatSessionExecutor implements Executor {
 
 				const response = this.commands.executeCommand<ChatAgentResultish | undefined>(openCommand, finalPayload);
 				this.activeTurns.add(activeTurnKey);
-				return { response, cancelled: false };
+				return { kind: 'injected' as const, response };
 			});
-			if (pending.cancelled) {
+			if (pending.kind === 'cancelled') {
 				return { ok: false, error: 'Copilot Chat turn cancelled before injection.' };
+			}
+			if (pending.kind === 'new-chat-failed') {
+				return await this.clipboardFallback(task, prompt, options, pending.diagnostic, true);
 			}
 
 			try {
@@ -434,7 +481,12 @@ export class ChatSessionExecutor implements Executor {
 		}
 	}
 
-	async detectCapabilities(mode: string, task?: Task, sessionPrefix?: string): Promise<ChatCapabilities> {
+	async detectCapabilities(
+		mode: string,
+		task?: Task,
+		sessionPrefix?: string,
+		agentName?: string,
+	): Promise<ChatCapabilities> {
 		const all = await this.commands.getCommands(true);
 		const sessionUri = task
 			? sessionUriForTaskBinding(task, sessionPrefix ?? 'kanban-pilot-', task.setId)
@@ -447,6 +499,7 @@ export class ChatSessionExecutor implements Executor {
 			remoteName: vscode.env.remoteName || undefined,
 			hasVscodeOpen: all.includes('vscode.open'),
 			chatCommand: this.findAgentOpenCommand(all, mode),
+			newChatCommand: this.findCommand(all, CHAT_NEW_COMMAND),
 			supportsChatSessionUri: probedSupport ?? (sessionUri
 				? sessionUri.scheme === CHAT_SESSION_SCHEME && !!parseSessionUri(sessionUri)
 				: true),
@@ -454,8 +507,12 @@ export class ChatSessionExecutor implements Executor {
 	}
 
 	private findAgentOpenCommand(all: readonly string[], mode: string): string | undefined {
-		const expected = `workbench.action.chat.open${mode}`.toLowerCase();
-		return all.find((id) => id.toLowerCase() === expected);
+		return this.findCommand(all, `workbench.action.chat.open${mode}`);
+	}
+
+	private findCommand(all: readonly string[], expected: string): string | undefined {
+		const lowerExpected = expected.toLowerCase();
+		return all.find((id) => id.toLowerCase() === lowerExpected);
 	}
 
 	/** §6.6: on failure, session binding still holds and the board still tracks state via the receipt. */
@@ -464,20 +521,25 @@ export class ChatSessionExecutor implements Executor {
 		prompt: string,
 		options: RunOptions,
 		diagnostic?: ChatCapabilityDiagnostic,
+		sessionAlreadyOpen = false,
 	): Promise<ExecutorResult> {
 		try {
-			await this.commands.executeCommand(
-				'vscode.open',
-				sessionUriForTaskBinding(task, options.sessionPrefix, task.setId),
-				taskChatOpenOptions(options.openBeside === true),
-			);
+			if (!sessionAlreadyOpen) {
+				await this.commands.executeCommand(
+					'vscode.open',
+					sessionUriForTaskBinding(task, options.sessionPrefix, task.setId),
+					taskChatOpenOptions(options.openBeside === true),
+				);
+			}
 			await vscode.env.clipboard.writeText(prompt);
 			void vscode.window.showWarningMessage(
 				`Kanban Pilot couldn't inject automatically — the prompt for ${task.id} is on your clipboard. Paste it into the opened chat.`,
 			);
 			return {
 				ok: false,
-				error: 'chat.open<Mode> unavailable; used clipboard fallback',
+				error: diagnostic?.capability === 'new-chat-command'
+					? 'Copilot Chat New Chat was unavailable; used clipboard fallback'
+					: 'chat.open<Mode> unavailable; used clipboard fallback',
 				diagnostic,
 			};
 		} catch (e) {
@@ -493,6 +555,7 @@ export class ChatSessionExecutor implements Executor {
 export function capabilityDiagnostic(
 	capabilities: ChatCapabilities,
 	includeOpenCapability = true,
+	requireNewChat = false,
 ): ChatCapabilityDiagnostic | undefined {
 	const remote = capabilities.remoteName;
 	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
@@ -526,5 +589,31 @@ export function capabilityDiagnostic(
 			remediation: 'Use a supported VS Code desktop or browser client with Copilot Chat enabled; clipboard fallback preserves the prompt.',
 		};
 	}
+	if (requireNewChat && !capabilities.newChatCommand) {
+		return {
+			code: 'missing-new-chat-command',
+			capability: 'new-chat-command',
+			mode: capabilities.mode,
+			...(remote ? { remoteName: remote } : {}),
+			message: `Copilot Chat's New Chat command is unavailable on ${client}; Kanban Pilot cannot safely inherit the active Agent and model for this first task turn.`,
+			remediation: 'Enable or update Copilot Chat, then retry the task action; the prompt remains available through the clipboard fallback.',
+		};
+	}
 	return undefined;
+}
+
+function newChatCommandFailureDiagnostic(
+	capabilities: ChatCapabilities,
+	error: unknown,
+): ChatCapabilityDiagnostic {
+	const remote = capabilities.remoteName;
+	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
+	return {
+		code: 'new-chat-command-failed',
+		capability: 'new-chat-command',
+		mode: capabilities.mode,
+		...(remote ? { remoteName: remote } : {}),
+		message: `Copilot Chat's New Chat command failed on ${client}: ${describeError(error)}.`,
+		remediation: 'Retry the task action after confirming Copilot Chat is available and focused; the prompt was copied to the clipboard and was not injected into an unverified conversation.',
+	};
 }

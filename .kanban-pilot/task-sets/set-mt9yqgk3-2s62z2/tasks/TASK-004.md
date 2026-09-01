@@ -2,12 +2,11 @@
 id: TASK-004
 title: make the synchronization a subscription  instead of pulling data every few sconds
 type: feature
-state: in-progress
+state: done
 status: idle
 position: 0
 created: 2026-08-26T19:26:46Z
-updated: 2026-08-26T19:47:15Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"r8nrj0v"}
+updated: 2026-08-27T21:07:16Z
 chat: 40c37fa6-7aaf-4ed8-9ab3-a4833573a7b6
 copilot_session_id: 40c37fa6-7aaf-4ed8-9ab3-a4833573a7b6
 scope_hash: a4d84ce
@@ -59,3 +58,4 @@ Replace periodic board-state retrieval with an event-driven subscription so conn
 - run:r8nrj0v task:TASK-004 stage:develop result:ok note:"2026-08-26T19:47:08Z — develop completed: hardened SSE subscriptions with focused coverage and passing smoke checks."
 - audit:status-change at:2026-08-26T19:47:15Z task:TASK-004 from:blocked to:idle action:late-receipt run:r8nrj0v outcome:ok note:"Status changed from blocked to idle via late-receipt."
 - audit:activity-finish at:2026-08-26T19:47:15Z task:TASK-004 stage:develop action:late-receipt run:r8nrj0v outcome:ok correction:true note:"2026-08-26T19:47:08Z — develop completed: hardened SSE subscriptions with focused coverage and passing smoke checks."
+- audit:state-change at:2026-08-27T21:07:16Z task:TASK-004 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

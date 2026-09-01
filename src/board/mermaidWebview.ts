@@ -82,6 +82,7 @@ function initializeMermaid(): void {
     startOnLoad: false,
     securityLevel: 'strict',
     suppressErrorRendering: true,
+    htmlLabels: false,
     theme: 'base',
     themeVariables: {
       background: edgeLabelBackground,
@@ -99,7 +100,6 @@ function initializeMermaid(): void {
       fontFamily: cssVariable('--vscode-font-family', 'Arial, sans-serif'),
     },
     flowchart: {
-      htmlLabels: false,
       useMaxWidth: true,
     },
     sequence: {

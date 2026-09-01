@@ -10,10 +10,15 @@ import { Stage } from './receipt';
  * These are **not** registered VS Code chat participants. No extension
  * defines a `Bro Refiner`/`Bro Coder`/`Bro QA` participant, so `@Bro Refiner`
  * in a prompt is plain text the model reads as persona framing, not a
- * `contributes.chatParticipants` mention VS Code resolves specially. If a
- * real per-stage participant is ever wanted, that's a separate, larger
- * feature (a request handler per participant) — this is deliberately the
- * lightweight version.
+ * `contributes.chatParticipants` mention VS Code resolves specially.
+ *
+ * A name may nonetheless match a **Copilot custom agent** the user has installed.
+ * VS Code's chat open action resolves its `mode` option with `findModeByName`,
+ * which matches a custom agent by name or id. `ChatExecutor` therefore sends the
+ * resolved column agent as that option, so the badge, the prompt persona line, and
+ * the agent actually running the turn agree. When the name matches no installed
+ * agent, VS Code resolves nothing and the name stays exactly what it always was:
+ * persona framing only.
  */
 export const STAGE_AGENT_NAME: Record<Stage, string> = {
 	refine: 'Bro Refiner',

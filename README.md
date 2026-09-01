@@ -428,7 +428,11 @@ A release runs when a `v<major>.<minor>.<patch>` tag is pushed:
 
 ## Release notes
 
-The current documented release is **0.4.1**.
+The current documented release is **0.4.2**.
+
+**0.4.2 (2026-09-01)** — Mermaid flowchart labels now remain readable across VS Code themes.
+Moving a task between workflow columns preserves its task-bound Copilot Chat conversation, and
+stage runs now select configured custom agents rather than only displaying their assignments.
 
 **0.4.1** — Configure additional custom-agent directories from Settings using
 absolute, home-relative, or workspace-relative paths. Board and Task Details

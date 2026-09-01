@@ -787,6 +787,12 @@ export interface SettingsState {
   gates: Record<string, string>;
   agents: Record<Column, string>;
   availableAgents: CopilotAgentOption[];
+  /**
+   * Names VS Code has a registered open action for. An assignment outside this
+   * set still renders the badge and the prompt persona line, but cannot change
+   * which agent executes the turn, so the UI must not imply that it does.
+   */
+  selectableAgents: string[];
   values: Record<string, unknown>;
 }
 
@@ -882,6 +888,7 @@ export function settingsStateFor(
   agentNames: AgentNameOverrides,
   availableAgents: readonly CopilotAgentOption[] = [],
   values: Record<string, unknown> = {},
+  selectableAgents: readonly string[] = [],
 ): SettingsState {
   return {
     gates: { ...gates },
@@ -889,6 +896,7 @@ export function settingsStateFor(
       COLUMNS.map((column) => [column, agentLabelFor(column, agentNames)]),
     ) as Record<Column, string>,
     availableAgents: availableAgents.map((agent) => ({ ...agent })),
+    selectableAgents: [...selectableAgents],
     values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, defaultSettingValue(value)])),
   };
 }
@@ -1518,9 +1526,13 @@ export class BoardPanel {
       agentDirectories: cfg.get<unknown>('chat.agentDirectories', []),
       additionalLocations: vscode.workspace.getConfiguration('chat').get<unknown>('agentFilesLocations', {}),
     });
+    // An assignment is honorable when it names an agent discovery actually found:
+    // that is the same set VS Code resolves `mode` against. A stale or hand-typed
+    // name outside it cannot select anything, and the UI must say so.
+    const selectable = availableAgents.map((agent) => agent.name);
     await this.surface.postMessage({
       type: 'settings/state',
-      ...settingsStateFor(gates, agentNames, availableAgents, values),
+      ...settingsStateFor(gates, agentNames, availableAgents, values, selectable),
     });
 	}
 
@@ -1885,6 +1897,12 @@ ${bootstrapMarkup}
   }
   .agent-setting-row:last-child { border-bottom: none; }
   .agent-setting-label { font-size: 13px; font-weight: 600; }
+  .agent-setting-note {
+    grid-column: 1 / -1;
+    font-size: 12px;
+    opacity: 0.8;
+    color: var(--vscode-descriptionForeground);
+  }
   .agent-setting-select {
     min-width: 0; font-family: inherit; font-size: 13px; color: var(--vscode-foreground);
     background: var(--vscode-input-background);
@@ -2167,6 +2185,7 @@ ${bootstrapMarkup}
   }
   .drop-slot.empty-slot {
     min-height: 52px;
+    margin: 0;
     border: 1px dashed var(--col-line);
     background: color-mix(in srgb, var(--col) 5%, transparent);
   }
@@ -3309,6 +3328,7 @@ ${bootstrapMarkup}
     settingErrorFor(document.getElementById('settingsPanelAgents'), '');
     const assignments = state.agents || {};
     const availableAgents = Array.isArray(state.availableAgents) ? state.availableAgents : [];
+    const selectableAgents = Array.isArray(state.selectableAgents) ? state.selectableAgents : [];
     for (const column of COLUMN_SETTINGS) {
       const row = el('div', 'agent-setting-row');
       row.id = 'agent-setting-' + column.id;
@@ -3346,6 +3366,15 @@ ${bootstrapMarkup}
       }
       select.value = selectedValue;
       row.appendChild(select);
+
+      // Honest UI: a name this client has no registered agent action for still
+      // renders the badge and the prompt persona line, but does not change which
+      // agent runs the turn. Say so rather than implying otherwise.
+      if (selectedValue && !selectableAgents.includes(selectedValue)) {
+        const note = el('div', 'agent-setting-note', 'Presentation only — no matching agent is registered in this client, so runs use the default agent.');
+        note.id = 'agent-setting-note-' + column.id;
+        row.appendChild(note);
+      }
 
       const actions = el('div', 'agent-setting-actions');
       const resetButton = el('button', 'btn-chip', 'Reset');
@@ -4199,7 +4228,7 @@ ${bootstrapMarkup}
     newTaskBackdrop.classList.remove('open'); // and with New Task
     selectSettingsCategory(focusColumn ? 'agents' : DEFAULT_SETTINGS_CATEGORY, false);
     settingsBackdrop.classList.add('open');
-    renderSettings(lastSettings || { gates: {}, agents: {}, availableAgents: [], values: {} });
+    renderSettings(lastSettings || { gates: {}, agents: {}, availableAgents: [], selectableAgents: [], values: {} });
     vscode.postMessage({ type: 'settings/refresh' });
     if (focusColumn) {
       const select = document.getElementById('agent-select-' + focusColumn);

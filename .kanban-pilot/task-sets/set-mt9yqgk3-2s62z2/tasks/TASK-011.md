@@ -2,12 +2,11 @@
 id: TASK-011
 title: webview: task card elements tend to overlap when column starts overflowing with scrollbars
 type: feature
-state: in-progress
+state: done
 status: idle
 position: 6
 created: 2026-08-26T23:27:06Z
-updated: 2026-08-26T23:34:08Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"ry3o4vp"}
+updated: 2026-08-27T21:07:21Z
 chat: 664fbfec-b0fb-4221-86cb-4c9eb58e1e3d
 copilot_session_id: 664fbfec-b0fb-4221-86cb-4c9eb58e1e3d
 scope_hash: 5eaa57a
@@ -78,3 +77,4 @@ scrollbar space so every card remains readable and operable.
 - run:ry3o4vp task:TASK-011 stage:develop result:ok note:"2026-08-26T23:33:58Z — reserved scrollbar gutter space and constrained card layout actions with regression coverage"
 - audit:status-change at:2026-08-26T23:34:08Z task:TASK-011 from:running to:idle action:receipt run:ry3o4vp outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-26T23:34:08Z task:TASK-011 stage:develop action:receipt run:ry3o4vp outcome:ok note:"2026-08-26T23:33:58Z — reserved scrollbar gutter space and constrained card layout actions with regression coverage"
+- audit:state-change at:2026-08-27T21:07:21Z task:TASK-011 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

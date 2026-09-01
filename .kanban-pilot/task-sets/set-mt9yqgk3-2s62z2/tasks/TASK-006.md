@@ -2,12 +2,11 @@
 id: TASK-006
 title: Task Details: Mermaid diagrams(Flow charts) are rendered with black shapes only
 type: bug
-state: in-progress
+state: done
 status: idle
 position: 2
 created: 2026-08-26T20:17:56Z
-updated: 2026-08-26T20:29:46Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"r1259eq"}
+updated: 2026-08-27T21:07:17Z
 chat: 65bb3230-7aef-492d-b5e6-44a680ea74ad
 copilot_session_id: 65bb3230-7aef-492d-b5e6-44a680ea74ad
 scope_hash: c0408a9
@@ -72,3 +71,4 @@ Acceptance criteria:
 - run:r1259eq task:TASK-006 stage:develop result:ok note:"2026-08-26T20:29:32Z — configured readable Mermaid flowchart colors, retained safe SVG styles, and added palette coverage."
 - audit:status-change at:2026-08-26T20:29:46Z task:TASK-006 from:running to:idle action:receipt run:r1259eq outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-26T20:29:46Z task:TASK-006 stage:develop action:receipt run:r1259eq outcome:ok note:"2026-08-26T20:29:32Z — configured readable Mermaid flowchart colors, retained safe SVG styles, and added palette coverage."
+- audit:state-change at:2026-08-27T21:07:17Z task:TASK-006 from:in-progress to:done action:move note:"State changed from in-progress to done via move."
