@@ -31,7 +31,7 @@ import {
 	validateSettingValue,
 } from '../board/boardPanel';
 import { Executor } from '../chat/executor';
-import { RunManager } from '../chat/runManager';
+import { CommandExecutor, RunManager } from '../chat/runManager';
 import { formatReceipt } from '../chat/receipt';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
 import {
@@ -317,9 +317,18 @@ suite('BoardPanel Settings', () => {
 
 	test('renders flowchart and sequence diagrams through the packaged local Mermaid bridge', async () => {
 		const sections = [
-			['Request', ['flowchart TD', '  Request --> Review']],
+			['Request', [
+				'flowchart TD',
+				'  Entry["Entry point"] -->|dispatches work| Core["Core module"]',
+				'  Core --> Result["Saved result"]',
+			]],
 			['Refined', ['sequenceDiagram', '  participant User', '  participant Board', '  User->>Board: Select task']],
-			['Scope', ['flowchart LR', '  Edit --> Save']],
+			['Scope', [
+				'flowchart LR',
+				'  subgraph Persistence["Persistence flow"]',
+				'    Edit["Edit task"] -->|persist on every mutation| Save["Save state"]',
+				'  end',
+			]],
 		] as const;
 		const html = sections.map(([label, source]) => (
 			'<section data-section="' + label + '">' + renderTaskMarkdown('```mermaid\n' + source.join('\n') + '\n```') + '</section>'
@@ -344,6 +353,18 @@ suite('BoardPanel Settings', () => {
 			assert.strictEqual(root.querySelectorAll('.modal-mermaid-source').length, 0);
 			assert.ok(root.querySelector('.modal-mermaid-rendered svg.flowchart'));
 			assert.ok(root.querySelector('.modal-mermaid-rendered svg[aria-roledescription="sequence"]'));
+			const flowchartSvgs = Array.from(root.querySelectorAll('.modal-mermaid-rendered svg.flowchart'));
+			const flowchartText = flowchartSvgs.map((svg) => svg.textContent ?? '').join('\n');
+			const flowchartMarkup = flowchartSvgs.map((svg) => svg.outerHTML).join('\n');
+			assert.match(flowchartText, /Entry point/);
+			assert.match(flowchartText, /Core module/);
+			assert.match(flowchartText, /Saved result/);
+			assert.match(flowchartText, /Edit task/);
+			assert.match(flowchartText, /Save state/);
+			assert.match(flowchartText, /dispatches work/);
+			assert.match(flowchartText, /persist on every mutation/);
+			assert.match(flowchartText, /Persistence flow/);
+			assert.doesNotMatch(flowchartMarkup, /foreignObject/i);
 			const flowchartStyles = root.querySelector('.modal-mermaid-rendered svg.flowchart style')?.textContent ?? '';
 			assert.match(flowchartStyles, /fill:\s*#3a3d41/, 'flowchart nodes use the readable fallback fill');
 			assert.match(flowchartStyles, /fill:\s*#f0f0f0/, 'flowchart labels use the readable fallback text color');
@@ -754,6 +775,16 @@ suite('BoardPanel Settings', () => {
 			);
 			assert.match(
 				stylesheet,
+				/\.drop-slot\.empty-slot\s*\{[\s\S]*?margin:\s*0;[\s\S]*?border:\s*1px dashed/,
+				'empty drop targets stay inside the cards scrollport instead of clipping their upper border',
+			);
+			assert.match(
+				stylesheet,
+				/\.drop-slot\s*\{[\s\S]*?margin:\s*-2px 0;/,
+				'populated insertion targets retain their existing shared spacing',
+			);
+			assert.match(
+				stylesheet,
 				/\.card\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?max-width:\s*100%;/,
 				'cards remain constrained to the available scroller width',
 			);
@@ -863,6 +894,148 @@ suite('BoardPanel Settings', () => {
 		} finally {
 			browserBoard.dispose();
 			assert.strictEqual(browserSurface.connected, false);
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('routes the move UI through moveTask without invoking an action or chat', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-move-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-move-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const executorCalls: unknown[] = [];
+		const executor: Executor = {
+			async isAvailable() {
+				return true;
+			},
+			async run(task, taskFileUri, prompt, stage, options) {
+				executorCalls.push({ task, taskFileUri, prompt, stage, options });
+				return { ok: true, sessionId: 'unexpected-session' };
+			},
+		};
+		const commandCalls: { command: string; args: readonly unknown[] }[] = [];
+		const executeCommand: CommandExecutor = <T>(command: string, ...args: unknown[]) => {
+			commandCalls.push({ command, args });
+			return Promise.resolve(undefined as T);
+		};
+		const realRunManager = new RunManager(store, executor, folder, undefined, executeCommand);
+		const moveCalls: { taskId: unknown; destination: unknown }[] = [];
+		let actionCalls = 0;
+		const runManager = {
+			async moveTask(taskId: unknown, destination: unknown) {
+				moveCalls.push({ taskId, destination });
+				return realRunManager.moveTask(taskId, destination);
+			},
+			async handleAction() {
+				actionCalls++;
+			},
+		} as unknown as RunManager;
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardMoveTest',
+			'Kanban Pilot Move Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Move from the detail panel');
+			await store.patch(task.id, {
+				chat: 'persisted-task-chat',
+				copilot_session_id: 'copilot-task-chat',
+				chat_reset_required: 'true',
+			});
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({
+							postMessage(message: unknown) {
+								posted.push(message);
+							},
+						}),
+					});
+				},
+			});
+
+			dispatchWebviewMessage(dom, {
+				type: 'task/detail',
+				task: {
+					id: task.id,
+					title: task.title,
+					type: 'feature',
+					typeLabel: 'Feature',
+					state: 'backlog',
+					stateLabel: 'Backlog',
+					status: 'idle',
+					canEdit: true,
+					request: '',
+					refined: '',
+					scope: '',
+					lastLog: '',
+					moveTargets: [
+						{ id: 'backlog', label: 'Backlog' },
+						{ id: 'refine', label: 'Refine' },
+					],
+					secondary: null,
+				},
+			});
+			const moveSelect = dom.window.document.querySelector('select[aria-label="Move task to column"]') as HTMLSelectElement | null;
+			assert.ok(moveSelect);
+			moveSelect.value = 'refine';
+			moveSelect.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			const moveMessage = [...posted].reverse().find((message): message is { type: string; taskId: string; destination: string } => (
+				message !== null && typeof message === 'object' &&
+				(message as { type?: unknown }).type === 'task/move'
+			));
+			assert.ok(moveMessage);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(moveMessage)), {
+				type: 'task/move',
+				taskId: task.id,
+				destination: 'refine',
+			});
+
+			await onMessage(moveMessage);
+
+			assert.deepStrictEqual(moveCalls, [{ taskId: task.id, destination: 'refine' }]);
+			assert.strictEqual(actionCalls, 0, 'a move must not route through action/invoke');
+			assert.deepStrictEqual(executorCalls, [], 'a move must not launch an agent stage');
+			assert.deepStrictEqual(commandCalls, [], 'a move must not open or create chat');
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'refine');
+			assert.strictEqual(after.chat, 'persisted-task-chat');
+			assert.strictEqual(after.copilotSessionId, 'copilot-task-chat');
+			assert.strictEqual(after.chatResetRequired, true);
+		} finally {
+			dom?.window.close();
 			board.dispose();
 			try {
 				await vscode.workspace.fs.delete(directory, { recursive: true });
@@ -1020,6 +1193,7 @@ suite('BoardPanel Settings', () => {
 				validation: 'Quality Pilot',
 				done: 'None',
 			},
+			selectableAgents: ['Quality Pilot'],
 			availableAgents: [
 				{ name: 'Local Agent', description: 'Workspace agent', source: 'workspace' },
 				{ name: 'Quality Pilot', description: 'Checks quality', source: 'user' },
@@ -1092,6 +1266,21 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(refineSelect.options[0]?.textContent, 'Bro Refiner');
 		assert.ok(!Array.from(refineSelect.options).some((option) => option.textContent === 'Bro Refiner (current)'));
 		const legacySelect = settingsDocument.getElementById('agent-select-in-progress') as HTMLSelectElement;
+		// 'Legacy Coder' has no registered agent action, so the row must say the
+		// assignment is presentation-only; 'Quality Pilot' does, so it must not.
+		const legacyNote = settingsDocument.getElementById('agent-setting-note-in-progress');
+		assert.ok(legacyNote, 'an unselectable assignment must be marked presentation-only');
+		assert.match(String(legacyNote?.textContent), /Presentation only/);
+		assert.strictEqual(
+			settingsDocument.getElementById('agent-setting-note-validation'),
+			null,
+			'a selectable assignment must not be marked presentation-only',
+		);
+		assert.strictEqual(
+			settingsDocument.getElementById('agent-setting-note-refine'),
+			null,
+			'a column left on its default must not be marked',
+		);
 		assert.strictEqual(legacySelect.value, 'Legacy Coder');
 		assert.ok(Array.from(legacySelect.options).some((option) => option.textContent === 'Legacy Coder (current)'));
 		refineSelect.value = 'Local Agent';

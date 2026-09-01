@@ -5,12 +5,12 @@ import * as vscode from 'vscode';
 
 import { Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
-import { CancellationResult, ChatCommandApi, ChatSessionExecutor, Executor, ExecutorResult, RunOptions } from '../chat/executor';
+import { CancellationResult, ChatCommandApi, ChatSessionExecutor, CHAT_NEW_COMMAND, Executor, ExecutorResult, RunOptions } from '../chat/executor';
 import { closeTaskChatTabs, CommandExecutor, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 import { parseAuditEvents } from '../model/taskLog';
-import { sessionUriForTask, sessionUriForTaskBinding } from '../chat/sessionUri';
+import { sessionIdForTask, sessionUriForId, sessionUriForTask, sessionUriForTaskBinding } from '../chat/sessionUri';
 import { RECEIPT_COMPLETION_GATES } from '../model/gates';
 import { hashScope } from '../chat/scopeHash';
 
@@ -107,11 +107,14 @@ class PendingChatCommands implements ChatCommandApi {
 	readonly responses: { runId: string; deferred: Deferred<unknown> }[] = [];
 
 	getCommands(): Thenable<string[]> {
-		return Promise.resolve(['workbench.action.chat.openagent']);
+		return Promise.resolve([CHAT_NEW_COMMAND, 'workbench.action.chat.openagent']);
 	}
 
 	executeCommand<T>(command: string, ...args: unknown[]): Thenable<T> {
 		if (command === 'vscode.open') {
+			return Promise.resolve(undefined as T);
+		}
+		if (command === CHAT_NEW_COMMAND) {
 			return Promise.resolve(undefined as T);
 		}
 
@@ -341,6 +344,63 @@ suite('M3 RunManager', () => {
 			assert.ok(parseAuditEvents(after.sections['Log']).some((event) => event.kind === 'state-change' && event.to === 'done'));
 		});
 
+		test('manual moves preserve an existing chat binding and never create chat activity', async () => {
+			const task = await store.create('Preserve the task conversation');
+			await store.patch(task.id, {
+				state: 'refine',
+				status: 'idle',
+				chat: 'persisted-task-chat',
+				copilot_session_id: 'copilot-task-chat',
+				chat_reset_required: 'true',
+			});
+			const executor = new StubExecutor(() => 'hang');
+			const commandCalls: { command: string; args: readonly unknown[] }[] = [];
+			const runManager = new RunManager(
+				store,
+				executor,
+				folder,
+				undefined,
+				recordingCommandExecutor(commandCalls),
+			);
+
+			for (const destination of ['in-progress', 'validation'] as const) {
+				assert.deepStrictEqual(await runManager.moveTask(task.id, destination), { kind: 'applied' });
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.strictEqual(after.state, destination);
+				assert.strictEqual(after.chat, 'persisted-task-chat');
+				assert.strictEqual(after.copilotSessionId, 'copilot-task-chat');
+				assert.strictEqual(after.chatResetRequired, true);
+				assert.strictEqual(after.status, 'idle');
+				assert.strictEqual(after.run, undefined);
+			}
+
+			assert.strictEqual(executor.calls.length, 0, 'a pure move must not invoke the executor');
+			assert.deepStrictEqual(commandCalls, [], 'a pure move must not open or reset chat');
+		});
+
+		test('manual moves of an unbound task do not persist a chat or invoke chat activity', async () => {
+			const task = await store.create('Move without a conversation');
+			const executor = new StubExecutor(() => 'hang');
+			const commandCalls: { command: string; args: readonly unknown[] }[] = [];
+			const runManager = new RunManager(
+				store,
+				executor,
+				folder,
+				undefined,
+				recordingCommandExecutor(commandCalls),
+			);
+
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'refine'), { kind: 'applied' });
+			assert.deepStrictEqual(await runManager.moveTask(task.id, 'in-progress'), { kind: 'applied' });
+
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.chat, undefined);
+			assert.strictEqual(after.copilotSessionId, undefined);
+			assert.strictEqual(after.chatResetRequired, false);
+			assert.strictEqual(executor.calls.length, 0, 'a pure move must not invoke the executor');
+			assert.deepStrictEqual(commandCalls, [], 'a pure move must not open or create chat');
+		});
+
 		test('manual move into Done closes only the matching task chat tab', async () => {
 			const task = await store.create('Close chat on manual completion');
 			await store.patch(task.id, { chat: 'persisted-close-session' });
@@ -417,6 +477,65 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(executor.calls.length, 1);
 			assert.strictEqual(executor.calls[0].options.openBeside, true);
 		});
+
+		test('keeps every stage run on the same derived session without ever opening a new chat', async () => {
+		const task = await store.create('Create a task conversation');
+		await store.patch(task.id, { state: 'refine', status: 'idle', chat: sessionIdForTask(task.id, 'kanban-pilot-', store.setId) });
+		const executor = new StubExecutor(async (current, prompt) => {
+			const runId = runIdFromPrompt(prompt);
+			await store.appendLog(current.id, formatReceipt({
+				runId,
+				taskId: current.id,
+				stage: 'refine',
+				result: 'ok',
+				note: 'created conversation',
+			}));
+			return { ok: true, sessionId: 'copilot-session-1' };
+		});
+		const runManager = new RunManager(store, executor, folder);
+
+		const derivedBinding = sessionIdForTask(task.id, 'kanban-pilot-', store.setId);
+		// Opening the derived session is the whole binding; New Chat would spin the
+		// conversation off into a separate Copilot chat, so it is never requested.
+		await runManager.handleAction(task.id, 'refine');
+		await waitUntilSettled(store, task.id);
+		assert.strictEqual(executor.calls[0].options.newChatBefore, undefined);
+		assert.strictEqual(executor.calls[0].task.chat, derivedBinding);
+
+		// Copilot's returned UUID is a misroute detector only (M0 finding 9): it
+		// must never overwrite the stable derived `chat` binding used to reopen
+		// the conversation, or the next open would spawn a brand-new empty chat.
+		assert.deepStrictEqual(await runManager.moveTask(task.id, 'in-progress'), { kind: 'applied' });
+		assert.deepStrictEqual(await runManager.moveTask(task.id, 'refine'), { kind: 'applied' });
+		const afterMove = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+		assert.strictEqual(afterMove.chat, derivedBinding);
+		assert.strictEqual(afterMove.copilotSessionId, 'copilot-session-1');
+		assert.strictEqual(
+			sessionUriForTaskBinding(afterMove, 'kanban-pilot-', store.setId).toString(),
+			sessionUriForTask(task.id, 'kanban-pilot-', store.setId).toString(),
+			'the reopen URI stays on the derived local session, never Copilot’s UUID',
+		);
+
+		await runManager.handleAction(task.id, 'refine');
+		await waitUntilSettled(store, task.id);
+		assert.strictEqual(executor.calls[1].options.newChatBefore, undefined);
+		assert.strictEqual(executor.calls[1].task.copilotSessionId, 'copilot-session-1');
+		assert.strictEqual(executor.calls[1].task.chat, derivedBinding);
+		assert.strictEqual((await store.readAll()).tasks[0].chat, derivedBinding);
+	});
+
+	test('treats a legacy chat binding as an existing conversation', async () => {
+		const task = await store.create('Keep a legacy conversation');
+		await store.patch(task.id, { state: 'refine', status: 'idle', chat: 'legacy-conversation-id' });
+		const executor = new StubExecutor(okReceipt(store, 'refine'));
+		const runManager = new RunManager(store, executor, folder);
+
+		await runManager.handleAction(task.id, 'refine');
+		await waitUntilSettled(store, task.id);
+
+		assert.strictEqual(executor.calls[0].options.newChatBefore, undefined);
+		assert.strictEqual(executor.calls[0].task.chat, 'legacy-conversation-id');
+	});
 
 		test('docking persists first-use identity and reuses it after manager recreation', async () => {
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
@@ -527,7 +646,7 @@ suite('M3 RunManager', () => {
 			);
 		});
 
-		test('a reloaded manager opens Copilot’s persisted conversation id over a legacy derived binding', async () => {
+		test('a reloaded manager reopens the persisted local binding, not Copilot’s conversation UUID', async () => {
 			const task = await store.create('Reopen the completed conversation');
 			await store.patch(task.id, {
 				chat: 'legacy-derived-binding',
@@ -548,6 +667,16 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(
 				(calls[0].args[0] as vscode.Uri).toString(),
 				sessionUriForTaskBinding(after, 'different-prefix-', store.setId).toString(),
+			);
+			// M0 finding 9: the Copilot UUID is not a local-session id — dock must
+			// never open a URI built from it, or VS Code spawns a new empty chat.
+			assert.strictEqual(
+				(calls[0].args[0] as vscode.Uri).toString(),
+				sessionUriForId('legacy-derived-binding').toString(),
+			);
+			assert.notStrictEqual(
+				(calls[0].args[0] as vscode.Uri).toString(),
+				sessionUriForId('copilot-conversation-id').toString(),
 			);
 			assert.strictEqual(after.chat, 'legacy-derived-binding');
 			assert.strictEqual(after.copilotSessionId, 'copilot-conversation-id');
@@ -617,6 +746,72 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'approved');
 			// resetOnApprove defaults to false — Develop deliberately continues
 			// the same conversation Refine started (see package.json's default).
+		});
+
+
+		test('passes the resolved column agent to the executor for each stage', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('chat.agentNames', {
+				refine: 'Bro Rapid Architect',
+				'in-progress': 'Bro Rapid Coder',
+				validation: 'Bro Rapid QA',
+			}, vscode.ConfigurationTarget.Global);
+			try {
+				for (const [state, action, expected] of [
+					['refine', 'refine', 'Bro Rapid Architect'],
+					['approved', 'develop', 'Bro Rapid Coder'],
+					['validation', 'validate', 'Bro Rapid QA'],
+				] as const) {
+					const task = await store.create('Agent reaches the executor');
+					await store.patch(task.id, { state, status: 'idle' });
+					const executor = new StubExecutor(() => 'hang');
+					const runManager = new RunManager(store, executor, folder);
+
+					await runManager.handleAction(task.id, action);
+					await waitUntil(() => executor.calls.length === 1);
+					assert.strictEqual(
+						executor.calls[0].options.agentName,
+						expected,
+						`${action} must run under its column agent`,
+					);
+					await runManager.handleAction(task.id, 'stop');
+				}
+			} finally {
+				await cfg.update('chat.agentNames', undefined, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('a column agent assignment does not disturb the task session binding', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			await cfg.update('chat.agentNames', { refine: 'Bro Rapid Architect' }, vscode.ConfigurationTarget.Global);
+			try {
+				const task = await store.create('Agent selection leaves the session alone');
+				const binding = sessionIdForTask(task.id, 'kanban-pilot-', store.setId);
+				await store.patch(task.id, { state: 'refine', status: 'idle', chat: binding });
+				const executor = new StubExecutor(() => 'hang');
+				const commandCalls: { command: string; args: readonly unknown[] }[] = [];
+				const runManager = new RunManager(
+					store,
+					executor,
+					folder,
+					undefined,
+					recordingCommandExecutor(commandCalls),
+				);
+
+				await runManager.handleAction(task.id, 'refine');
+				await waitUntil(() => executor.calls.length === 1);
+
+				assert.strictEqual(executor.calls[0].options.agentName, 'Bro Rapid Architect');
+				assert.strictEqual(executor.calls[0].options.newChatBefore, undefined, 'no New Chat for agent selection');
+				assert.strictEqual(executor.calls[0].task.chat, binding);
+				assert.ok(
+					!commandCalls.some(({ command }) => command === 'workbench.action.chat.newChat'),
+					'selecting an agent must not reset the conversation',
+				);
+				await runManager.handleAction(task.id, 'stop');
+			} finally {
+				await cfg.update('chat.agentNames', undefined, vscode.ConfigurationTarget.Global);
+			}
 		});
 
 		test('develop is a single click that both moves the card and launches a run', async () => {
@@ -698,7 +893,11 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'scoped');
 			assert.strictEqual(after.status, 'idle');
 			assert.strictEqual(after.run, undefined);
-			assert.strictEqual(after.chat, 's1', 'the concrete Copilot session id must replace the first-use derived binding');
+			assert.strictEqual(
+				after.chat,
+				sessionIdForTask(task.id, 'kanban-pilot-', store.setId),
+				'the derived local binding is the reopen id and must survive the run, not be replaced by Copilot’s UUID',
+			);
 			assert.strictEqual(after.copilotSessionId, 's1');
 			assert.ok(after.scopeHash, 'refine success must record scope_hash for §6.8 layer 2');
 			const audit = parseAuditEvents(after.sections['Log']);

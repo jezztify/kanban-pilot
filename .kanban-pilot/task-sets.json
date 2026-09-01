@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "activeSetId": "set-mt9yqgk3-2s62z2",
+  "activeSetId": "set-mtc0ngyp-2gzaam",
   "sets": [
     {
       "id": "default",
@@ -29,6 +29,10 @@
     {
       "id": "set-mt9yqgk3-2s62z2",
       "name": "0.4.1"
+    },
+    {
+      "id": "set-mtc0ngyp-2gzaam",
+      "name": "0.4.2"
     }
   ]
 }

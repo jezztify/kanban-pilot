@@ -2,12 +2,11 @@
 id: TASK-008
 title: Add ability to specify agent directories to use for kanban-pilot
 type: feature
-state: in-progress
+state: done
 status: idle
 position: 4
 created: 2026-08-26T20:39:44Z
-updated: 2026-08-26T20:52:14Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"r4zn627"}
+updated: 2026-08-27T21:07:19Z
 chat: 7ab7af08-805e-483f-99c2-f92aac5f6070
 copilot_session_id: 7ab7af08-805e-483f-99c2-f92aac5f6070
 scope_hash: 8f928f5
@@ -92,3 +91,4 @@ de-duplication and source-precedence behavior.
 - run:r4zn627 task:TASK-008 stage:develop result:ok note:"2026-08-26T20:52:06Z — added the multi-directory agent setting, discovery integration, Settings controls, tests, and documentation"
 - audit:status-change at:2026-08-26T20:52:14Z task:TASK-008 from:running to:idle action:receipt run:r4zn627 outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-26T20:52:14Z task:TASK-008 stage:develop action:receipt run:r4zn627 outcome:ok note:"2026-08-26T20:52:06Z — added the multi-directory agent setting, discovery integration, Settings controls, tests, and documentation"
+- audit:state-change at:2026-08-27T21:07:19Z task:TASK-008 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

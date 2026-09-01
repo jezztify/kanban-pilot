@@ -2,12 +2,11 @@
 id: TASK-005
 title: Task Details modal: Fix rendering issues
 type: bug
-state: in-progress
+state: done
 status: idle
 position: 1
 created: 2026-08-26T19:41:27Z
-updated: 2026-08-26T19:46:01Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"rg1eltl"}
+updated: 2026-08-27T21:07:17Z
 chat: 5a2b7ad9-e3f0-4b6b-b70a-4ab5446947c8
 copilot_session_id: 5a2b7ad9-e3f0-4b6b-b70a-4ab5446947c8
 scope_hash: 9e3df33
@@ -50,3 +49,4 @@ The Task Details modal renders Markdown checklist labels as an `inline-flex` row
 - run:rg1eltl task:TASK-005 stage:develop result:ok note:"2026-08-26T19:45:47Z — restored inline checklist flow and added mixed inline-code regression coverage; focused tests, compile, and lint pass."
 - audit:status-change at:2026-08-26T19:46:01Z task:TASK-005 from:running to:idle action:receipt run:rg1eltl outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-26T19:46:01Z task:TASK-005 stage:develop action:receipt run:rg1eltl outcome:ok note:"2026-08-26T19:45:47Z — restored inline checklist flow and added mixed inline-code regression coverage; focused tests, compile, and lint pass."
+- audit:state-change at:2026-08-27T21:07:17Z task:TASK-005 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

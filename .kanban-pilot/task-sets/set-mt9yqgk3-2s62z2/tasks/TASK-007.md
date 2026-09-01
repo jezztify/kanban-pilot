@@ -2,12 +2,11 @@
 id: TASK-007
 title: Fix failing test
 type: bug
-state: in-progress
+state: done
 status: idle
 position: 3
 created: 2026-08-26T20:38:07Z
-updated: 2026-08-26T20:45:06Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"r29u2cc"}
+updated: 2026-08-27T21:07:18Z
 chat: 96caefce-fcaa-4622-80dc-963b7f480e3a
 copilot_session_id: 96caefce-fcaa-4622-80dc-963b7f480e3a
 scope_hash: ca392aa
@@ -63,3 +62,4 @@ The `M3 RunManager` test for a develop run that times out and later writes a sam
 - run:r29u2cc task:TASK-007 stage:develop result:ok note:"Reduced late-receipt backstop delay and verified idempotent proposal recovery with focused and full tests."
 - audit:status-change at:2026-08-26T20:45:06Z task:TASK-007 from:running to:idle action:receipt run:r29u2cc outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-26T20:45:06Z task:TASK-007 stage:develop action:receipt run:r29u2cc outcome:ok note:"Reduced late-receipt backstop delay and verified idempotent proposal recovery with focused and full tests."
+- audit:state-change at:2026-08-27T21:07:18Z task:TASK-007 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

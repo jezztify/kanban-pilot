@@ -473,6 +473,7 @@ export class RunManager {
 		private readonly workspaceFolder: vscode.WorkspaceFolder,
 		private readonly tabGroups: TabGroupsLike = vscode.window.tabGroups,
 		private readonly executeCommand: CommandExecutor = vscode.commands.executeCommand.bind(vscode.commands),
+		private readonly trace: (message: string) => void = () => {},
 	) {
 		this.concurrency = coordinatorFor(workspaceFolder, store);
 	}
@@ -521,6 +522,7 @@ export class RunManager {
 		if (this.disposed) {
 			return;
 		}
+		this.trace(`handleAction task=${taskId} action=${action}`);
 		switch (action) {
 			case 'refine':
 				await this.startStageRun(taskId, action, 'refine');
@@ -629,6 +631,7 @@ export class RunManager {
 		if (this.disposed) {
 			return { kind: 'not-found' };
 		}
+		this.trace(`moveTask task=${String(taskId)} destination=${String(destination)}`);
 		return this.concurrency.runExclusive(async () => {
 			if (this.disposed) {
 				return { kind: 'not-found' };
@@ -677,6 +680,7 @@ export class RunManager {
 		if (this.disposed) {
 			return { kind: 'stale' };
 		}
+		this.trace(`applyPendingOutcome task=${taskId}`);
 		let outcome!: PendingOutcomeResult;
 		await this.concurrency.runExclusive(async () => {
 			if (this.disposed) {
@@ -716,6 +720,7 @@ export class RunManager {
 		if (this.disposed) {
 			return;
 		}
+		this.trace(`dockTaskChat task=${taskId} onSelect=${opts.onSelect} explicit=${opts.explicit === true}`);
 		const cfg = readConfig();
 		if (!opts.explicit && (!cfg.dockChat || (opts.onSelect && !cfg.dockChatOnSelect))) {
 			return;
@@ -1070,6 +1075,15 @@ export class RunManager {
 		}
 		const cfg = readConfig();
 		const runId = generateRunId();
+		// Stage runs never issue `workbench.action.chat.newChat`. Opening the
+		// task's derived `vscode-chat-session://local` URI is the whole binding
+		// (M0 findings 4–5): the first open creates that task-unique session and
+		// every later open reopens the same one idempotently, so injecting into it
+		// continues the one conversation. Issuing New Chat here instead spins the
+		// conversation off into a separate Copilot-managed chat divorced from the
+		// derived session, which is why a fresh empty chat appeared on the next
+		// stage/move. New Chat stays reserved for the explicit approval reset path.
+		const newChatBefore = false;
 		const started = await this.concurrency.tryStart(taskId, runId, cfg.maxParallelTasks, async () => {
 			if (this.disposed) {
 				return false;
@@ -1138,7 +1152,7 @@ export class RunManager {
 
 		// Fire-and-forget: the board reflects state via the file watcher, not a
 		// held promise. Errors are caught inside — this never rejects.
-		void this.runStage(taskId, runId, stage, cfg, cfg.dockChat && shouldDockActionChat(action));
+		void this.runStage(taskId, runId, stage, cfg, cfg.dockChat && shouldDockActionChat(action), newChatBefore);
 	}
 
 	private async runStage(
@@ -1147,6 +1161,7 @@ export class RunManager {
 		stage: Stage,
 		cfg: RunManagerConfig,
 		openBeside: boolean,
+		newChatBefore: boolean,
 	): Promise<void> {
 		if (this.disposed) {
 			this.releaseReservation(taskId, runId);
@@ -1214,9 +1229,13 @@ export class RunManager {
 					sessionPrefix: cfg.sessionPrefix,
 					toolsIncludeForRefine: cfg.toolsIncludeForRefine,
 					toolsExclude: cfg.toolsExclude,
+					...(newChatBefore ? { newChatBefore: true } : {}),
 					attachmentUris,
 					openBeside,
 					modelSelector: cfg.modelSelector,
+					// Same value the prompt's persona line renders. The executor sends it
+					// as the payload's mode, which is what actually selects the agent.
+					agentName: resolveAgentName(stage, cfg.agentNames),
 				}),
 				timeoutMs,
 			);
@@ -2259,12 +2278,14 @@ export class RunManager {
 
 		// §6.9: automatic misroute detection via Copilot's own conversation id.
 		if (result.sessionId) {
-			// The local derived id creates the first chat, but Copilot returns the
-			// concrete durable conversation id. Persist both fields so a subsequent
-			// VS Code-window reload reopens the transcript rather than an empty
-			// local-session resource.
+			this.trace(`run-result task=${taskId} run=${runId} stage=${stage} returnedSession=${result.sessionId} priorSession=${task.copilotSessionId ?? 'none'}`);
+			// Copilot's metadata.sessionId is its own conversation UUID, not a
+			// vscode-chat-session://local id (M0 finding 9). Record it ONLY as a
+			// misroute detector — never overwrite the stable derived `chat` binding
+			// with it, because reopening a URI built from that UUID spawns a fresh
+			// empty chat instead of the task's existing conversation. Leaving `chat`
+			// intact keeps reopen/continue/dock hitting the same session.
 			const sessionPatch: Record<string, string | undefined> = {
-				chat: result.sessionId,
 				copilot_session_id: result.sessionId,
 			};
 			if (task.copilotSessionId && task.copilotSessionId !== result.sessionId) {

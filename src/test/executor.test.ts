@@ -6,6 +6,7 @@ import {
 	ChatCommandApi,
 	ChatSessionExecutor,
 	CHAT_CANCEL_COMMAND,
+	CHAT_NEW_COMMAND,
 	capabilityDiagnostic,
 	orderedTaskChatAttachments,
 	resolveToolsInclude,
@@ -13,7 +14,7 @@ import {
 } from '../chat/executor';
 import { RunOptions } from '../chat/executor';
 import type { OutboundMetadata, OutboundPayload } from '../chat/executor';
-import { sessionUriForTaskBinding } from '../chat/sessionUri';
+import { sessionUriForId, sessionUriForTaskBinding } from '../chat/sessionUri';
 
 interface Deferred<T> {
 	promise: Promise<T>;
@@ -65,8 +66,9 @@ const executorRunOptions: RunOptions = {
 class ControlledChatCommands implements ChatCommandApi {
 	readonly calls: { command: string; args: readonly unknown[] }[] = [];
 	readonly responses: Deferred<unknown>[] = [];
-	availableCommands = ['vscode.open', 'workbench.action.chat.openagent'];
+	availableCommands = ['vscode.open', CHAT_NEW_COMMAND, 'workbench.action.chat.openagent'];
 	rejectAgentCommand = false;
+	rejectNewChatCommand = false;
 	rejectOpenCommand = false;
 	rejectCancelCommand = false;
 	openResponse?: Deferred<unknown>;
@@ -82,6 +84,11 @@ class ControlledChatCommands implements ChatCommandApi {
 				return Promise.reject(new Error('vscode.open unavailable'));
 			}
 			return (this.openResponse?.promise ?? Promise.resolve(undefined)) as Promise<T>;
+		}
+		if (command === CHAT_NEW_COMMAND) {
+			return this.rejectNewChatCommand
+				? Promise.reject(new Error('new chat command failed'))
+				: Promise.resolve(undefined as T);
 		}
 		if (command === CHAT_CANCEL_COMMAND) {
 			return this.rejectCancelCommand
@@ -121,6 +128,7 @@ suite('Chat capability diagnostics', () => {
 		remoteName: 'ssh-remote',
 		hasVscodeOpen: true,
 		chatCommand: 'workbench.action.chat.openagent',
+		newChatCommand: CHAT_NEW_COMMAND,
 		supportsChatSessionUri: true,
 	};
 
@@ -136,6 +144,10 @@ suite('Chat capability diagnostics', () => {
 		assert.strictEqual(
 			capabilityDiagnostic({ ...complete, supportsChatSessionUri: false })?.code,
 			'unsupported-chat-session-uri',
+		);
+		assert.strictEqual(
+			capabilityDiagnostic({ ...complete, newChatCommand: undefined }, false, true)?.code,
+			'missing-new-chat-command',
 		);
 		const diagnostic = capabilityDiagnostic({ ...complete, chatCommand: undefined });
 		assert.strictEqual(diagnostic?.remoteName, 'ssh-remote');
@@ -184,6 +196,99 @@ suite('Chat capability diagnostics', () => {
 	});
 });
 
+suite('first-use task chat', () => {
+	test('opens the task session, creates New Chat, then injects the prompt', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-007'),
+			vscode.Uri.file('C:/tasks/TASK-007.md'),
+			'first-use prompt',
+			'develop',
+			{ ...executorRunOptions, newChatBefore: true },
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		assert.deepStrictEqual(commands.calls.map(({ command }) => command), [
+			'vscode.open',
+			CHAT_NEW_COMMAND,
+			'workbench.action.chat.openagent',
+		]);
+		const payload = commands.calls[2].args[0] as OutboundPayload;
+		assert.strictEqual(payload.query, 'first-use prompt');
+		assert.ok(!('modelSelector' in payload), 'an omitted selector must inherit the New Chat model');
+
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-7' } });
+		assert.deepStrictEqual(await run, { ok: true, sessionId: 'session-7' });
+	});
+
+	test('preserves an explicit model selector after New Chat', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-008'),
+			vscode.Uri.file('C:/tasks/TASK-008.md'),
+			'override prompt',
+			'develop',
+			{
+				...executorRunOptions,
+				newChatBefore: true,
+				modelSelector: { id: 'gpt-5.6-luna', vendor: 'copilot' },
+			},
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		assert.deepStrictEqual((commands.calls[2].args[0] as OutboundPayload).modelSelector, {
+			id: 'gpt-5.6-luna',
+			vendor: 'copilot',
+		});
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-8' } });
+		assert.deepStrictEqual(await run, { ok: true, sessionId: 'session-8' });
+	});
+
+	test('uses the clipboard fallback with an explicit diagnostic when New Chat is unavailable', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands = ['vscode.open', 'workbench.action.chat.openagent'];
+		const executor = new ChatSessionExecutor(commands);
+
+		const result = await executor.run(
+			executorTask('TASK-009'),
+			vscode.Uri.file('C:/tasks/TASK-009.md'),
+			'fallback prompt',
+			'develop',
+			{ ...executorRunOptions, newChatBefore: true },
+		);
+
+		assert.strictEqual(result.ok, false);
+		assert.strictEqual(result.diagnostic?.code, 'missing-new-chat-command');
+		assert.ok(!commands.calls.some(({ command }) => command === 'workbench.action.chat.openagent'));
+		assert.ok(!commands.calls.some(({ command }) => command === CHAT_NEW_COMMAND));
+	});
+
+	test('does not inject when New Chat fails and reports an actionable diagnostic', async () => {
+		const commands = new ControlledChatCommands();
+		commands.rejectNewChatCommand = true;
+		const executor = new ChatSessionExecutor(commands);
+
+		const result = await executor.run(
+			executorTask('TASK-010'),
+			vscode.Uri.file('C:/tasks/TASK-010.md'),
+			'failed new-chat prompt',
+			'develop',
+			{ ...executorRunOptions, newChatBefore: true },
+		);
+
+		assert.strictEqual(result.ok, false);
+		assert.strictEqual(result.diagnostic?.code, 'new-chat-command-failed');
+		assert.deepStrictEqual(commands.calls.map(({ command }) => command), [
+			'vscode.open',
+			CHAT_NEW_COMMAND,
+		]);
+		assert.match(result.diagnostic?.remediation ?? '', /retry/i);
+		assert.ok(!commands.calls.some(({ command }) => command === 'workbench.action.chat.openagent'));
+	});
+});
+
 suite('task chat open options', () => {
 	test('docking opens the task session beside the board as a preview', () => {
 		assert.deepStrictEqual(taskChatOpenOptions(true), {
@@ -216,7 +321,7 @@ suite('task chat open options', () => {
 		assert.deepStrictEqual(await run, { ok: true, sessionId: 'session-1' });
 	});
 
-	test('injection opens Copilot’s concrete session id after a window reload', async () => {
+	test('injection reopens the derived local binding, not Copilot’s conversation UUID', async () => {
 		const commands = new ControlledChatCommands();
 		const executor = new ChatSessionExecutor(commands);
 		const task = executorTask('TASK-001');
@@ -226,9 +331,16 @@ suite('task chat open options', () => {
 		const run = executor.run(task, vscode.Uri.file('C:/tasks/TASK-001.md'), 'prompt', 'develop', executorRunOptions);
 		await waitUntil(() => commands.responses.length === 1);
 
+		// M0 finding 9: copilot_session_id is Copilot's own conversation UUID, not
+		// a vscode-chat-session://local id. Opening a URI built from it spawns a
+		// new empty chat — the reopen must stay on the derived local binding.
 		assert.strictEqual(
 			(commands.calls[0].args[0] as vscode.Uri).toString(),
-			sessionUriForTaskBinding(task, executorRunOptions.sessionPrefix, task.setId).toString(),
+			sessionUriForId('legacy-derived-binding').toString(),
+		);
+		assert.notStrictEqual(
+			(commands.calls[0].args[0] as vscode.Uri).toString(),
+			sessionUriForId('copilot-conversation-id').toString(),
 		);
 
 		commands.responses[0].resolve({ metadata: { sessionId: 'copilot-conversation-id' } });
@@ -573,5 +685,97 @@ suite('outbound payload seam', () => {
 		commands.responses[0].resolve({ metadata: { sessionId: 'session-1' } });
 		commands.responses[1].resolve({ metadata: { sessionId: 'session-2' } });
 		await Promise.all([first, second]);
+	});
+});
+
+
+suite('column agent selection', () => {
+	const AGENT = 'Bro LocalRapidPrototyping Orchestrator';
+
+	// These assert the OUTCOME — which agent the payload selects — not the
+	// transport. An earlier version checked only the invoked command id, which
+	// passed against a payload that silently resolved back to the built-in agent.
+	test('sends the assigned agent as the payload mode so findModeByName selects it', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-030'),
+			vscode.Uri.file('C:/tasks/TASK-030.md'),
+			'agent prompt',
+			'develop',
+			{ ...executorRunOptions, agentName: AGENT },
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		const injected = commands.calls.find(({ command }) => command === 'workbench.action.chat.openagent');
+		assert.ok(injected, 'the turn still goes through the configured mode command');
+		assert.strictEqual(
+			(injected.args[0] as OutboundPayload).mode,
+			AGENT,
+			'the payload mode must name the agent, not the configured chat mode',
+		);
+		assert.ok(
+			!commands.calls.some(({ command }) => command === CHAT_NEW_COMMAND),
+			'selecting an agent must not create a conversation',
+		);
+
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-30' } });
+		assert.deepStrictEqual(await run, { ok: true, sessionId: 'session-30' });
+	});
+
+	test('an unassigned column still sends the configured chat mode unchanged', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-031'),
+			vscode.Uri.file('C:/tasks/TASK-031.md'),
+			'plain prompt',
+			'develop',
+			{ ...executorRunOptions },
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		const injected = commands.calls.find(({ command }) => command === 'workbench.action.chat.openagent');
+		assert.strictEqual((injected!.args[0] as OutboundPayload).mode, 'agent');
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-31' } });
+		assert.deepStrictEqual(await run, { ok: true, sessionId: 'session-31' });
+	});
+
+	test('a blank assignment falls back to the configured mode rather than an empty one', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-032'),
+			vscode.Uri.file('C:/tasks/TASK-032.md'),
+			'blank prompt',
+			'develop',
+			{ ...executorRunOptions, agentName: '   ' },
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		const injected = commands.calls.find(({ command }) => command === 'workbench.action.chat.openagent');
+		assert.strictEqual((injected!.args[0] as OutboundPayload).mode, 'agent');
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-32' } });
+		await run;
+	});
+
+	test('selecting an agent opens the task session and never resets it', async () => {
+		const commands = new ControlledChatCommands();
+		const executor = new ChatSessionExecutor(commands);
+		const run = executor.run(
+			executorTask('TASK-033'),
+			vscode.Uri.file('C:/tasks/TASK-033.md'),
+			'agent prompt',
+			'develop',
+			{ ...executorRunOptions, agentName: AGENT },
+		);
+
+		await waitUntil(() => commands.responses.length === 1);
+		assert.deepStrictEqual(commands.calls.map(({ command }) => command), [
+			'vscode.open',
+			'workbench.action.chat.openagent',
+		], 'open the derived session, then inject — no New Chat, no extra command');
+		commands.responses[0].resolve({ metadata: { sessionId: 'session-33' } });
+		await run;
 	});
 });

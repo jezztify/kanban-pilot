@@ -2,11 +2,11 @@
 id: TASK-010
 title: when tasks are in-progress, the webview tends to refresh all the time
 type: bug
-state: in-progress
+state: done
 status: idle
 position: 5
 created: 2026-08-26T21:18:49Z
-updated: 2026-08-26T23:14:19Z
+updated: 2026-08-27T21:07:20Z
 chat: eeeff8c6-0bd4-447b-9ba3-596226140008
 copilot_session_id: eeeff8c6-0bd4-447b-9ba3-596226140008
 scope_hash: 0c65bc1
@@ -81,3 +81,4 @@ task set, or the selected task is no longer available.
 - audit:activity-finish at:2026-08-26T21:30:37Z task:TASK-010 stage:develop action:receipt run:r0vjjnc outcome:ok note:"Preserved watcher-refresh scroll positions and open modal or draft state, with regression coverage."
 - audit:state-change at:2026-08-26T23:13:37Z task:TASK-010 from:in-progress to:validation action:apply-pending run:r0vjjnc outcome:ok note:"State changed from in-progress to validation via apply-pending."
 - audit:state-change at:2026-08-26T23:14:19Z task:TASK-010 from:validation to:in-progress action:move note:"State changed from validation to in-progress via move."
+- audit:state-change at:2026-08-27T21:07:20Z task:TASK-010 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

@@ -728,14 +728,34 @@ The v1 implementation is `ChatSessionExecutor` — the mechanism from
 binding of §6.7:
 
 ```ts
-// Open immediately before injecting, with nothing awaited in between (§6.9).
+// Open immediately before injecting, with no unrelated work in between (§6.9).
 await vscode.commands.executeCommand('vscode.open', sessionUriFor(task), { preserveFocus: false });
+
+// Only for a task without a concrete Copilot conversation identity. This is
+// awaited inside the same process-wide injection mutex as open and inject.
+if (options.newChatBefore) {
+  await vscode.commands.executeCommand('workbench.action.chat.newChat');
+}
 
 const result = await vscode.commands.executeCommand(
   openCommand,                              // mode-scoped, resolved live — see below
   {
     query: prompt,
     mode: options.mode,                      // kanbanPilot.chat.mode, default 'agent'
+
+The first-use sequence is therefore `vscode.open` → optional
+`workbench.action.chat.newChat` → `workbench.action.chat.open<Mode>`. The New Chat action is
+Copilot Chat's built-in operation, not a prompt persona: it carries the Agent and model/LLM
+currently selected in the Copilot Chat UI into the newly created task conversation. When
+`kanbanPilot.chat.modelSelector` is unset, the selected Copilot model is inherited. When it is
+set, the explicit `modelSelector` in the outbound payload takes precedence intentionally. The
+extension does not scrape the Agent picker or model selector.
+
+The executor feature-detects `workbench.action.chat.newChat` only when the task is on its first
+use. If that command is missing, or if invoking it fails, the executor does not submit the
+prompt to an unverified conversation. It reports a capability diagnostic and uses the existing
+clipboard fallback after opening the task session, so the user can retry or paste the prompt
+manually. A missing or failed New Chat is never treated as successful Agent/model inheritance.
     blockOnResponse: true,                   // resolves at terminal state
     attachFiles: [taskFileUri, ...attachmentUris], // Markdown first, then referenced task images
     toolsInclude: resolveToolsInclude(stage, options.toolsIncludeForRefine),
@@ -773,9 +793,12 @@ though note that only the injection path gives one-chat-per-task in the *user-vi
 
 `isAvailable()` feature-detects each command id via `vscode.commands.getCommands(true)`. M0
 resolved the mode-scoped id to **`workbench.action.chat.openagent`** (lowercase), but it is
-derived at runtime from the mode's display name, so it is looked up rather than hardcoded. On failure the executor degrades to opening the task's
-session and copying the prompt to the clipboard for the user to paste — the session binding
-still holds, and the board still tracks state via the receipt.
+derived at runtime from the mode's display name, so it is looked up rather than hardcoded. On
+ordinary injection failure the executor degrades to opening the task's session and copying the
+prompt to the clipboard for the user to paste — the session binding still holds, and the board
+still tracks state via the receipt. The first-use New Chat failure described above is a
+separate, explicit diagnostic because silently continuing would lose the requested Agent/model
+inheritance guarantee.
 
 #### Which actions launch a run
 
@@ -883,9 +906,9 @@ the gate.
 | Event | Session behaviour |
 | --- | --- |
 | **New Task** | No session created — ids are derived, not allocated. Nothing exists until the first run. |
-| **First run** (Accept) | `vscode.open` mints the session; tab titled after the task |
-| **Later runs** (Refine, Continue) | Same URI → same conversation, full history intact |
-| **Approve** | Conversation cleared, URI unchanged — the implementation phase starts clean (§6.8) |
+| **First run** (Refine, Develop, Validate, or Split) | `vscode.open` → `workbench.action.chat.newChat` → mode-scoped injection when no concrete Copilot id exists; the returned id is persisted and the tab is titled after the task |
+| **Later runs** (Refine, Develop, Continue, Validate, or Split) | Same URI and persisted concrete id → same conversation, full history intact; New Chat is not invoked again |
+| **Approve** | Conversation is cleared only when `chat.resetOnApprove` is enabled; URI and task binding remain unchanged (§6.8) |
 | **Stop** | Active response/tool execution is cancelled in this task's focused session; conversation history remains and `Continue` resumes in place |
 | **Done** | Tab closed via `window.tabGroups.close`; session persists in VS Code's session list |
 | **Reopen** | Same derived URI — the original conversation comes back |

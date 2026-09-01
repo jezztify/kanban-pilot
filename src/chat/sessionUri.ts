@@ -43,18 +43,46 @@ export function sessionIdForTask(
 }
 
 /**
- * Resolves the durable chat identity for a task. Copilot's returned session
- * id is the concrete persisted conversation identity after a prompt has run;
- * it must win over the derived local-session id when VS Code restores chats
- * after a window reload. The legacy `chat` binding remains the first-use
- * fallback until Copilot supplies that concrete id.
+ * Returns true when the task has no known Copilot conversation identity yet.
+ * A missing chat field and the deterministic binding written before a first
+ * run are both placeholders; a non-derived legacy chat value is treated as a
+ * real persisted conversation for backwards compatibility.
+ */
+export function isFirstUseTaskChat(
+	task: { id: string; chat?: string; copilotSessionId?: string },
+	prefix = DEFAULT_SESSION_PREFIX,
+	setId = DEFAULT_TASK_SET_ID,
+): boolean {
+	return !task.copilotSessionId
+		&& (!task.chat || task.chat === sessionIdForTask(task.id, prefix, setId));
+}
+
+/**
+ * Resolves the durable `vscode-chat-session://local` id used to open, reopen,
+ * dock, continue, and close a task's conversation.
+ *
+ * Copilot's returned `metadata.sessionId` (persisted as `copilot_session_id`)
+ * is Copilot's own conversation UUID, NOT a valid `LocalChatSessionUri` id
+ * (M0 finding 9). Building the reopen URI from it opens a brand-new empty chat
+ * instead of the task's existing conversation, which is the "a new chat is
+ * created when the task moves/reopens" defect. That id is therefore kept only
+ * for post-run misroute detection and never used here.
+ *
+ * The binding is the derived local-session id, honouring an explicit `chat`
+ * value (e.g. a legacy binding, or one pinned across a session-prefix change).
+ * A `chat` field that was previously polluted with the Copilot UUID — the only
+ * way it can equal `copilot_session_id` — is ignored so the binding self-heals
+ * back to the stable derived local-session id.
  */
 export function sessionIdForTaskBinding(
 	task: { id: string; chat?: string; copilotSessionId?: string },
 	prefix = DEFAULT_SESSION_PREFIX,
 	setId = DEFAULT_TASK_SET_ID,
 ): string {
-	return task.copilotSessionId || task.chat || sessionIdForTask(task.id, prefix, setId);
+	if (task.chat && task.chat !== task.copilotSessionId) {
+		return task.chat;
+	}
+	return sessionIdForTask(task.id, prefix, setId);
 }
 
 export function sessionUriForId(sessionId: string): vscode.Uri {

@@ -2,11 +2,12 @@ import * as vscode from 'vscode';
 import { deleteTask, pickTaskFor } from './board/actions';
 import { BoardPanel, BoardTaskSetChange } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
-import { ChatSessionExecutor, OutboundPayloadSeam } from './chat/executor';
-import { normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
+import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, OutboundPayloadSeam } from './chat/executor';
+import { CommandExecutor, normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
 import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore, TaskStoreChange } from './model/taskStore';
+import { CHAT_SESSION_SCHEME, parseSessionUri } from './chat/sessionUri';
 import { endpointConnectionUrl, httpEndpointConfig, isNonLoopbackBindAddress, RealtimeBoardServer, startRealtimeBoardServer } from './http/realtimeBoardServer';
 import { showEndpointSharePanel } from './http/endpointSharePanel';
 
@@ -39,7 +40,64 @@ const outboundSeam: OutboundPayloadSeam = {
 	},
 };
 
-const executor = new ChatSessionExecutor(vscode.commands, {}, outboundSeam);
+const executor = new ChatSessionExecutor(tracedChatCommands(), {}, outboundSeam);
+
+/**
+ * Diagnostic tracing for the chat-open path. Every VS Code command that can
+ * open, create, or submit into a chat is logged to the 'Kanban Pilot' output
+ * channel with the decoded task session id, so a single reproduction reveals
+ * exactly what surfaces a chat (a stage run, a dock, a New Chat, or a stray
+ * open on a move). Low volume — only chat-relevant commands are recorded.
+ */
+function describeChatCommandArgs(command: string, args: readonly unknown[]): string {
+	if (command === 'vscode.open' || command === CHAT_CANCEL_COMMAND) {
+		const uri = args[0];
+		if (uri instanceof vscode.Uri) {
+			const sessionId = parseSessionUri(uri);
+			return sessionId ? `session=${sessionId}` : `uri=${uri.toString()}`;
+		}
+	}
+	const payload = args[0];
+	if (payload && typeof payload === 'object' && 'query' in payload) {
+		const query = (payload as { query?: unknown }).query;
+		const mode = (payload as { mode?: unknown }).mode;
+		return `mode=${String(mode)} query.len=${typeof query === 'string' ? query.length : 'n/a'}`;
+	}
+	return '';
+}
+
+function logChatCommand(source: string, command: string, args: readonly unknown[]): void {
+	const isChatCommand = command === 'vscode.open'
+		? args[0] instanceof vscode.Uri && (args[0] as vscode.Uri).scheme === CHAT_SESSION_SCHEME
+		: command.startsWith('workbench.action.chat.');
+	if (!isChatCommand) {
+		return;
+	}
+	const detail = describeChatCommandArgs(command, args);
+	outboundLog.appendLine(`[chat-trace] ${new Date().toISOString()} via=${source} cmd=${command}${detail ? ` ${detail}` : ''}`);
+}
+
+/** Wraps vscode.commands so the executor's chat commands are traced. */
+function tracedChatCommands(): ChatCommandApi {
+	return {
+		getCommands: (includeInternal?: boolean) => vscode.commands.getCommands(includeInternal),
+		executeCommand: <T>(command: string, ...args: unknown[]): Thenable<T> => {
+			logChatCommand('executor', command, args);
+			return vscode.commands.executeCommand<T>(command, ...args);
+		},
+	};
+}
+
+/** RunManager's command boundary (dock, close, reset), traced the same way. */
+const tracedRunManagerCommand: CommandExecutor = <T>(command: string, ...args: unknown[]): Thenable<T> => {
+	logChatCommand('runManager', command, args);
+	return vscode.commands.executeCommand<T>(command, ...args);
+};
+
+/** Records the user action that triggered a chat operation, for correlation. */
+function traceRunManagerAction(message: string): void {
+	outboundLog.appendLine(`[chat-trace] ${new Date().toISOString()} via=action ${message}`);
+}
 
 export type WorkspaceChangeKind = 'task' | 'attachment' | 'configuration' | 'task-set' | 'run' | 'reconnect';
 
@@ -77,7 +135,7 @@ export class WorkspaceTaskSetContext {
 		this.registry = new TaskSetRegistry(folder, tasksDir);
 		this.currentSet = this.registry.defaultSet;
 		this.currentStore = new TaskStore(this.currentSet.directory, this.currentSet.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, folder);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction);
 		this.configurationWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
 			if (event.affectsConfiguration('kanbanPilot') || event.affectsConfiguration('chat.agentFilesLocations')) {
 				this.emitChange('configuration');
@@ -156,7 +214,7 @@ export class WorkspaceTaskSetContext {
 		const previousManager = this.currentRunManager;
 		this.currentSet = set;
 		this.currentStore = new TaskStore(set.directory, set.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction);
 		if (previousManager !== this.currentRunManager) {
 			previousManager.dispose();
 		}

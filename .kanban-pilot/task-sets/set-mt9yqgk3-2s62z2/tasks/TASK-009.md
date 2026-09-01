@@ -2,12 +2,11 @@
 id: TASK-009
 title: Update README and CHANGELOGS for 0.4.1
 type: feature
-state: in-progress
+state: done
 status: idle
 position: 7
 created: 2026-08-26T21:16:22Z
-updated: 2026-08-27T02:01:16Z
-pending_outcome: {"gate":"developToValidation","stage":"develop","result":"ok","runId":"rbksm71"}
+updated: 2026-08-27T21:07:23Z
 chat: 318f67a2-a6da-420b-ae0f-7f678dce7044
 copilot_session_id: 318f67a2-a6da-420b-ae0f-7f678dce7044
 scope_hash: 4312d7c
@@ -77,3 +76,4 @@ automation.
 - run:rbksm71 task:TASK-009 stage:develop result:ok note:"2026-08-27T02:00:57Z — documented the 0.4.1 release in the README and changelog."
 - audit:status-change at:2026-08-27T02:01:16Z task:TASK-009 from:running to:idle action:receipt run:rbksm71 outcome:ok note:"Status changed from running to idle via receipt."
 - audit:activity-finish at:2026-08-27T02:01:16Z task:TASK-009 stage:develop action:receipt run:rbksm71 outcome:ok note:"2026-08-27T02:00:57Z — documented the 0.4.1 release in the README and changelog."
+- audit:state-change at:2026-08-27T21:07:23Z task:TASK-009 from:in-progress to:done action:move note:"State changed from in-progress to done via move."
