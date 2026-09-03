@@ -224,60 +224,74 @@ This table reproduces the design exactly and is the authoritative spec for card 
 > whenever the column/status combination makes splitting legal (Backlog/idle, Refine/idle,
 > blocked,failed, Scoped/idle).
 
-        C2["vscode-chat-session://local/…TASK-151"]
- * Wait to resolve the command until the chat response reaches a terminal state
-### 6.19 Authenticated real-time extension-host endpoint
+### 5.3 Column header
 
-The optional HTTP endpoint is a transport over the existing VS Code extension host. It does not
-create a browser product, task store, run manager, LLM provider, worker, or chat transcript.
-`TaskStore`, task Markdown, `RunManager`, Copilot session bindings, receipts, gates, and the
-existing `BoardPanel` remain authoritative.
+Each column header shows its title, a live count of contained cards, and a per-column **Agent**
+badge — `Backlog 6 / Agent None`, `Refine 2 / Agent Bro Refiner`, `Scoped 3 / Agent None`,
+`Approved 2 / Agent None`, `In Progress 2 / Agent Bro Coder`, `Validation 2 / Agent Bro QA`,
+`Done 5 / Agent None`. The badge is the effective value from the shared column-assignment
+resolver (`chat/agentNames.ts`), so the three runnable columns tell you exactly which persona
+the next Refine, Develop, or Validate prompt will address. Every column has an active pencil;
+clicking it opens the combined Settings surface (§6.17) with that column's assignment focused.
+Assignments on resting columns are display labels only and do not create or dispatch runs.
+
+---
+
+## 6. Architecture
+
+### 6.1 Component overview
 
 ```mermaid
-flowchart LR
-  C["Authenticated HTTP client"] <--> E["Extension-host HTTP + SSE endpoint"]
-  E <--> R["Existing TaskStore + RunManager"]
-  R <--> F["Task Markdown and attachments"]
-  R <--> P["Existing Copilot Chat sessions"]
-  V["Existing VS Code BoardPanel"] <--> R
+flowchart TB
+  subgraph W["Webview — Board UI"]
+    UI["Columns · Cards · New Task"]
+  end
+  subgraph E["Extension Host"]
+    BC["BoardController<br/><i>action → transition</i>"]
+    SM["StateMachine<br/><i>legal moves + gates</i>"]
+    TS["TaskStore<br/><i>read/write markdown</i>"]
+    RUN["RunManager<br/><i>launch · watch · timeout</i>"]
+    EX["ChatSessionExecutor<br/><i>bind session · inject · await</i>"]
+    FW["FileWatcher"]
+  end
+  subgraph D["Disk — source of truth"]
+    MD[".kanban-pilot/tasks/*.md"]
+  end
+  subgraph C["Copilot Chat — one session per task"]
+    C1["vscode-chat-session://local/…TASK-142"]
+    C2["vscode-chat-session://local/…TASK-151"]
+  end
+
+  UI -- "action/invoke" --> BC
+  BC -- "board/state" --> UI
+  BC --> SM
+  SM --> TS
+  BC --> RUN
+  RUN --> EX
+  EX -- "vscode.open + chat.openAgent" --> C1
+  EX -- "" --> C2
+  C1 -- "edits task file + repo" --> MD
+  C1 -. "blockOnResponse resolves" .-> EX
+  TS <--> MD
+  MD --> FW
+  FW -- "receipt detected" --> RUN
+  RUN -- "run complete" --> BC
 ```
 
-**One board, two surfaces.** A browser on the endpoint is served the extension's own board
-webview, not a second board. `BoardPanel` renders through a `BoardSurface`, which is the only
-seam that differs between clients: how a bundled file becomes a loadable URL, what the
-Content-Security-Policy must allow, and how messages cross the boundary. `WebviewPanelSurface`
-backs the editor panel; `BrowserBoardSurface` backs a browser, substituting a bridge for
-`acquireVsCodeApi` and endpoint-served paths for `asWebviewUri`. The board's markup, styling,
-state machine, and message protocol have exactly one implementation, so the two surfaces cannot
-drift apart. Each browser tab is its own `BoardPanel` bound to its own surface, keeping
-per-client state such as card selection per-client while the workspace stays shared.
+### 6.2 Closing the loop: two independent completion signals
 
-**Dialogs and editor-bound actions.** Board dialogs are rendered by the board rather than by
-`vscode.window`, so a prompt appears to whoever raised it instead of on the host's screen.
-Actions that operate on the editor rather than the board — opening a task file, docking a task's
-chat — are declared by the surface (`hostEditor`) and hidden on clients that do not share the
-host's editor.
+Injection is **not** fire-and-forget. `IChatViewOpenOptions` exposes:
 
-**Authentication and deployment.** The endpoint starts only when it is enabled and an access
-token is configured in the board's **HTTP endpoint** Settings category. Its host, port, token,
-and optional public URL are workspace settings and changes take effect immediately. It binds to loopback by
+```ts
+/**
+ * Wait to resolve the command until the chat response reaches a terminal state
  * (complete, error, or pending user confirmation, etc.).
  */
 blockOnResponse?: boolean;
-
-**API and synchronization.** `GET /` serves the board webview and starts a board session, which
-then speaks the board's own message protocol over `GET /session/events` and
-`POST /session/messages`; `GET /resource/:root/*` serves bundled assets and task attachments,
-constrained to the same roots the editor webview is granted. Sessions are reclaimed once their
-event stream has been gone past a grace period, so a reconnecting browser keeps its board.
-`GET /api/board` returns the current active task-set snapshot.
-`GET /api/events` is an SSE stream that sends an immediate full snapshot, then a full snapshot on
 ```
 
 and the action resolves with `IChatAgentResult & { type?: 'confirmation' }`. So the primary
 completion signal is simply **awaiting the command**.
-
-**Chat boundary.** HTTP task actions can invoke Refine, Split, Develop, Continue, or Validate
 
 **M0 confirmed this**: the same prompt took **2754 ms** with the flag and **19 ms** without. The
 resolved value is richer than assumed — `timings`, `metadata.promptTokens` / `outputTokens`,
@@ -498,13 +512,19 @@ A progress line is deliberately **not** a receipt: it carries no `stage`/`result
 completes or moves a task, and the receipt and `audit:` parsers ignore it (distinct `progress`
 prefix). Like a receipt, a line whose `task:` disagrees with the file it appears in is ignored
 (§6.9); `at:` follows the same UTC ISO 8601 second-precision rule as audit timestamps. The board
-projects the most recent `K = 20` progress lines of the selected task into the task detail as a
-bounded, read-only activity feed, re-derived from the task file on every projection so a
-reconnecting browser re-syncs for free. This is the source-D slice recommended by the
-browser-chat-proxy spike (`docs/browser-chat-proxy-spike.md`): notes are human/agent-authored
-summaries — never source, secrets, paths, or tokens — because the feed can ride a shared,
-token-gated HTTP surface, and a `blocked` run is surfaced honestly ("action required at the
-host") since a remote viewer cannot act on it.
+projects bounded, read-only activity metadata for three visibly labeled sources: durable progress
+recorded in the task log, near-real-time structural hook observations, and delayed structural
+transcript observations. Optional sources report Disabled, Unavailable, Enabled · empty, or
+Available rather than making an empty feed look like an idle run. Hook rows carry event and
+observed timestamps and can become stale; transcript rows are always labeled delayed. A browser
+receives optional sources only with the existing `chat.transcriptFeedRemote` opt-in, and
+reconnects reuse the same event/observation timestamps rather than fabricating freshness. This is
+still the source-D slice recommended by the browser-chat-proxy spike
+(`docs/browser-chat-proxy-spike.md`): rows contain bounded structural summaries only — never
+prompts, assistant/reasoning text, tool arguments/results, credentials, tokens, absolute paths,
+or sensitive command/query/file-target content — because the feed can ride a shared, token-gated
+HTTP surface. A `blocked` run is surfaced honestly ("action required at the host") since a remote
+viewer cannot act on it.
 
 ### 6.4 Run lifecycle
 
@@ -1027,6 +1047,33 @@ memory tool — M0's confirming probe used a session that had never existed befo
 still occurred. Splitting sessions is a fix for `newChat`'s reliability, not for R12; layer 0
 (tool exclusion) is required regardless of which reset strategy is in use.
 
+#### Native context compaction (TASK-014)
+
+Kanban Pilot offers an opt-in `chat.autoCompact` setting and a ratio-only
+`chat.autoCompactThreshold` setting. A value such as `0.8` means 80% of the active model's
+context window. The threshold decision and history rewrite belong to Copilot, not to Kanban
+Pilot: the extension never estimates live usage from `metadata.promptTokens`/
+`outputTokens`, transcript files, hook events, or turn counts. A live context-usage display is
+explicitly deferred until a supported usage source exists.
+
+The native settings are experimental and are the source of truth:
+`github.copilot.chat.summarizeAgentConversationHistory.enabled` and
+`github.copilot.chat.summarizeAgentConversationHistoryThreshold`. The extension checks their
+runtime registration and the installed Copilot metadata. It writes only missing values after the
+Kanban opt-in is enabled; an explicit Copilot value wins and a conflict is surfaced rather than
+overwritten. The Kanban setting accepts ratios only, even though Copilot's native threshold also
+supports absolute token counts.
+
+The compatibility check recorded on 2026-09-04 found both native settings in the VS Code 1.133.0
+/ Copilot Chat 0.61.0 and VS Code 1.136.1 / Copilot Chat 0.64.1 test builds. The supported
+extension engine remains `^1.125.0`, but no minimum Copilot version is guaranteed because the
+settings are experimental. Those builds expose `github.copilot.chat.compact`, but its
+implementation opens `/compact` in the focused chat and accepts no supported
+`vscode-chat-session://local` target. Kanban Pilot therefore detects the command for bounded
+diagnostics but never invokes it; only a future explicitly session-targeted host API may be
+used. This prevents an unrelated focused chat from being compacted while preserving the existing
+task session identity and normal run/resume behavior.
+
 ### 6.9 Misroute handling — what M0 changed
 
 The sharpest risk in the system (R8). Three properties compound:
@@ -1240,6 +1287,25 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `settings/save` | `{ values }` — validates a batch before writing any values, so malformed settings cannot cause a partial update (§6.17) |
 | view → ext | `settings/reset` | `{ key }` — removes one workspace override, restoring its effective global/default value; gate resets also re-run gate policies (§6.17) |
 | ext → view | `settings/error` | `{ key?, error }` — inline validation or persistence failure for the affected setting (§6.17) |
+
+The board also exposes local find and filter controls above the projection. The Find field
+matches a card's own task id, title fragment, or known parent task id, case-insensitively;
+whitespace-only input is treated as empty. Type offers All, Feature, and Bug. Status offers All
+plus every runtime status (`idle`, `running`, `paused`, `blocked`, and `failed`). Relationship
+offers All, Parent, Child, and Standalone, where Parent means the card has children, Child means
+the card has a parent, and Standalone means it has neither. An intermediate card may match both
+Parent and Child. Active criteria are combined with AND semantics.
+
+Find and filter values are webview-local presentation state. They do not add a protocol message,
+write task files or frontmatter, change positions, invoke task actions, or alter task-set
+selection or workflow state. The board keeps all seven canonical columns and their canonical card
+order; filtered columns show visible counts and a distinct no-match state, while genuinely empty
+columns retain their normal drop target. A result summary reports visible and total card counts.
+A fresh `board/state` snapshot for the same active task set reapplies the local values. When
+`activeTaskSetId` changes, the controls reset while the existing task-set selection flow remains
+unchanged. Labels, keyboard-focusable controls, clear/reset behavior, and the live result summary
+must remain usable at the narrow board breakpoint. The editor and browser surfaces use this same
+generated document, so filtering requires no server-side search API or persisted protocol state.
 
 `task/move` is a manual state override, not a state-machine action: a valid cross-column move
 updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
@@ -1733,6 +1799,58 @@ and those images afterward. Prompt defaults and custom-template fallback guidanc
 as read-only task context unless Scope explicitly permits modification. Text-only runs and the
 clipboard fallback remain unchanged.
 
+### 6.19 Authenticated real-time extension-host endpoint
+
+The automatic HTTP endpoint is a transport over the existing VS Code extension host. It does not
+create a second board, task store, state machine, run manager, LLM provider, worker, or chat
+transcript. `TaskStore`, task Markdown, `RunManager`, Copilot session bindings, receipts, gates,
+and the existing `BoardPanel` remain authoritative.
+
+```mermaid
+flowchart LR
+  C["Authenticated HTTP client"] <--> E["Extension-host HTTP + SSE endpoint"]
+  E <--> R["Existing TaskStore + RunManager"]
+  R <--> F["Task Markdown and attachments"]
+  R <--> P["Existing Copilot Chat sessions"]
+  V["Existing VS Code BoardPanel"] <--> R
+```
+
+**One board, two surfaces.** Every task set receives an independently bound endpoint. A browser
+client cannot follow later editor task-set selection, and selecting a task set in the browser is
+local to that browser session. The browser receives the same board implementation, styling,
+message protocol, task-set behavior, attachments, settings, and actions as the editor surface.
+Editor-only actions such as opening a task file or docking a task's chat are hidden in browsers.
+
+**Authentication and deployment.** The endpoint starts automatically for every open workspace.
+Each task set receives a process-local, OS-assigned port and an in-memory access token; no HTTP
+host, port, token, or enablement setting is required. The endpoint binds to all interfaces by
+default so trusted LAN clients can connect. The share URL uses a reachable LAN address and the
+actual OS-assigned port. The token is never persisted to workspace settings and is discarded when
+the extension host exits. Direct HTTP binding is accompanied by a plaintext-token warning.
+
+The extension also starts exactly one workspace Registry per VS Code user profile. Every extension
+host attaches to that process through a shared startup lock and a client lease, so opening another
+VS Code window does not create another Registry. The Registry uses an OS-assigned port, binds to
+the same reachable interfaces as the boards, and contains workspace names plus credential-free
+board URLs in its public listing. A private in-memory redirect target retains each board token for
+the Registry's selection flow; the token is never persisted or returned by the listing. Registry
+startup or enrollment failures never stop local board serving.
+
+**API and synchronization.** `GET /` serves the board webview and starts a board session, which
+then speaks the board's message protocol over `GET /session/events` and `POST /session/messages`.
+`GET /resource/:root/*` serves bundled assets and task attachments constrained to the registered
+task-set roots. `GET /api/board` returns the current active task-set snapshot, and `GET /api/events`
+is an SSE stream that sends an immediate full snapshot and a newer full snapshot after task,
+attachment, configuration, task-set, or run changes. Existing validated card actions are exposed
+through the authenticated task-action routes and continue to use the same `RunManager` and gates.
+Clients treat `revision` as monotonic and reconnect to obtain an immediate full snapshot.
+
+Direct board connection URLs contain the bearer token as a query parameter, while API clients may
+send the same process-local token in an `Authorization: Bearer` header. Both forms are secrets and
+must not be logged, screenshotted, or published through the Registry listing. The user-facing
+**Kanban Pilot: Share** action publishes only the Registry URL; selecting a workspace there performs
+the private redirect to its live board.
+
 ## 7. Configuration
 
 Defaults are chosen to reproduce the design's behaviour exactly: all human gates manual.
@@ -2087,10 +2205,12 @@ session?), which decides §6.8 layer 1 rather than the executor choice.
 6. ~~**Session context across stages.**~~ **Resolved in §6.8** — layer 0 (memory tool
    exclusion) targets the *confirmed* leak vector (R12); layers 1–3 (conversation reset, scope
    hash, inlining) remain for ordinary conversational carryover. The closing exclusion probe
-   answered the side question too: with memory denied on both turns and `newChat` between them,
-   the codeword was **not** recalled — ordinary conversational clearing worked in this run once
-   isolated from the memory-tool confound. One data point, not exhaustive, but no longer
-   "unknown." `/compact` vs `newChat` remains an open efficiency question, not a correctness one.
+  answered the side question too: with memory denied on both turns and `newChat` between them,
+  the codeword was **not** recalled — ordinary conversational clearing worked in this run once
+  isolated from the memory-tool confound. One data point, not exhaustive, but no longer
+  "unknown." TASK-014 now delegates automatic threshold compaction to Copilot's native
+  experimental settings; `/compact` remains unsupported for task-session targeting and is not
+  substituted with `newChat`.
 7. ~~**Tab pressure.**~~ **Resolved in §6.10** — the docked chat opens unpinned, so clicking
    through cards replaces one preview tab instead of accumulating. `closeTabOnDone` remains for
    tabs a user explicitly pinned.

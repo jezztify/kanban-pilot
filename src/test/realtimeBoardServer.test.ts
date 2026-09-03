@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { ServerResponse } from 'node:http';
 import * as vscode from 'vscode';
 import { BrowserBoardSurface, containsPath } from '../http/browserBoardSurface';
-import { endpointConnectionUrl, endpointUrl, httpEndpointConfig, isNonLoopbackBindAddress, resolveShareHost } from '../http/realtimeBoardServer';
+import { automaticHttpEndpointConfig, endpointConnectionUrl, endpointConnectionUrls, endpointUrl, httpEndpointConfig, isNonLoopbackBindAddress, resolveShareHost } from '../http/realtimeBoardServer';
 
 /** Minimal stand-in for the SSE response a session writes into. */
 function fakeStream(): ServerResponse & { chunks: string[] } {
@@ -28,9 +28,30 @@ suite('Realtime board HTTP endpoint', () => {
 		assert.strictEqual(httpEndpointConfig({ enabled: false, token: 'token', port: 4173 }), undefined);
 		assert.throws(() => httpEndpointConfig({ enabled: true, port: 4173 }), /access token/);
 		assert.throws(
-			() => httpEndpointConfig({ enabled: true, token: 'token', port: 0 }),
+			() => httpEndpointConfig({ enabled: true, token: 'token', port: -1 }),
 			/HTTP port/,
 		);
+	});
+
+	test('accepts port zero so the operating system assigns a random board port', () => {
+		assert.deepStrictEqual(
+			httpEndpointConfig({ enabled: true, token: 'token', port: 0 }),
+			{ token: 'token', port: 0, bindAddress: '127.0.0.1' },
+		);
+	});
+
+	test('creates automatic hosting settings with a process-local token', () => {
+		const first = automaticHttpEndpointConfig();
+		const second = automaticHttpEndpointConfig();
+		assert.strictEqual(first.port, 0);
+		assert.strictEqual(first.bindAddress, '0.0.0.0');
+		assert.ok(first.token);
+		assert.notStrictEqual(first.token, second.token);
+		assert.deepStrictEqual(automaticHttpEndpointConfig('test-token'), {
+			port: 0,
+			token: 'test-token',
+			bindAddress: '0.0.0.0',
+		});
 	});
 
 	test('uses loopback by default and permits an explicit reverse-proxy bind address', () => {
@@ -78,6 +99,18 @@ suite('Realtime board HTTP endpoint', () => {
 		const config = { port: 4173, bindAddress: '0.0.0.0', token: 'token' } as const;
 		assert.strictEqual(endpointUrl(config, 4173, lookup), 'http://192.168.1.42:4173');
 		assert.strictEqual(endpointConnectionUrl(config, 4173, lookup), 'http://192.168.1.42:4173/?token=token');
+	});
+
+	test('builds a selectable connection URL for every address on a wildcard-bound endpoint', () => {
+		const lookup = (() => ({
+			lo: [{ family: 'IPv4', address: '127.0.0.1', internal: true }],
+			ethernet: [{ family: 'IPv4', address: '10.0.0.5', internal: false }, { family: 'IPv6', address: '2001:db8::5', internal: false }],
+		})) as unknown as typeof import('node:os').networkInterfaces;
+		assert.deepStrictEqual(endpointConnectionUrls({ port: 4173, bindAddress: '0.0.0.0', token: 'token' }, 4173, lookup), [
+			'http://127.0.0.1:4173/?token=token',
+			'http://10.0.0.5:4173/?token=token',
+			'http://[2001:db8::5]:4173/?token=token',
+		]);
 	});
 
 	test('falls back to localhost when a wildcard bind has no reachable IPv4', () => {
@@ -170,11 +203,11 @@ suite('Browser board surface', () => {
 		const board = surface();
 		assert.strictEqual(
 			board.resourceUri(vscode.Uri.joinPath(root, 'dist', 'mermaid-runtime.js')),
-			'/resource/0/dist/mermaid-runtime.js',
+			'/resource/0/dist/mermaid-runtime.js?session=session-1',
 		);
 		assert.strictEqual(
 			board.resourceUri(vscode.Uri.joinPath(tasks, 'TASK-001.attachments', 'shot.png')),
-			'/resource/1/TASK-001.attachments/shot.png',
+			'/resource/1/TASK-001.attachments/shot.png?session=session-1',
 		);
 		// Nothing outside a declared root is addressable, as in the editor.
 		assert.strictEqual(board.resourceUri(vscode.Uri.file(path.resolve('/tmp/elsewhere/secret.env'))), '');

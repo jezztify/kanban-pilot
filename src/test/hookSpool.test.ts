@@ -59,6 +59,30 @@ suite('Hook spool receiver', () => {
 		const entries = receiver.entriesFor('TASK-042');
 		assert.deepStrictEqual(entries.map((entry) => entry.note), ['prompt submitted', 'finished readFile']);
 		assert.strictEqual(entries[0].source, 'hook');
+		assert.match(entries[0].observedAt ?? '', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+		const snapshot = receiver.snapshotFor('TASK-042');
+		assert.strictEqual(snapshot.availability, 'configured');
+		assert.strictEqual(snapshot.latestEventAt, '2026-09-01T10:00:01Z');
+		assert.strictEqual(snapshot.latestObservedAt, entries[0].observedAt);
+		receiver.dispose();
+	});
+
+	test('unsafe hook labels are discarded while event attribution remains structural', () => {
+		const receiver = new HookSpoolReceiver('unused');
+		receiver.ingest(
+			spoolLine({ event: 'UserPromptSubmit', at: '2026-09-01T10:00:00Z', sessionId: 's-safe', taskId: 'TASK-043' })
+			+ spoolLine({
+				event: 'PostToolUse',
+				at: '2026-09-01T10:00:01Z',
+				sessionId: 's-safe',
+				toolName: 'C:\\private\\credentials.txt',
+				tool_input: SECRET,
+			}),
+		);
+		const entries = receiver.entriesFor('TASK-043');
+		assert.deepStrictEqual(entries.map((entry) => entry.note), ['prompt submitted', 'finished a tool']);
+		assert.strictEqual(JSON.stringify(entries).includes(SECRET), false);
+		assert.strictEqual(JSON.stringify(entries).includes('credentials.txt'), false);
 		receiver.dispose();
 	});
 
@@ -116,14 +140,14 @@ suite('Hook spool receiver', () => {
 	test('the tail is suppressed only while the hook feed is actually reporting', () => {
 		const tailed: FeedEntry[] = [
 			{ at: '2026-09-01T10:00:01Z', note: 'started readFile', source: 'transcript' },
-			{ at: '2026-09-01T10:00:02Z', note: 'assistant replied', source: 'transcript' },
+			{ at: '2026-09-01T10:00:02Z', note: 'assistant message observed', source: 'transcript' },
 		];
 		const hooks: FeedEntry[] = [{ at: '2026-09-01T10:00:01Z', note: 'finished readFile', source: 'hook' }];
 
 		// With hooks live, the tool step is not shown twice — once now and again
 		// up to 53 s later from the transcript.
 		const deduped = suppressDuplicatedTailEntries(tailed, hooks);
-		assert.deepStrictEqual(deduped.map((entry) => entry.note), ['assistant replied']);
+		assert.deepStrictEqual(deduped.map((entry) => entry.note), ['assistant message observed']);
 
 		// With no hook entries the tail is the only source and must keep flowing.
 		assert.strictEqual(suppressDuplicatedTailEntries(tailed, []).length, 2);
@@ -176,6 +200,17 @@ suite('Hook spool receiver', () => {
 			await receiver.cleanup();
 			await receiver.drain();
 			assert.deepStrictEqual(receiver.entriesFor('TASK-004'), []);
+			receiver.dispose();
+		});
+	});
+
+	test('an unreadable spool is distinguished from a missing spool', async () => {
+		await withSpool(async (path) => {
+			const fs = await import('node:fs/promises');
+			await fs.mkdir(path);
+			const receiver = new HookSpoolReceiver(path);
+			await receiver.drain();
+			assert.strictEqual(receiver.snapshotFor('TASK-044').availability, 'unreadable');
 			receiver.dispose();
 		});
 	});

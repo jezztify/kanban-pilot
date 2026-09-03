@@ -7,15 +7,19 @@ function escapeHtml(value: string): string {
 	}[character] ?? character));
 }
 
-/** Displays the configured existing-host endpoint connection without creating another board UI. */
-export async function showEndpointSharePanel(extensionUri: vscode.Uri, endpointUrl: string): Promise<void> {
+/** Displays the automatic Registry connection without creating another board UI. */
+export async function showEndpointSharePanel(
+	extensionUri: vscode.Uri,
+	registryUrl: string,
+	destinationName = 'Registry',
+): Promise<void> {
 	const panel = vscode.window.createWebviewPanel(
 		'kanbanPilot.endpointShare',
-		'Kanban Pilot Connection',
+		`Kanban Pilot: ${destinationName}`,
 		vscode.ViewColumn.Active,
 		{ enableScripts: true, localResourceRoots: [extensionUri] },
 	);
-	const qrCode = await QRCode.toDataURL(endpointUrl, {
+	const qrCode = await QRCode.toDataURL(registryUrl, {
 		errorCorrectionLevel: 'M',
 		margin: 2,
 		width: 320,
@@ -34,16 +38,16 @@ input { min-width: 0; flex: 1; padding: 8px; color: var(--vscode-input-foregroun
 button { padding: 7px 12px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 4px; cursor: pointer; }
 small { display: block; margin-top: 18px; color: var(--vscode-descriptionForeground); }
 </style></head><body>
-<h1>Connect to Kanban Pilot</h1><p>Scan this QR code or copy the current Kanban board snapshot URL.</p>
-<img src="${qrCode}" alt="QR code for Kanban Pilot endpoint connection">
-<div class="url"><input id="url" readonly value="${escapeHtml(endpointUrl)}" aria-label="Kanban Pilot board snapshot URL"><button id="copy">Copy</button></div>
-<small>This connection URL contains the access token. Treat it as a secret. The private Copilot chat remains in VS Code.</small>
+<h1>Open the Kanban Pilot Registry</h1><p>Scan this QR code or copy the Registry URL to choose a live workspace board.</p>
+<img src="${qrCode}" alt="QR code for the Kanban Pilot Registry">
+<div class="url"><input id="url" readonly value="${escapeHtml(registryUrl)}" aria-label="Kanban Pilot Registry URL"><button id="copy">Copy</button></div>
+<small>The Registry keeps board access links private and redirects you to a live board. The private Copilot chat remains in VS Code.</small>
 <script nonce="${nonce}">const vscode = acquireVsCodeApi(); document.getElementById('copy').addEventListener('click', () => vscode.postMessage({ type: 'copy' }));</script>
 </body></html>`;
 	panel.webview.onDidReceiveMessage(async (message: unknown) => {
 		if (message && typeof message === 'object' && (message as { type?: unknown }).type === 'copy') {
-			await vscode.env.clipboard.writeText(endpointUrl);
-			void vscode.window.showInformationMessage('Kanban Pilot board snapshot URL copied.');
+			await vscode.env.clipboard.writeText(registryUrl);
+			void vscode.window.showInformationMessage('Kanban Pilot Registry URL copied.');
 		}
 	});
 }

@@ -88,4 +88,24 @@ const mermaidWebviewConfig = {
   },
 };
 
-module.exports = [extensionConfig, mermaidWebviewConfig];
+/** @type WebpackConfig */
+const registryConfig = {
+  target: 'node',
+  mode: 'none',
+  entry: './src/http/registryProcess.ts',
+  output: {
+    path: path.resolve(__dirname, 'dist'),
+    filename: 'registry.js',
+    libraryTarget: 'commonjs2'
+  },
+  resolve: resolveConfig,
+  module: {
+    rules: [typescriptRule]
+  },
+  devtool: 'nosources-source-map',
+  infrastructureLogging: {
+    level: "log",
+  },
+};
+
+module.exports = [extensionConfig, mermaidWebviewConfig, registryConfig];

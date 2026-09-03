@@ -53,10 +53,22 @@ export interface CancellationOptions {
 	sessionPrefix: string;
 }
 
+export interface CompactionOptions {
+	mode: string;
+	sessionPrefix: string;
+}
+
+export type CompactionResult =
+	| { kind: 'success'; targeting: 'session' }
+	| { kind: 'unsupported'; diagnostic: ChatCapabilityDiagnostic }
+	| { kind: 'failed'; error: string; diagnostic?: ChatCapabilityDiagnostic };
+
 /** Built-in VS Code command used by Copilot Chat's own Stop button. */
 export const CHAT_CANCEL_COMMAND = 'workbench.action.chat.cancel';
 /** Built-in VS Code command that creates a chat inheriting the active UI configuration. */
 export const CHAT_NEW_COMMAND = 'workbench.action.chat.newChat';
+/** Copilot Chat's native focus-only compaction command, detected for diagnostics only. */
+export const CHAT_COMPACT_COMMAND = 'github.copilot.chat.compact';
 
 /**
  * The fully-assembled outbound turn Kanban Pilot authors for a stage run — the
@@ -184,7 +196,8 @@ export type ChatCapability =
 	| 'vscode.open'
 	| 'mode-specific-chat-command'
 	| 'vscode-chat-session-uri'
-	| 'new-chat-command';
+	| 'new-chat-command'
+	| 'compact-command';
 
 export interface ChatCapabilityDiagnostic {
 	code:
@@ -192,7 +205,10 @@ export interface ChatCapabilityDiagnostic {
 		| 'missing-chat-command'
 		| 'unsupported-chat-session-uri'
 		| 'missing-new-chat-command'
-		| 'new-chat-command-failed';
+		| 'new-chat-command-failed'
+		| 'missing-compact-command'
+		| 'unsupported-compact-session-target'
+		| 'compact-command-failed';
 	capability: ChatCapability;
 	mode: string;
 	remoteName?: string;
@@ -206,6 +222,7 @@ export interface ChatCapabilities {
 	hasVscodeOpen: boolean;
 	chatCommand?: string;
 	newChatCommand?: string;
+	compactCommand?: string;
 	supportsChatSessionUri: boolean;
 	agentName?: string;
 }
@@ -216,6 +233,8 @@ export interface Executor {
 	run(task: Task, taskFileUri: vscode.Uri, prompt: string, stage: Stage, options: RunOptions): Promise<ExecutorResult>;
 	/** Cancels the active turn in this task's bound session, when one exists. */
 	cancel?(task: Task, options: CancellationOptions): Promise<CancellationResult>;
+	/** Requests compaction only through a supported task-session target API. */
+	compact?(task: Task, options: CompactionOptions): Promise<CompactionResult>;
 }
 
 /** Copilot receives the Markdown task first, followed by images in reference order. */
@@ -238,6 +257,16 @@ export interface ChatCommandApi {
 
 export interface ChatCapabilityProbe {
 	supportsChatSessionUri?(uri: vscode.Uri): boolean | Promise<boolean>;
+}
+
+/**
+ * A compaction target is supplied only when a supported host API can address
+ * one concrete chat session. The installed Copilot compact command is not
+ * such an API: it opens `/compact` in the focused chat, so the production
+ * executor deliberately leaves this seam unset.
+ */
+export interface TaskSessionCompactionTarget {
+	compact(sessionUri: vscode.Uri): Thenable<void> | Promise<void>;
 }
 
 /** Serializes injections process-wide (§6.9) — two card actions can never race for focus. */
@@ -301,6 +330,7 @@ export class ChatSessionExecutor implements Executor {
 		private readonly commands: ChatCommandApi = vscode.commands,
 		private readonly capabilityProbe: ChatCapabilityProbe = {},
 		private readonly seam: OutboundPayloadSeam = {},
+		private readonly sessionCompactionTarget?: TaskSessionCompactionTarget,
 	) {}
 
 	async isAvailable(mode = 'agent'): Promise<boolean> {
@@ -481,6 +511,68 @@ export class ChatSessionExecutor implements Executor {
 		}
 	}
 
+	/**
+	 * Requests compaction only through a host API that explicitly accepts the
+	 * task session URI. The installed `github.copilot.chat.compact` command is
+	 * focus-only and has no supported target argument, so it is detected for
+	 * diagnostics but never invoked here.
+	 */
+	async compact(task: Task, options: CompactionOptions): Promise<CompactionResult> {
+		const sessionUri = sessionUriForTaskBinding(task, options.sessionPrefix, task.setId);
+		let capabilities: ChatCapabilities;
+		try {
+			capabilities = await this.detectCapabilities(options.mode, task, options.sessionPrefix);
+		} catch (e) {
+			return {
+				kind: 'failed',
+				error: describeError(e),
+				diagnostic: compactCommandFailureDiagnostic(undefined, e),
+			};
+		}
+
+		if (!capabilities.compactCommand) {
+			return {
+				kind: 'unsupported',
+				diagnostic: compactCapabilityDiagnostic(capabilities),
+			};
+		}
+		if (!capabilities.supportsChatSessionUri) {
+			return {
+				kind: 'unsupported',
+				diagnostic: {
+					code: 'unsupported-chat-session-uri',
+					capability: 'vscode-chat-session-uri',
+					mode: capabilities.mode,
+					...(capabilities.remoteName ? { remoteName: capabilities.remoteName } : {}),
+					message: 'The connected client cannot open the task session needed for best-effort compaction.',
+					remediation: 'Use a supported VS Code client with Copilot Chat enabled; native background compaction remains available when its settings are supported.',
+				},
+			};
+		}
+		if (!this.sessionCompactionTarget) {
+			return {
+				kind: 'unsupported',
+				diagnostic: compactSessionTargetDiagnostic(capabilities),
+			};
+		}
+
+		try {
+			await injectionMutex.run(async () => {
+				// The target API owns session selection. Do not open a session and then
+				// invoke the focus-only Copilot command: that sequence cannot prove that
+				// compaction will stay on this task.
+				await this.sessionCompactionTarget!.compact(sessionUri);
+			});
+			return { kind: 'success', targeting: 'session' };
+		} catch (e) {
+			return {
+				kind: 'failed',
+				error: describeError(e),
+				diagnostic: compactCommandFailureDiagnostic(capabilities, e),
+			};
+		}
+	}
+
 	async detectCapabilities(
 		mode: string,
 		task?: Task,
@@ -500,6 +592,7 @@ export class ChatSessionExecutor implements Executor {
 			hasVscodeOpen: all.includes('vscode.open'),
 			chatCommand: this.findAgentOpenCommand(all, mode),
 			newChatCommand: this.findCommand(all, CHAT_NEW_COMMAND),
+			compactCommand: this.findCommand(all, CHAT_COMPACT_COMMAND),
 			supportsChatSessionUri: probedSupport ?? (sessionUri
 				? sessionUri.scheme === CHAT_SESSION_SCHEME && !!parseSessionUri(sessionUri)
 				: true),
@@ -550,6 +643,48 @@ export class ChatSessionExecutor implements Executor {
 			};
 		}
 	}
+}
+
+export function compactCapabilityDiagnostic(capabilities: ChatCapabilities): ChatCapabilityDiagnostic {
+	const remote = capabilities.remoteName;
+	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
+	return {
+		code: 'missing-compact-command',
+		capability: 'compact-command',
+		mode: capabilities.mode,
+		...(remote ? { remoteName: remote } : {}),
+		message: `Copilot Chat's native compact command is unavailable on ${client}.`,
+		remediation: 'Update or enable Copilot Chat, or rely on its native background compaction settings when available; task execution remains usable without an explicit compact command.',
+	};
+}
+
+export function compactSessionTargetDiagnostic(capabilities: ChatCapabilities): ChatCapabilityDiagnostic {
+	const remote = capabilities.remoteName;
+	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
+	return {
+		code: 'unsupported-compact-session-target',
+		capability: 'compact-command',
+		mode: capabilities.mode,
+		...(remote ? { remoteName: remote } : {}),
+		message: `Copilot Chat exposes a focus-only compact command on ${client}, but no supported task-session target is available.`,
+		remediation: 'Use Copilot native background compaction settings when available; Kanban Pilot will not compact an unverified focused chat.',
+	};
+}
+
+function compactCommandFailureDiagnostic(
+	capabilities: ChatCapabilities | undefined,
+	error: unknown,
+): ChatCapabilityDiagnostic {
+	const remote = capabilities?.remoteName;
+	const client = remote ? `the ${remote} remote client` : 'this VS Code client';
+	return {
+		code: 'compact-command-failed',
+		capability: 'compact-command',
+		mode: capabilities?.mode ?? 'agent',
+		...(remote ? { remoteName: remote } : {}),
+		message: `Copilot Chat's native compact command failed on ${client}: ${describeError(error)}.`,
+		remediation: 'Retry after confirming Copilot Chat is available and the task chat is the intended focused session; normal task execution remains available.',
+	};
 }
 
 export function capabilityDiagnostic(

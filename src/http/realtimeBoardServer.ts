@@ -19,7 +19,9 @@ const SESSION_SWEEP_MS = 15_000;
  * The workspace controller the endpoint serves. It is the same contract the
  * editor's board panel is built on, because the endpoint serves that board.
  */
-export type RealtimeBoardHost = BoardTaskSetHost;
+export type RealtimeBoardHost = BoardTaskSetHost & {
+	createBrowserSessionHost?(): Promise<BoardTaskSetHost & { dispose?(): void }>;
+};
 
 export interface RealtimeBoardServerOptions {
 	host: RealtimeBoardHost;
@@ -54,6 +56,15 @@ export interface HttpEndpointSettings {
 	publicUrl?: unknown;
 }
 
+/**
+ * Creates the process-local endpoint configuration used by automatic hosting.
+ * Port zero delegates selection to the operating system and the token is kept
+ * in memory for the lifetime of the extension host only.
+ */
+export function automaticHttpEndpointConfig(token: string = randomUUID()): HttpEndpointConfig {
+	return { port: 0, token, bindAddress: '0.0.0.0' };
+}
+
 /** Validates the existing Settings-surface values; no environment state is read. */
 export function httpEndpointConfig(settings: HttpEndpointSettings): HttpEndpointConfig | undefined {
 	if (settings.enabled !== true) {
@@ -64,8 +75,8 @@ export function httpEndpointConfig(settings: HttpEndpointSettings): HttpEndpoint
 		throw new Error('Kanban Pilot HTTP access token cannot be blank while the endpoint is enabled.');
 	}
 	const port = settings.port;
-	if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
-		throw new Error('Kanban Pilot HTTP port must be an integer from 1 to 65535.');
+	if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) {
+		throw new Error('Kanban Pilot HTTP port must be an integer from 0 to 65535; use 0 for a random available port.');
 	}
 	const bindAddress = typeof settings.host === 'string' && settings.host.trim() ? settings.host.trim() : '127.0.0.1';
 	const publicUrl = typeof settings.publicUrl === 'string' ? settings.publicUrl.trim() : '';
@@ -134,6 +145,26 @@ export function endpointConnectionUrl(config: HttpEndpointConfig, actualPort = c
 	const url = new URL(endpointUrl(config, actualPort, lookup));
 	url.searchParams.set('token', config.token);
 	return url.toString();
+}
+
+/**
+ * Builds one token-bearing URL per address a wildcard-bound endpoint listens
+ * on. An explicit host or reverse-proxy public URL remains a single choice.
+ */
+export function endpointConnectionUrls(config: HttpEndpointConfig, actualPort = config.port, lookup: NetworkInterfaceLookup = os.networkInterfaces): string[] {
+	if (config.publicUrl || !isWildcardBindAddress(config.bindAddress)) {
+		return [endpointConnectionUrl(config, actualPort, lookup)];
+	}
+	const hosts = [...new Set(Object.values(lookup())
+		.flatMap((entries) => entries ?? [])
+		.filter((entry) => entry.family === 'IPv4' || entry.family === 'IPv6')
+		.map((entry) => entry.address))];
+	const usableHosts = hosts.length ? hosts : [resolveShareHost(config.bindAddress, lookup)];
+	return usableHosts.map((host) => {
+		const url = new URL(`http://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${actualPort}`);
+		url.searchParams.set('token', config.token);
+		return url.toString();
+	});
 }
 
 const RESOURCE_CONTENT_TYPES: Record<string, string> = {
@@ -263,6 +294,8 @@ interface BoardSession {
 	readonly id: string;
 	readonly surface: BrowserBoardSurface;
 	readonly panel: BoardPanel;
+	readonly host: BoardTaskSetHost;
+	readonly ownsHost: boolean;
 	idleSince: number | undefined;
 }
 
@@ -300,6 +333,9 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 	const dropSession = (session: BoardSession): void => {
 		sessions.delete(session.id);
 		session.panel.dispose();
+		if (session.ownsHost) {
+			(session.host as BoardTaskSetHost & { dispose?(): void }).dispose?.();
+		}
 	};
 
 	/**
@@ -323,7 +359,7 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 	const sweeper = setInterval(sweep, SESSION_SWEEP_MS);
 	sweeper.unref?.();
 
-	const createSession = (): BoardSession => {
+	const createSession = async (): Promise<BoardSession> => {
 		if (sessions.size >= MAX_SESSIONS) {
 			sweep();
 		}
@@ -334,20 +370,24 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 		}
 		const id = randomUUID();
 		const surface = new BrowserBoardSurface(id);
+		const sessionHost = host.createBrowserSessionHost
+			? await host.createBrowserSessionHost()
+			: host;
 		// Constructing the panel renders the board document into the surface.
-		const panel = BoardPanel.attach(surface, host, extensionUri);
-		const session: BoardSession = { id, surface, panel, idleSince: Date.now() };
+		const panel = BoardPanel.attach(surface, sessionHost, extensionUri);
+		const session: BoardSession = { id, surface, panel, host: sessionHost, ownsHost: sessionHost !== host, idleSince: Date.now() };
 		sessions.set(id, session);
 		return session;
 	};
 
 	// Mirrors BoardPanel.configureWebview: index 0 is the extension, index 1 is
-	// the active task-set directory that attachments are read from. The active
-	// set can change under a live client, so the roots are read per request.
-	const resourceRoots = (): vscode.Uri[] => [extensionUri, host.store.directory];
+	// the session's active task-set directory. BrowserBoardSurface includes the
+	// session id in resource URLs, so two sessions can safely select different
+	// task sets without exposing each other's attachments.
+	const resourceRoots = (session: BoardSession | undefined): vscode.Uri[] => [extensionUri, session?.host.store.directory ?? host.store.directory];
 
-	const serveResource = async (response: ServerResponse, rootIndex: number, relativePath: string): Promise<void> => {
-		const root = resourceRoots()[rootIndex];
+	const serveResource = async (response: ServerResponse, rootIndex: number, relativePath: string, session: BoardSession | undefined): Promise<void> => {
+		const root = resourceRoots(session)[rootIndex];
 		if (!root || relativePath.includes('\0')) {
 			json(response, 404, { error: 'Not found.' });
 			return;
@@ -382,13 +422,13 @@ export async function startRealtimeBoardServer(options: RealtimeBoardServerOptio
 			}
 
 			if (request.method === 'GET' && resource) {
-				await serveResource(response, Number(resource[1]), decodeURIComponent(resource[2]));
+				await serveResource(response, Number(resource[1]), decodeURIComponent(resource[2]), sessions.get(url.searchParams.get('session') ?? ''));
 				return;
 			}
 
 			// ---- the board itself -------------------------------------------
 			if (request.method === 'GET' && url.pathname === '/') {
-				const session = createSession();
+				const session = await createSession();
 				// Resource and stream requests that follow this document cannot
 				// carry the token themselves, so it is handed back as a cookie.
 				const secure = request.headers['x-forwarded-proto'] === 'https';

@@ -186,8 +186,19 @@ feed can be shared over a token-gated HTTP surface. Use the same UTC
 second-precision timestamp format as the receipt.
 
 ### Completion
-After completing the implementation work, append this line to the \`## Log\`
-section of the attached active task file at {{taskFilePath}}:
+An agent-reported \`PASSED\` message in chat is only a progress report; it is
+not extension acceptance. RunManager accepts Develop completion only after it
+finds the matching receipt and validates same-run implementation evidence.
+After completing the implementation work, append this evidence line and then
+the success receipt to the \`## Log\` section of the attached active task file
+at {{taskFilePath}}. List each changed non-task workspace file, excluding
+generated output, and name the verification you performed:
+- implementation-evidence run:{{runId}} files:"<changed non-task files>" verify:"<verification performed>"
+Do not claim implementation or workflow success when you only created
+follow-up tasks, changed Kanban task files, made no implementation change, or
+cannot record the required evidence or receipt. In those cases, explain the
+concrete blocker and append exactly one blocked receipt instead. A blocked
+receipt is not completion; the extension owns the final workflow transition.
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
 ### Non-completion
 If you cannot complete the implementation because a dependency, decision,

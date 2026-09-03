@@ -24,17 +24,21 @@ export interface Proposal {
 	title: string;
 	note: string;
 	type?: TaskType;
+	parentTaskId?: string;
 }
 
 /** Stable identity for one accepted proposal, used to make retries reload-safe. */
 export function proposalFingerprint(proposal: Proposal, type: TaskType): string {
+	const identity = proposal.parentTaskId === undefined
+		? [proposal.runId, type, proposal.title, proposal.note]
+		: [proposal.runId, type, proposal.title, proposal.note, proposal.parentTaskId];
 	return createHash('sha256')
-		.update(JSON.stringify([proposal.runId, type, proposal.title, proposal.note]))
+		.update(JSON.stringify(identity))
 		.digest('hex')
 		.slice(0, 24);
 }
 
-const PROPOSAL_LINE = /^-\s*propose-task\s+run:(\S+)(?:\s+type:(\S+))?\s+title:"([^"]*)"\s+note:"([^"]*)"\s*$/;
+const PROPOSAL_LINE = /^-\s*propose-task\s+run:(\S+)((?:\s+(?:type|parent):\S+)*)\s+title:"([^"]*)"\s+note:"([^"]*)"\s*$/;
 
 /** Parses every well-formed proposal line in a `## Log` section, in file order. */
 export function parseProposals(logSection: string): Proposal[] {
@@ -42,11 +46,38 @@ export function parseProposals(logSection: string): Proposal[] {
 	for (const line of logSection.split(/\r?\n/)) {
 		const match = PROPOSAL_LINE.exec(line.trim());
 		if (match) {
-			const [, runId, rawType, title, note] = match;
+			const [, runId, rawMetadata, title, note] = match;
+			let rawType: string | undefined;
+			let rawParent: string | undefined;
+			let validMetadata = true;
+			for (const token of rawMetadata.trim().split(/\s+/).filter(Boolean)) {
+				const separator = token.indexOf(':');
+				const key = token.slice(0, separator);
+				const value = token.slice(separator + 1);
+				if (key === 'type' && rawType === undefined) {
+					rawType = value;
+				} else if (key === 'parent' && rawParent === undefined) {
+					rawParent = value;
+				} else {
+					validMetadata = false;
+				}
+			}
+			if (!validMetadata) {
+				continue;
+			}
 			if (rawType !== undefined && !isTaskType(rawType)) {
 				continue;
 			}
-			proposals.push({ runId, title, note, ...(rawType ? { type: rawType } : {}) });
+			if (rawParent !== undefined && !/^TASK-\d+$/.test(rawParent)) {
+				continue;
+			}
+			proposals.push({
+				runId,
+				title,
+				note,
+				...(rawType ? { type: rawType } : {}),
+				...(rawParent ? { parentTaskId: rawParent } : {}),
+			});
 		}
 	}
 	return proposals;

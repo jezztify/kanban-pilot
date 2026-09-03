@@ -1,9 +1,10 @@
 {
   "name": "kanban-pilot",
+  "publisher": "jezztify",
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"
@@ -144,7 +145,7 @@
       },
       {
         "command": "kanban-pilot.showEndpointConnection",
-        "title": "Show HTTP Endpoint Connection",
+        "title": "Share",
         "category": "Kanban Pilot"
       }
     ],
@@ -276,6 +277,18 @@
           "default": false,
           "description": "Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default: Develop and Validate deliberately continue the same conversation Refine started, and every prompt inlines the current task content regardless, which is the actual mitigation for stale agent reasoning."
         },
+        "kanbanPilot.chat.autoCompact": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to Copilot's native automatic conversation compaction for task chats. Kanban Pilot configures the native experimental setting only when no explicit Copilot value conflicts; it never estimates usage from transcripts or token totals. Focus-only compact commands are not used without a supported task-session target."
+        },
+        "kanbanPilot.chat.autoCompactThreshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8,
+          "description": "Context-window ratio at which Copilot's native automatic compaction is requested. Must be greater than 0 and at most 1; 0.8 means 80%. Kanban Pilot does not use Copilot's separate absolute-token form."
+        },
         "kanbanPilot.chat.agentDirectories": {
           "type": "array",
           "items": {
@@ -353,33 +366,6 @@
           "type": "boolean",
           "default": true,
           "description": "Let develop and validate runs file follow-up work as new backlog tasks (§6.12) via a propose-task log line, capped at 5 per run. Off disables the capability entirely — any propose-task lines an agent writes are simply ignored."
-        },
-        "kanbanPilot.http.enabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable the authenticated real-time HTTP endpoint backed by this extension host."
-        },
-        "kanbanPilot.http.host": {
-          "type": "string",
-          "default": "0.0.0.0",
-          "description": "Bind host for the real-time HTTP endpoint. Keep loopback (127.0.0.1) unless a TLS reverse proxy is configured. Set 0.0.0.0 or :: to bind all interfaces for LAN sharing — the share URL/QR then use the machine's LAN IP, but the access token travels in plain text over HTTP with no TLS, so only do this on trusted networks."
-        },
-        "kanbanPilot.http.port": {
-          "type": "number",
-          "default": 4173,
-          "minimum": 1,
-          "maximum": 65535,
-          "description": "TCP port for the real-time HTTP endpoint."
-        },
-        "kanbanPilot.http.token": {
-          "type": "string",
-          "default": "kanban-pilot",
-          "description": "Bearer token required by the real-time HTTP endpoint. Stored in workspace settings; use a high-entropy secret."
-        },
-        "kanbanPilot.http.publicUrl": {
-          "type": "string",
-          "default": "",
-          "description": "Optional absolute http or https URL shown in the status-bar QR code when a reverse proxy fronts the endpoint."
         }
       }
     }

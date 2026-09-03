@@ -2,25 +2,19 @@
 
 # Kanban Pilot
 
-**A Kanban board for VS Code with an optional real-time HTTP endpoint.**
+**A Kanban board for VS Code with an automatic real-time HTTP endpoint.**
 
 You work the board — create a card, accept it, refine it, approve it, ship it. The VS Code
-extension drives GitHub Copilot Chat in the workspace. Its optional HTTP endpoint exposes that
-same board state and those same validated actions in real time.
+extension drives GitHub Copilot Chat in the workspace. Its automatically started HTTP endpoint
+exposes that same board state and those same validated actions in real time.
 
 Every task is a plain Markdown file in your repo. The endpoint reads that existing task store and
 routes mutations through the existing run manager; it does not mirror or scrape a VS Code Copilot
 transcript.
 
-## Why you might want it
 
-- **Nothing gets built before you've read the plan.** There's a deliberate review stop between
-  "here's the plan" and "go write the code."
-- **One conversation per task.** No context bleeding between unrelated pieces of work.
-- **You stay in control.** Every step waits for a click by default. Turn on auto-advance only
-  where you want it.
-- **Your tasks are durable.** Task Markdown remains in `.kanban-pilot/`; the endpoint does not add
-   another state store.
+
+
 
 ## VS Code extension
 
@@ -83,6 +77,24 @@ headings, lists, checklists, tables, code, links, and task-local images. Fenced 
 readable fallback and the rest of the modal stays usable. Unsafe links and unavailable or remote
 images are not loaded. Rendering is read-only; choose **Edit task** to edit the authored Markdown.
 
+
+### Central Registry screenshots
+
+### Discovering shared workspaces
+
+Each VS Code user profile has exactly one automatically managed Kanban Pilot Central Registry. All
+VS Code windows attach to that same process, which listens on an OS-selected port and lists the
+live board endpoints from every open workspace. Use **Kanban Pilot: Share** to show the Registry
+QR code and URL; there is no separate Registry command or configuration.
+
+![Kanban Pilot: Share](docs/media/kanban-pilot-share.png)
+
+
+![Central Registry directory showing one live workspace and its Open board action](docs/media/central-registry-directory.png)
+
+
+![Kanban Pilot browser board reached from the Central Registry](docs/media/central-registry-board.png)
+
 ## Documentation
 
 | Guide | What's in it |
@@ -113,6 +125,8 @@ snapshots, so re-run the command whenever the repository's skill changes.
 Stage prompts in `.kanban-pilot/prompts` belong to you and are never migrated automatically. If an
 older copy predates the `kanban-pilot: extension-supervised` marker, either update it by hand or
 delete it and let the extension write a fresh default.
+
+Make sure that the agent skill is integrated into your agents.
 
 ## Known issues
 
