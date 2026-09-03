@@ -3,7 +3,7 @@
   "displayName": "Kanban Pilot",
   "description": "A Kanban-first Copilot Chat Driver",
   "repository": "https://github.com/jezztify/kanban-pilot.git",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "license": "MIT",
   "engines": {
     "vscode": "^1.125.0"

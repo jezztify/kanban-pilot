@@ -234,7 +234,7 @@ export class WorkspaceTaskSetContext {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {
 				return;
 			}
-			this.emitChange('run', change.taskId, change.note);
+			this.emitChange(change.kind === 'task' ? 'task' : 'run', change.taskId, change.note);
 		});
 		this.watcher = this.currentStore.watchChanges((change) => {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {

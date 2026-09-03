@@ -27,6 +27,18 @@ suite('M3.5 proposal grammar', () => {
 		assert.deepStrictEqual(proposals.map((proposal) => proposal.title), ['Fix retry backoff', 'Add metrics']);
 	});
 
+	test('parses an optional parent in either metadata order and rejects malformed values', () => {
+		const log = [
+			'- propose-task run:r19 parent:TASK-001 type:bug title:"Child one" note:"first"',
+			'- propose-task run:r19 type:feature parent:TASK-002 title:"Child two" note:"second"',
+			'- propose-task run:r19 parent:not-a-task title:"Rejected" note:"malformed parent"',
+		].join('\n');
+
+		const proposals = parseProposals(log);
+		assert.deepStrictEqual(proposals.map((proposal) => proposal.parentTaskId), ['TASK-001', 'TASK-002']);
+		assert.deepStrictEqual(proposals.map((proposal) => proposal.type), ['bug', 'feature']);
+	});
+
 	test('ignores free-form prose and unrelated receipt lines around it', () => {
 		const log = [
 			'- run:r19 task:TASK-142 stage:develop result:ok note:"done"',
@@ -64,6 +76,15 @@ suite('M3.5 proposal grammar', () => {
 		assert.notStrictEqual(
 			proposalFingerprint(proposal, 'bug'),
 			proposalFingerprint({ ...proposal, note: 'different reason' }, 'bug'),
+		);
+		assert.notStrictEqual(
+			proposalFingerprint(proposal, 'bug'),
+			proposalFingerprint({ ...proposal, parentTaskId: 'TASK-001' }, 'bug'),
+		);
+		assert.strictEqual(
+			proposalFingerprint(proposal, 'bug'),
+			proposalFingerprint({ ...proposal, parentTaskId: undefined }, 'bug'),
+			'old omitted-parent fingerprints remain compatible',
 		);
 	});
 });

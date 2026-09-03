@@ -1241,6 +1241,25 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `settings/reset` | `{ key }` — removes one workspace override, restoring its effective global/default value; gate resets also re-run gate policies (§6.17) |
 | ext → view | `settings/error` | `{ key?, error }` — inline validation or persistence failure for the affected setting (§6.17) |
 
+The board also exposes local find and filter controls above the projection. The Find field
+matches a card's own task id, title fragment, or known parent task id, case-insensitively;
+whitespace-only input is treated as empty. Type offers All, Feature, and Bug. Status offers All
+plus every runtime status (`idle`, `running`, `paused`, `blocked`, and `failed`). Relationship
+offers All, Parent, Child, and Standalone, where Parent means the card has children, Child means
+the card has a parent, and Standalone means it has neither. An intermediate card may match both
+Parent and Child. Active criteria are combined with AND semantics.
+
+Find and filter values are webview-local presentation state. They do not add a protocol message,
+write task files or frontmatter, change positions, invoke task actions, or alter task-set
+selection or workflow state. The board keeps all seven canonical columns and their canonical card
+order; filtered columns show visible counts and a distinct no-match state, while genuinely empty
+columns retain their normal drop target. A result summary reports visible and total card counts.
+A fresh `board/state` snapshot for the same active task set reapplies the local values. When
+`activeTaskSetId` changes, the controls reset while the existing task-set selection flow remains
+unchanged. Labels, keyboard-focusable controls, clear/reset behavior, and the live result summary
+must remain usable at the narrow board breakpoint. The editor and browser surfaces use this same
+generated document, so filtering requires no server-side search API or persisted protocol state.
+
 `task/move` is a manual state override, not a state-machine action: a valid cross-column move
 updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
 It preserves the task body and unrelated metadata, does not launch a stage or append a receipt,

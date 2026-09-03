@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { Task } from '../model/task';
+import { newTaskFile, Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { CancellationResult, ChatCommandApi, ChatSessionExecutor, CHAT_NEW_COMMAND, Executor, ExecutorResult, RunOptions } from '../chat/executor';
 import { closeTaskChatTabs, CommandExecutor, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
@@ -145,10 +145,19 @@ function runIdFromPrompt(prompt: string): string {
 	return match[1];
 }
 
+async function recordDevelopEvidence(store: TaskStore, task: Task, runId: string): Promise<void> {
+	const file = `implementation-${runId}.ts`;
+	await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(store.directory, file), Buffer.from('export {};', 'utf8'));
+	await store.appendLog(task.id, `- implementation-evidence run:${runId} files:"${file}" verify:"focused test"`);
+}
+
 /** Stage-generic receipt writer for a stub executor: reads the runId straight out of the prompt it received. */
 function okReceipt(store: TaskStore, stage: 'refine' | 'develop' | 'validate' | 'split') {
 	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
 		const runId = runIdFromPrompt(prompt);
+		if (stage === 'develop') {
+			await recordDevelopEvidence(store, t, runId);
+		}
 		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result: 'ok', note: 'done' }));
 		return { ok: true, sessionId: 's1' };
 	};
@@ -172,12 +181,17 @@ function okReceiptWithProposals(
 	stage: 'refine' | 'develop' | 'validate' | 'split',
 	titles: string[],
 	types: (string | undefined)[] = [],
+	parents: (string | undefined)[] = [],
 ) {
 	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
 		const runId = runIdFromPrompt(prompt);
+		if (stage === 'develop') {
+			await recordDevelopEvidence(store, t, runId);
+		}
 		for (const [index, title] of titles.entries()) {
 			const type = types[index];
-			await store.appendLog(t.id, `- propose-task run:${runId}${type ? ` type:${type}` : ''} title:"${title}" note:"found while working"`);
+			const parent = parents[index];
+			await store.appendLog(t.id, `- propose-task run:${runId}${type ? ` type:${type}` : ''}${parent ? ` parent:${parent}` : ''} title:"${title}" note:"found while working"`);
 		}
 		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result: 'ok', note: 'done' }));
 		return { ok: true, sessionId: 's1' };
@@ -193,6 +207,9 @@ function okReceiptThenProposals(
 ) {
 	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
 		const runId = runIdFromPrompt(prompt);
+		if (stage === 'develop') {
+			await recordDevelopEvidence(store, t, runId);
+		}
 		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result: 'ok', note: 'receipt first' }));
 		setTimeout(() => {
 			void (async () => {
@@ -1806,6 +1823,86 @@ suite('M3 RunManager', () => {
 	});
 
 	suite('task proposals (§6.12)', () => {
+		test('a Develop success receipt without implementation evidence remains blocked', async () => {
+			const task = await store.create('Do not complete without implementation');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const executor = new StubExecutor(async (currentTask, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(currentTask.id, formatReceipt({
+					runId,
+					taskId: currentTask.id,
+					stage: 'develop',
+					result: 'ok',
+					note: 'no implementation performed',
+				}));
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'develop');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'in-progress');
+			assert.strictEqual(after.status, 'blocked');
+			assert.match(after.sections['Log'], /implementation evidence/i);
+		});
+
+		test('a Develop success receipt with changed-file evidence advances', async () => {
+			const task = await store.create('Complete with implementation evidence');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const executor = new StubExecutor(async (currentTask, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				const sourceDirectory = vscode.Uri.joinPath(dir, 'src');
+				await vscode.workspace.fs.createDirectory(sourceDirectory);
+				await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(sourceDirectory, 'evidence.ts'), Buffer.from('export {};', 'utf8'));
+				await store.appendLog(currentTask.id, `- implementation-evidence run:${runId} files:"src/evidence.ts" verify:"npm test"`);
+				await store.appendLog(currentTask.id, formatReceipt({
+					runId,
+					taskId: currentTask.id,
+					stage: 'develop',
+					result: 'ok',
+					note: 'implemented evidence guard',
+				}));
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'develop');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
+		});
+
+		test('an explicitly task-only Scope allows a non-code Develop completion', async () => {
+			const task = await store.create('Document the release process');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			await store.edit(task.id, {
+				title: task.title,
+				request: task.sections['Request'] ?? '',
+				refined: task.sections['Refined'] ?? '',
+				scope: 'completion-evidence: task-only',
+			});
+			const executor = new StubExecutor(async (currentTask, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(currentTask.id, formatReceipt({
+					runId,
+					taskId: currentTask.id,
+					stage: 'develop',
+					result: 'ok',
+					note: 'documentation completed',
+				}));
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'develop');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
+		});
+
 		test('a develop run\'s propose-task lines become real backlog tasks, marked with their origin', async () => {
 			const task = await store.create('Set up billing webhook');
 			await store.patch(task.id, { state: 'approved', status: 'idle' });
@@ -1863,6 +1960,59 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Add retry metrics')?.type, 'feature');
 			assert.strictEqual(tasks.find((candidate) => candidate.title === 'Fix timeout handling')?.type, 'bug');
 			assert.strictEqual(tasks.some((candidate) => candidate.title === 'Invalid child'), false);
+		});
+
+		test('omitted proposals attach to the run task while explicit parents stay separate from origin provenance', async () => {
+			const task = await store.create('Proposal origin');
+			const explicitParent = await store.create('Explicit parent');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptWithProposals(
+					store,
+					'develop',
+					['Inherited child', 'Explicit child'],
+					[],
+					[undefined, explicitParent.id],
+				)),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			await waitUntilSettled(store, task.id);
+
+			const { tasks } = await store.readAll();
+			const inherited = tasks.find((candidate) => candidate.title === 'Inherited child');
+			const explicit = tasks.find((candidate) => candidate.title === 'Explicit child');
+		assert.strictEqual(inherited?.parentTaskId, task.id);
+		assert.strictEqual(explicit?.parentTaskId, explicitParent.id);
+		assert.strictEqual(explicit?.originTask, task.id);
+		assert.notStrictEqual(explicit?.originTask, explicit?.parentTaskId);
+		});
+
+		test('invalid proposal parents are retryable and do not create unattached tasks', async () => {
+			const task = await store.create('Retry invalid proposal parent');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceiptWithProposals(store, 'develop', ['Waiting child'], [], ['TASK-999'])),
+				folder,
+			);
+
+			await runManager.handleAction(task.id, 'develop');
+			await waitUntilSettled(store, task.id);
+			assert.strictEqual((await store.readAll()).tasks.some((candidate) => candidate.title === 'Waiting child'), false);
+			assert.match((await store.readAll()).tasks.find((candidate) => candidate.id === task.id)?.sections['Log'] ?? '', /proposal-error/);
+
+			await vscode.workspace.fs.writeFile(
+				store.fileFor('TASK-999'),
+				Buffer.from(newTaskFile('TASK-999', 'Now available'), 'utf8'),
+			);
+			await runManager.reconcileTaskChange(task.id);
+			await runManager.reconcileTaskChange(task.id);
+			const children = (await store.readAll()).tasks.filter((candidate) => candidate.title === 'Waiting child');
+			assert.strictEqual(children.length, 1);
+			assert.strictEqual(children[0].parentTaskId, 'TASK-999');
 		});
 
 		test('refine ignores propose-task lines even if an agent writes one — scoping only, not filing', async () => {
@@ -1992,6 +2142,44 @@ suite('M3 RunManager', () => {
 			const namedTasks = (await namedStore.readAll()).tasks;
 			assert.strictEqual(namedTasks.filter((candidate) => candidate.title === 'Recovered named child').length, 1);
 			assert.strictEqual((await store.readAll()).tasks.length, 0, 'the legacy Default task folder must remain untouched');
+		});
+
+		test('concurrent reconciliation managers file an accepted proposal only once', async () => {
+			const task = await store.create('Prevent duplicate child tasks');
+			const runId = 'r-concurrent-proposal';
+			await store.auditedPatch(
+				task.id,
+				{ state: 'validation', status: 'idle', run: undefined },
+				{
+					action: 'receipt',
+					runId,
+					outcome: 'ok',
+					events: [
+						{ kind: 'activity-start', stage: 'develop', action: 'develop', runId },
+						{ kind: 'activity-finish', stage: 'develop', action: 'receipt', runId, outcome: 'ok' },
+					],
+				},
+			);
+			await store.appendLog(task.id, formatReceipt({
+				runId,
+				taskId: task.id,
+				stage: 'develop',
+				result: 'ok',
+				note: 'completed before concurrent reconciliation',
+			}));
+			await store.appendLog(task.id, `- propose-task run:${runId} title:"Create once" note:"reconciled concurrently"`);
+
+			const secondStore = new TaskStore(dir, 'default');
+			const firstManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			const secondManager = new RunManager(secondStore, new StubExecutor(() => 'hang'), folder);
+			await Promise.all([
+				firstManager.reconcileTaskChange(task.id),
+				secondManager.reconcileTaskChange(task.id),
+			]);
+
+			const children = (await store.readAll()).tasks.filter((candidate) => candidate.originTask === task.id);
+			assert.strictEqual(children.length, 1);
+			assert.strictEqual(children[0].title, 'Create once');
 		});
 
 		test('a post-receipt child-write failure is recorded instead of being swallowed', async () => {

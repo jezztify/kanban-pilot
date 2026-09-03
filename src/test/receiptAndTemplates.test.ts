@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { findLatestReceipt, findReceipt, findReceiptDetails, formatReceipt, parseReceipts } from '../chat/receipt';
+import { findLatestReceipt, findReceipt, findReceiptDetails, formatReceipt, parseImplementationEvidence, parseReceipts } from '../chat/receipt';
 import { loadPromptTemplate, renderTemplate, TemplateVars } from '../chat/promptTemplates';
 import { hashScope } from '../chat/scopeHash';
 import { STAGE_AGENT_NAME } from '../chat/agentNames';
@@ -39,6 +39,18 @@ async function tempFolder(): Promise<{ folder: vscode.WorkspaceFolder; dispose: 
 }
 
 suite('M3 receipt grammar', () => {
+	test('parses a structured Develop implementation-evidence line', () => {
+		const [evidence] = parseImplementationEvidence(
+			'- implementation-evidence run:r7 files:"src/chat/runManager.ts,src/test/runManager.test.ts" verify:"npm test"',
+		);
+
+		assert.deepStrictEqual(evidence, {
+			runId: 'r7',
+			files: ['src/chat/runManager.ts', 'src/test/runManager.test.ts'],
+			verification: 'npm test',
+		});
+	});
+
 	test('parses a well-formed receipt line', () => {
 		const log = '- run:r7 task:TASK-142 stage:refine result:ok note:"scope written, 3 files"';
 		const [receipt] = parseReceipts(log);
@@ -305,6 +317,8 @@ suite('M3 prompt templates', () => {
 
 			assert.ok(rendered.includes('A signed webhook endpoint for Stripe billing events.'));
 			assert.ok(rendered.includes('- [ ] src/routes/webhooks/stripe.ts'));
+			assert.ok(rendered.includes('implementation-evidence run:r7 files:"<changed non-task files>" verify:"<verification performed>"'));
+			assert.ok(rendered.includes('Do not report success when you only created follow-up tasks'));
 		} finally {
 			await dispose();
 		}

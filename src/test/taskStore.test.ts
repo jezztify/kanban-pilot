@@ -277,6 +277,14 @@ suite('M1 task schema', () => {
 		assert.ok(task!.sections['Request'].includes("Filed automatically by TASK-142's run r19"));
 	});
 
+	test('newTaskFile round-trips an optional parent task', () => {
+		const raw = newTaskFile('TASK-002', 'Child task', { parentTaskId: 'TASK-001' });
+		const task = taskFromRaw(raw);
+
+		assert.strictEqual(task?.parentTaskId, 'TASK-001');
+		assert.match(raw, /status: idle\nparent_task: TASK-001\n/);
+	});
+
 	test('newTaskFile uses the description as Request, falling back to the title when blank (§6.16)', () => {
 		const withDescription = newTaskFile('TASK-004', 'Set up billing webhook', {
 			request: 'Stripe webhooks are not handled at all.',
@@ -955,6 +963,52 @@ suite('M1 task store', () => {
 		assert.strictEqual(filed.originRunId, 'r19');
 		assert.strictEqual(filed.originProposalKey, 'key-r19');
 		assert.strictEqual(filed.setId, store.setId);
+	});
+
+	test('validates same-set parents, rejects invalid links before writing, and protects parent deletion', async () => {
+		const parent = await store.create('Parent');
+		const child = await store.create('Child', { parentTaskId: parent.id });
+		assert.strictEqual(child.parentTaskId, parent.id);
+		assert.strictEqual((await new TaskStore(dir, store.setId).readAll()).tasks.find((task) => task.id === child.id)?.parentTaskId, parent.id);
+
+		const beforeInvalid = await vscode.workspace.fs.readDirectory(dir);
+		await assert.rejects(() => store.create('Missing parent', { parentTaskId: 'TASK-999' }), /not found in the active task set/);
+		await assert.rejects(() => store.create('Self parent', { parentTaskId: 'TASK-003' }), /own parent/);
+		assert.deepStrictEqual(await vscode.workspace.fs.readDirectory(dir), beforeInvalid);
+
+		await assert.rejects(() => store.patch(parent.id, { parent_task: child.id }), /cannot contain a cycle/);
+		await assert.rejects(() => store.delete(parent.id), /has child tasks/);
+		assert.ok((await store.readAll()).tasks.some((task) => task.id === parent.id));
+
+		await store.patch(child.id, { parent_task: undefined });
+		await store.delete(parent.id);
+		assert.strictEqual((await store.readAll()).tasks.some((task) => task.id === parent.id), false);
+	});
+
+	test('detaches malformed and missing legacy parent links for reads', async () => {
+		const parent = await store.create('Parent');
+		const child = await store.create('Child');
+		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(child.id))).toString('utf8');
+		await vscode.workspace.fs.writeFile(store.fileFor(child.id), Buffer.from(updateFrontmatter(raw, { parent_task: 'TASK-not-valid' }), 'utf8'));
+		assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === child.id)?.parentTaskId, undefined);
+
+		await vscode.workspace.fs.writeFile(store.fileFor(child.id), Buffer.from(updateFrontmatter(raw, { parent_task: 'TASK-999' }), 'utf8'));
+		assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === child.id)?.parentTaskId, undefined);
+		assert.strictEqual((await store.readAll()).tasks.find((task) => task.id === parent.id)?.parentTaskId, undefined);
+	});
+
+	test('detaches every link in a legacy parent cycle', async () => {
+		const first = await store.create('First');
+		const second = await store.create('Second', { parentTaskId: first.id });
+		const raw = Buffer.from(await vscode.workspace.fs.readFile(store.fileFor(first.id))).toString('utf8');
+		await vscode.workspace.fs.writeFile(
+			store.fileFor(first.id),
+			Buffer.from(updateFrontmatter(raw, { parent_task: second.id }), 'utf8'),
+		);
+
+		const tasks = (await store.readAll()).tasks;
+		assert.strictEqual(tasks.find((task) => task.id === first.id)?.parentTaskId, undefined);
+		assert.strictEqual(tasks.find((task) => task.id === second.id)?.parentTaskId, undefined);
 	});
 
 	test('non-task files in the folder are ignored', async () => {

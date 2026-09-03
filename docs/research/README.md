@@ -15,6 +15,7 @@ specification, see [PRD.md](../PRD.md); for how the shipped product behaves, see
 | [Copilot model selection spike](copilot-model-selection-spike.md) | 2026-09-01 | **Conditional go.** Per-stage model selection is achievable on supported API surface, once two defects in the global selector are fixed. |
 | [Copilot response streaming spike](copilot-response-streaming-spike.md) | 2026-09-01 | **Conditional go.** Response content is reachable as ordinary files, but it is a lagging tail (5–50 s), undocumented and unversioned. |
 | [Copilot hook feed design](copilot-hook-feed-design.md) | 2026-09-01 | **Conditional go, at reduced value.** Hooks deliver turn and tool events at near-zero lag, but the editor never dispatches `PermissionRequest`. |
+| [User experience spike](user-experience-spike.md) | 2026-09-03 | **Approve five follow-ups.** Prioritized improvements for workflow recovery, browser parity and connection feedback, activity clarity, and board-scale discovery. |
 
 ## Known stale links
 

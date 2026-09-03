@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import {
 	applyPendingOutcome as applyPendingTaskOutcome,
@@ -21,6 +22,7 @@ import type { Proposal } from './proposals';
 import {
 	findReceiptDetails,
 	formatReceipt,
+	parseImplementationEvidence,
 	parseReceipts,
 	Receipt,
 	ReceiptExpectation,
@@ -53,6 +55,14 @@ const POST_RECEIPT_PROPOSAL_GRACE_MS = 5_000;
 const LATE_RECEIPT_MARKER = 'awaiting late receipt';
 const appliedReceiptKeys = new Set<string>();
 const inFlightReceiptKeys = new Set<string>();
+const IMPLEMENTATION_EVIDENCE_EXCLUDED_DIRECTORIES = new Set([
+	'.git',
+	'.kanban-pilot',
+	'.vscode-test',
+	'dist',
+	'dist-test',
+	'node_modules',
+]);
 
 class AdmissionMutex {
 	private tail: Promise<void> = Promise.resolve();
@@ -424,6 +434,7 @@ export type CommandExecutor = <T>(command: string, ...args: unknown[]) => Thenab
 export type RunChangeKind =
 	| 'start'
 	| 'progress'
+	| 'task'
 	| 'stop'
 	| 'blocked'
 	| 'failed'
@@ -467,6 +478,7 @@ export class RunManager {
 	private readonly postReceiptProposalRuns = new Set<string>();
 	private readonly ownedReservations = new Map<string, { taskId: string; runId: string }>();
 	private readonly activeExecutorRuns = new Map<string, Task>();
+	private readonly implementationBaselines = new Map<string, Map<string, string>>();
 	private readonly changed = new vscode.EventEmitter<RunManagerChange>();
 	private readonly progressTimers = new Set<ReturnType<typeof setInterval>>();
 	private disposed = false;
@@ -505,6 +517,57 @@ export class RunManager {
 
 	private reservationKey(taskId: string, runId: string): string {
 		return `${taskId}\u0000${runId}`;
+	}
+
+	private isImplementationEvidencePath(path: string): boolean {
+		const segments = path.split('/');
+		return path.length > 0 && !segments.some((segment) =>
+			segment === '..' || IMPLEMENTATION_EVIDENCE_EXCLUDED_DIRECTORIES.has(segment),
+		);
+	}
+
+	private async implementationFileSnapshot(
+		directory = this.workspaceFolder.uri,
+		prefix = '',
+		files = new Map<string, string>(),
+	): Promise<Map<string, string>> {
+		for (const [name, type] of await vscode.workspace.fs.readDirectory(directory)) {
+			const relativePath = prefix ? `${prefix}/${name}` : name;
+			if (!this.isImplementationEvidencePath(relativePath)) {
+				continue;
+			}
+			const uri = vscode.Uri.joinPath(directory, name);
+			if (type === vscode.FileType.Directory) {
+				await this.implementationFileSnapshot(uri, relativePath, files);
+			} else if (type === vscode.FileType.File) {
+				const contents = await vscode.workspace.fs.readFile(uri);
+				files.set(relativePath, createHash('sha256').update(contents).digest('hex'));
+			}
+		}
+		return files;
+	}
+
+	private async developEvidenceFailure(task: Task, runId: string): Promise<string | undefined> {
+		if (/^\s*completion-evidence:\s*task-only\s*$/mi.test(task.sections['Scope'] ?? '')) {
+			return undefined;
+		}
+		const evidence = parseImplementationEvidence(task.sections['Log'] ?? '').filter((entry) => entry.runId === runId);
+		if (evidence.length === 0) {
+			return 'Develop completion requires implementation evidence with changed files and verification.';
+		}
+		const baseline = this.implementationBaselines.get(this.reservationKey(task.id, runId));
+		if (!baseline) {
+			return 'Develop completion cannot verify implementation changes because its workspace baseline is unavailable.';
+		}
+		const current = await this.implementationFileSnapshot();
+		const files = evidence.flatMap((entry) => entry.files);
+		if (files.some((file) => !this.isImplementationEvidencePath(file))) {
+			return 'Develop implementation evidence must name non-task, non-generated workspace files.';
+		}
+		if (!files.some((file) => current.has(file) && current.get(file) !== baseline.get(file))) {
+			return 'Develop completion evidence does not identify a workspace file changed during this run.';
+		}
+		return undefined;
 	}
 
 	private releaseReservation(taskId: string, runId: string): void {
@@ -1238,6 +1301,9 @@ export class RunManager {
 				return;
 			}
 			const executorRunKey = this.reservationKey(taskId, runId);
+			if (stage === 'develop') {
+				this.implementationBaselines.set(executorRunKey, await this.implementationFileSnapshot());
+			}
 			this.activeExecutorRuns.set(executorRunKey, latest);
 			if (cfg.transcriptFeed) {
 				// A first run has no copilot_session_id yet — it is harvested from the
@@ -1280,6 +1346,7 @@ export class RunManager {
 		} finally {
 			this.transcriptTail?.stop(taskId);
 			this.activeExecutorRuns.delete(this.reservationKey(taskId, runId));
+			this.implementationBaselines.delete(this.reservationKey(taskId, runId));
 			clearInterval(progressTimer);
 			this.progressTimers.delete(progressTimer);
 			this.notify({ kind: 'completion', taskId, runId, stage });
@@ -1921,6 +1988,20 @@ export class RunManager {
 			if (this.disposed || !fresh || !isCurrent(fresh)) {
 				return;
 			}
+			if (stage === 'develop' && receipt.result === 'ok') {
+				const evidenceFailure = await this.developEvidenceFailure(fresh, runId);
+				if (evidenceFailure) {
+					await this.applyOutcome(taskId, runId, stage, 'blocked', fresh.sections['Scope'], {
+						correction: options.correction ?? !initial.run,
+						note: evidenceFailure,
+						action: options.action ?? (initial.run ? 'receipt' : 'late-receipt'),
+						transitionAction: options.transitionAction,
+					});
+					this.notify({ kind: 'blocked', taskId, runId, stage, note: evidenceFailure });
+					appliedReceiptKeys.add(key);
+					return;
+				}
+			}
 
 			await this.applyOutcome(
 				taskId,
@@ -2392,7 +2473,11 @@ export class RunManager {
 		type: Task['type'],
 		fingerprint: string,
 	): boolean {
-		if (child.originTask !== parent.id || child.type !== type) {
+		const effectiveParentId = proposal.parentTaskId ?? parent.id;
+		const parentMatches = child.parentTaskId === effectiveParentId || (
+			proposal.parentTaskId === undefined && child.parentTaskId === undefined
+		);
+		if (child.originTask !== parent.id || child.type !== type || !parentMatches) {
 			return false;
 		}
 		if (child.originRunId !== undefined && child.originRunId !== runId) {
@@ -2427,6 +2512,7 @@ export class RunManager {
 			.filter((candidate, index, all) =>
 				all.findIndex((other) =>
 					other.type === candidate.type &&
+					(other.proposal.parentTaskId ?? task.id) === (candidate.proposal.parentTaskId ?? task.id) &&
 					other.proposal.title === candidate.proposal.title &&
 					other.proposal.note === candidate.proposal.note,
 				) === index,
@@ -2440,11 +2526,17 @@ export class RunManager {
 			const fingerprint = proposalFingerprint(proposal, type);
 			accepted.push({ proposal, type, fingerprint });
 			if (known.some((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint))) {
+				const existing = known.find((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint));
+				if (existing && proposal.parentTaskId === undefined && existing.parentTaskId === undefined) {
+					await this.store.patch(existing.id, { parent_task: task.id });
+					existing.parentTaskId = task.id;
+				}
 				continue;
 			}
 
 			const child = await this.store.create(proposal.title, {
 				type,
+				parentTaskId: proposal.parentTaskId ?? task.id,
 				origin: { taskId: task.id, runId, note: proposal.note, proposalKey: fingerprint },
 			});
 			known.push(child);
@@ -2455,6 +2547,9 @@ export class RunManager {
 		const persisted = accepted.filter(({ proposal, type, fingerprint }) =>
 			persistedTasks.some((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint)),
 		).length;
+		if (created > 0) {
+			this.notify({ kind: 'task', taskId: task.id, note: `${created} child task${created === 1 ? '' : 's'} created.` });
+		}
 		return { accepted: accepted.length, persisted, created };
 	}
 

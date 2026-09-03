@@ -13,6 +13,27 @@ set-specific binding keeps chats from different sets isolated.
 - Default can't be renamed or deleted.
 - You can't switch or create sets while a task is running — a run always stays with its set.
 
+## Find cards without scanning every column
+
+Use the board-local controls above the columns to narrow the current task-set projection:
+
+- **Find** matches a task ID, part of a title, or a known parent task ID, without regard to case.
+- **Type** filters by Feature or Bug.
+- **Status** filters by Idle, Running, Paused, Blocked, or Failed.
+- **Relationship** filters by Parent, Child, or Standalone. A Parent has child tasks, a Child has
+	a parent task, and a task in the middle of a chain can be both. Standalone has neither role.
+
+Find and filter criteria combine, so a card must satisfy every active control. **Clear** resets
+the Find field and all selectors. The board keeps all seven columns and their card order visible;
+counts show matching cards, and a **No matching tasks** message distinguishes a filtered column
+from one that is genuinely empty. The result summary reports how many cards match.
+
+These controls are local to the board. They do not edit task files, frontmatter, positions, task
+sets, workflow state, or card actions, and they do not require a task detail modal. A refresh from
+the same task set keeps the active criteria. Switching task sets clears them for the new
+projection. The labeled controls, clear action, keyboard focus, and live result summary are
+available at the board's narrow layout as well.
+
 ## Edit a card without leaving the board
 
 Select a card and choose **Edit task**. You can change the title and the Markdown in the
@@ -22,6 +43,30 @@ message stays on screen so you can fix it without retyping everything.
 
 Editing never changes the card's column, its run state, or its history — those only move through
 workflow actions and run results. A task that's currently running can't be saved until it stops.
+
+## Read outcome guidance at the point of work
+
+Cards and task detail show a visible outcome callout for conditions that need attention. The
+callout is text-based, so the meaning does not depend on the column colour or a hover state.
+
+- **Running** identifies the active stage and run. The detail view explains that the run is in
+	progress and keeps the legal **Stop** action visible.
+- **Blocked** identifies the stage and the recorded reason when one exists. Detail explains that
+	host approval or another host action is holding the task and shows only the legal retry action.
+- **Failed** shows the stage, run, and failure reason when available. Detail points to the legal
+	retry action instead of treating the failure as a successful completion.
+- **Review Required** means a durable receipt completed but a manual finishing gate still holds
+	the transition. The detail view shows the receipt result, stage, run, and gate, and **Apply**
+	commits that existing outcome without starting another run.
+- **Recovery Available** means a validated successful receipt from an older run arrived after the
+	newer task history had already settled. Detail shows the old run, current or latest run, and
+	receipt summary. **Recover** always asks for explicit host confirmation and revalidates the
+	candidate, so an active-run or stale race is reported as not applied rather than shown as a
+	successful recovery.
+
+After **Apply** or **Recover**, the board reports the host result in a visible status notice. A
+stale task, missing receipt, active run, or other conflict therefore leaves an explanation on the
+board while the task and its open detail refresh from disk.
 
 ## Reorder cards
 

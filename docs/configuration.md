@@ -30,6 +30,28 @@ starts another agent run. Review-required outcomes survive reloads and window re
 starts still respect the shared run-capacity limit. Blocked or failed work is never retried on its
 own.
 
+## Distinguish pending, blocked, failed, and stale work
+
+The board's outcome callout separates four states that can otherwise look similar:
+
+- A **Review Required** result has a matching durable receipt and a `pending_outcome`. It is a
+	completed stage waiting for the named manual gate. Use **Apply** to commit that receipt; do not
+	use the ordinary retry action as a substitute for gate review.
+- A **Blocked** task has stopped because host approval or another host action is required. Its
+	detail explains the reason when available and offers the state-machine retry action for that
+	column.
+- A **Failed** task has a failed run or receipt. Its detail shows the failure reason when it can be
+	recovered from the audit or receipt history and offers the legal retry action.
+- A **Recovery Available** result is a successful receipt from an older run that passed the
+	extension's stale-candidate checks. The board shows the old and latest/current run context and
+	receipt summary. **Recover** requires modal host confirmation and a second validation while the
+	workspace coordinator is held; it never starts another run or silently overwrites newer state.
+
+If the task changes between display and the click, the board reports that Apply or Recover was not
+applied and refreshes the card and open detail. An active-run conflict, missing receipt, pending
+outcome, or stale candidate is therefore an explicit recovery result rather than an apparently
+successful transition.
+
 ## Tune it in Settings
 
 The **Settings** button in the header opens a keyboard-friendly, two-pane editor covering every

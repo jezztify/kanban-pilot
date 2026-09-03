@@ -10,6 +10,7 @@ import { BrowserBoardSurface } from '../http/browserBoardSurface';
 import {
 	ALL_KANBAN_SETTING_KEYS,
 	BoardPanel,
+	BoardTaskSetChange,
 	BoardTaskSetHost,
 	GATES,
 	isAgentColumn,
@@ -26,7 +27,9 @@ import {
 	settingsStateFor,
 	settingsValuesFor,
 	renderTaskMarkdown,
+		outcomeGuidanceFor,
 	primaryAction,
+	taskTreeFor,
 	updateAgentNameOverrides,
 	validateSettingValue,
 } from '../board/boardPanel';
@@ -41,6 +44,7 @@ import {
 	encodePendingOutcome,
 	parseTaskDetailSections,
 	Status,
+	Task,
 	taskAttachmentReference,
 	taskFromRaw,
 	newTaskFile,
@@ -121,6 +125,7 @@ function detailViewFor(task: {
 		latestRunId?: string;
 		summary: string;
 	}[];
+	outcome?: ReturnType<typeof outcomeGuidanceFor>;
 	feed?: readonly {
 		runId: string;
 		taskId: string;
@@ -158,6 +163,7 @@ function detailViewFor(task: {
 			? primaryAction(task.state ?? 'backlog', task.status ?? (canEdit ? 'idle' : 'running'))
 			: task.primary,
 		pending: task.pending ?? null,
+		outcome: task.outcome,
 		staleCompletions: task.staleCompletions ?? [],
 		secondary: task.secondary === undefined ? null : task.secondary,
 	};
@@ -492,10 +498,1024 @@ suite('BoardPanel Settings', () => {
 		dom.window.close();
 	});
 
+	test('projects Task Tree descendants in deterministic order and detaches legacy cycles', () => {
+		const makeTask = (id: string, title: string, parentTaskId?: string, state: Column = 'backlog', status: Status = 'idle'): Task => ({
+			setId: 'tree-test',
+			id,
+			title,
+			type: 'feature',
+			state,
+			status,
+			...(parentTaskId ? { parentTaskId } : {}),
+			chatResetRequired: false,
+			sections: { Request: '', Refined: '', Scope: '', Log: '' },
+			body: '',
+		});
+
+		const tree = taskTreeFor([
+			makeTask('TASK-11', 'Second child', 'TASK-10', 'done', 'paused'),
+			makeTask('TASK-3', 'Grandchild', 'TASK-2', 'validation', 'blocked'),
+			makeTask('TASK-10', 'Root'),
+			makeTask('TASK-2', 'First child', 'TASK-10', 'refine', 'running'),
+			makeTask('TASK-99', 'Unrelated'),
+		], 'TASK-10');
+		assert.ok(tree);
+		assert.deepStrictEqual(tree?.nodes, [
+			{ id: 'TASK-2', name: 'First child', status: 'Refine · running' },
+			{ id: 'TASK-3', name: 'Grandchild', status: 'Validation · blocked' },
+			{ id: 'TASK-10', name: 'Root', status: 'Backlog · idle' },
+			{ id: 'TASK-11', name: 'Second child', status: 'Done · paused' },
+		]);
+		assert.deepStrictEqual(tree?.edges, [
+			{ parentId: 'TASK-2', childId: 'TASK-3' },
+			{ parentId: 'TASK-10', childId: 'TASK-2' },
+			{ parentId: 'TASK-10', childId: 'TASK-11' },
+		]);
+
+		const cyclicTree = taskTreeFor([
+			makeTask('TASK-20', 'Cycle A', 'TASK-21'),
+			makeTask('TASK-21', 'Cycle B', 'TASK-20'),
+			makeTask('TASK-22', 'Cycle child', 'TASK-20'),
+		], 'TASK-20');
+		assert.strictEqual(cyclicTree, undefined);
+	});
+
+	test('projects child metadata while keeping child cards in their own columns', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-child-card-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-child-card-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardChildCardTest',
+			'Kanban Pilot Child Card Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		let dom: JSDOM | undefined;
+		try {
+			const parent = await store.create('Parent task');
+			const child = await store.create('Child task', {
+				parentTaskId: parent.id,
+				origin: { taskId: parent.id, runId: 'run-child-card', note: 'Generated child', proposalKey: 'child-card' },
+			});
+			await store.patch(child.id, { state: 'in-progress' });
+			const toView = (board as unknown as {
+				toView(snapshot: unknown, agentNames: unknown, taskSets: unknown[]): unknown;
+			}).toView.bind(board);
+			const projected = toView(await store.snapshot(), {}, [activeSet]) as {
+				columns: { id: string; cards: { id: string; parentTaskId?: string; hasChildren?: boolean }[] }[]
+			};
+			const parentCard = projected.columns.find((column) => column.id === 'backlog')?.cards
+				.find((card) => card.id === parent.id);
+			const childCard = projected.columns.find((column) => column.id === 'in-progress')?.cards
+				.find((card) => card.id === child.id);
+			assert.strictEqual(parentCard?.parentTaskId, undefined);
+			assert.strictEqual(parentCard?.hasChildren, true);
+			assert.strictEqual(childCard?.parentTaskId, parent.id);
+
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({ postMessage() {} }),
+					});
+				},
+			});
+			dispatchWebviewMessage(dom, {
+				type: 'board/state',
+				snapshot: { ...projected, parentOptions: undefined },
+			});
+			const childElement = dom.window.document.querySelector('.card[data-task-id="' + child.id + '"]');
+			const parentElement = dom.window.document.querySelector('.card[data-task-id="' + parent.id + '"]');
+			assert.strictEqual(parentElement?.querySelector('.badge-task-parent')?.textContent, 'Parent');
+			assert.ok(childElement);
+			assert.strictEqual(childElement?.querySelector('.badge-task-child')?.textContent, 'Child of ' + parent.id);
+			assert.strictEqual(childElement?.querySelector('.badge-proposed'), null);
+			assert.match(childElement?.getAttribute('aria-label') ?? '', /Child of TASK-\d+\./);
+			assert.strictEqual(childElement?.querySelector('.badge-task-child')?.tagName, 'SPAN');
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('renders board-local find controls and filters cards without host messages', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-filter-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-filter-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardFilterTest',
+			'Kanban Pilot Board Filter Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		let dom: JSDOM | undefined;
+		try {
+			const labels: Record<string, string> = {
+				backlog: 'Backlog',
+				refine: 'Refine',
+				scoped: 'Scoped',
+				approved: 'Approved',
+				'in-progress': 'In Progress',
+				validation: 'Validation',
+				done: 'Done',
+			};
+			const cards = [
+				{
+					id: 'TASK-101', title: 'Prepare release notes', type: 'feature', typeLabel: 'Feature',
+					status: 'idle', primary: null, canSplit: false, hasChildren: true,
+				},
+				{
+					id: 'TASK-102', title: 'Fix checkout', type: 'bug', typeLabel: 'Bug',
+					status: 'running', primary: 'continue', canSplit: false, parentTaskId: 'TASK-101',
+				},
+				{
+					id: 'TASK-103', title: 'Archive notes', type: 'feature', typeLabel: 'Feature',
+					status: 'paused', primary: null, canSplit: false,
+				},
+				{
+					id: 'TASK-104', title: 'Release checklist', type: 'feature', typeLabel: 'Feature',
+					status: 'blocked', primary: null, canSplit: false, parentTaskId: 'TASK-101', hasChildren: true,
+				},
+				{
+					id: 'TASK-105', title: 'Investigate timeout', type: 'bug', typeLabel: 'Bug',
+					status: 'failed', primary: null, canSplit: false,
+				},
+			];
+			const snapshot = {
+				malformed: [],
+				taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+				activeTaskSetId: activeSet.id,
+				activeTaskSetName: activeSet.name,
+				columns: ['backlog', 'refine', 'scoped', 'approved', 'in-progress', 'validation', 'done'].map((id) => {
+					const columnCards = id === 'backlog'
+						? [cards[0]]
+						: id === 'refine'
+							? [cards[3]]
+							: id === 'approved'
+								? [cards[4]]
+								: id === 'in-progress'
+									? [cards[1]]
+									: id === 'done' ? [cards[2]] : [];
+					return {
+						id,
+						label: labels[id],
+						agent: 'None',
+						count: columnCards.length,
+						cards: columnCards,
+					};
+				}),
+			};
+			const taskFile = vscode.Uri.joinPath(directory, 'TASK-101.md');
+			await vscode.workspace.fs.writeFile(
+				taskFile,
+				Buffer.from(newTaskFile('TASK-101', 'Prepare release notes', { type: 'feature', position: 0 })),
+			);
+			const taskFileBefore = Buffer.from(await vscode.workspace.fs.readFile(taskFile));
+			const snapshotBefore = JSON.stringify(snapshot);
+			const activeTaskSetBefore = { id: activeSet.id, name: activeSet.name };
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({ postMessage(message: unknown) { posted.push(message); } }),
+					});
+				},
+			});
+			posted.length = 0;
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot });
+			assert.strictEqual(dom.window.document.querySelectorAll('.column').length, 7);
+			assert.strictEqual(dom.window.document.querySelectorAll('.card').length, 5);
+			const find = dom.window.document.getElementById('boardFind') as HTMLInputElement | null;
+			assert.ok(find, 'the board exposes a local find field');
+			const visibleTaskIds = () => Array.from(dom!.window.document.querySelectorAll('.card'))
+				.map((card) => card.getAttribute('data-task-id'));
+			find.value = ' FIX ';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-102']);
+			find.value = '';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			const typeFilter = dom.window.document.getElementById('boardTypeFilter') as HTMLSelectElement | null;
+			const statusFilter = dom.window.document.getElementById('boardStatusFilter') as HTMLSelectElement | null;
+			const relationshipFilter = dom.window.document.getElementById('boardRelationshipFilter') as HTMLSelectElement | null;
+			assert.ok(typeFilter, 'the board exposes a type filter');
+			assert.ok(statusFilter, 'the board exposes a status filter');
+			assert.ok(relationshipFilter, 'the board exposes a relationship filter');
+			assert.deepStrictEqual(Array.from(typeFilter.options).map((option) => option.value), ['all', 'feature', 'bug']);
+			assert.deepStrictEqual(Array.from(statusFilter.options).map((option) => option.value), ['all', 'idle', 'running', 'paused', 'blocked', 'failed']);
+			assert.deepStrictEqual(Array.from(relationshipFilter.options).map((option) => option.value), ['all', 'parent', 'child', 'standalone']);
+			find.value = ' task-101 ';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101', 'TASK-104', 'TASK-102']);
+			find.value = '\n\t  ';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101', 'TASK-104', 'TASK-105', 'TASK-102', 'TASK-103']);
+			typeFilter.value = 'bug';
+			typeFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-105', 'TASK-102']);
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="backlog"] .count')?.textContent, '0');
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="in-progress"] .count')?.textContent, '1');
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="approved"] .count')?.textContent, '1');
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="done"] .count')?.textContent, '0');
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="backlog"] .filtered-empty')?.textContent, 'No matching tasks');
+			assert.match(dom.window.document.getElementById('boardFilterSummary')?.textContent ?? '', /Showing 2 of 5 tasks across 7 columns\./);
+			typeFilter.value = 'all';
+			statusFilter.value = 'running';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-102']);
+			statusFilter.value = 'idle';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101']);
+			statusFilter.value = 'paused';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-103']);
+			statusFilter.value = 'blocked';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-104']);
+			statusFilter.value = 'failed';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-105']);
+			statusFilter.value = 'all';
+			relationshipFilter.value = 'parent';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101', 'TASK-104']);
+			relationshipFilter.value = 'child';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-104', 'TASK-102']);
+			relationshipFilter.value = 'standalone';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-105', 'TASK-103']);
+			relationshipFilter.value = 'all';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			find.value = 'task-101';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			typeFilter.value = 'feature';
+			typeFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			statusFilter.value = 'blocked';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			relationshipFilter.value = 'child';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-104'], 'active criteria combine with AND semantics');
+			clickElement(dom.window.document.getElementById('boardFilterClear'));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101', 'TASK-104', 'TASK-105', 'TASK-102', 'TASK-103']);
+			assert.strictEqual(find.value, '');
+			assert.strictEqual(typeFilter.value, 'all');
+			assert.strictEqual(statusFilter.value, 'all');
+			assert.strictEqual(relationshipFilter.value, 'all');
+			assert.strictEqual(dom.window.document.activeElement, find, 'clear returns focus to the find field');
+			assert.deepStrictEqual(Buffer.from(await vscode.workspace.fs.readFile(taskFile)), taskFileBefore);
+			assert.strictEqual(JSON.stringify(snapshot), snapshotBefore);
+			assert.deepStrictEqual({ id: activeSet.id, name: activeSet.name }, activeTaskSetBefore);
+			find.value = 'no-such-task';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			assert.deepStrictEqual(visibleTaskIds(), []);
+			assert.match(dom.window.document.getElementById('boardFilterSummary')?.textContent ?? '', /No matching tasks\. Showing 0 of 5 tasks across 7 columns\./);
+			assert.strictEqual(dom.window.document.querySelectorAll('.filtered-empty').length, 5);
+			assert.strictEqual(dom.window.document.querySelector('.column[data-column-id="scoped"] .filtered-empty'), null);
+			assert.ok(dom.window.document.querySelector('.column[data-column-id="scoped"] .empty-slot'));
+			clickElement(dom.window.document.getElementById('boardFilterClear'));
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-101', 'TASK-104', 'TASK-105', 'TASK-102', 'TASK-103']);
+			assert.strictEqual(posted.length, 0, 'local filtering must not emit a host message');
+			relationshipFilter.value = 'all';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			find.value = 'fix';
+			find.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+			typeFilter.value = 'bug';
+			typeFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			statusFilter.value = 'running';
+			statusFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			relationshipFilter.value = 'child';
+			relationshipFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+			const visibleCard = dom.window.document.querySelector('.card[data-task-id="TASK-102"]');
+			clickElement(visibleCard);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'task/select',
+				taskId: 'TASK-102',
+			});
+			posted.length = 0;
+			clickElement(visibleCard?.querySelector('.action'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'action/invoke',
+				taskId: 'TASK-102',
+				action: 'continue',
+			});
+			const hiddenCanonicalCard = {
+				id: 'TASK-104', title: 'Hidden canonical card', type: 'feature', typeLabel: 'Feature',
+				status: 'idle', primary: null, canSplit: false,
+			};
+			const refreshedSnapshot = {
+				...snapshot,
+				columns: snapshot.columns.map((column) => column.id === 'in-progress'
+					? { ...column, cards: [cards[1], hiddenCanonicalCard], count: 2 }
+					: column),
+			};
+			posted.length = 0;
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot: refreshedSnapshot });
+			assert.deepStrictEqual(
+				Array.from(dom.window.document.querySelectorAll('.card')).map((card) => card.getAttribute('data-task-id')),
+				['TASK-102'],
+			);
+			assert.strictEqual(find.value, 'fix');
+			assert.strictEqual(typeFilter.value, 'bug');
+			assert.strictEqual(statusFilter.value, 'running');
+			assert.strictEqual(relationshipFilter.value, 'child');
+			const refreshedCard = dom.window.document.querySelector('.card[data-task-id="TASK-102"]');
+			assert.ok(refreshedCard);
+			refreshedCard?.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'task/reorder',
+				taskId: 'TASK-102',
+				column: 'in-progress',
+				beforeTaskId: null,
+			});
+			posted.length = 0;
+			refreshedCard?.dispatchEvent(new dom.window.Event('dragstart', { bubbles: true, cancelable: true }));
+			const inProgressEndSlot = dom.window.document.querySelector('.column[data-column-id="in-progress"] .drop-slot:last-child');
+			assert.ok(inProgressEndSlot);
+			inProgressEndSlot?.dispatchEvent(new dom.window.Event('drop', { bubbles: true, cancelable: true }));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'task/reorder',
+				taskId: 'TASK-102',
+				column: 'in-progress',
+				beforeTaskId: null,
+			});
+			refreshedCard?.dispatchEvent(new dom.window.Event('dragend', { bubbles: true }));
+			posted.length = 0;
+			refreshedCard?.dispatchEvent(new dom.window.Event('dragstart', { bubbles: true, cancelable: true }));
+			const approvedEmptySlot = dom.window.document.querySelector('.column[data-column-id="approved"] .drop-slot.empty-slot');
+			assert.ok(approvedEmptySlot);
+			approvedEmptySlot?.dispatchEvent(new dom.window.Event('drop', { bubbles: true, cancelable: true }));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'task/move',
+				taskId: 'TASK-102',
+				destination: 'approved',
+			});
+			refreshedCard?.dispatchEvent(new dom.window.Event('dragend', { bubbles: true }));
+			const switchedSnapshot = {
+				...snapshot,
+				taskSets: [{ id: 'other-task-set', name: 'Other task set', isDefault: false }],
+				activeTaskSetId: 'other-task-set',
+				activeTaskSetName: 'Other task set',
+				columns: snapshot.columns.map((column, index) => index === 0
+					? {
+						...column,
+						count: 1,
+						cards: [{
+							id: 'TASK-201', title: 'Other set task', type: 'feature', typeLabel: 'Feature',
+							status: 'idle', primary: null, canSplit: false,
+						}],
+					}
+					: { ...column, count: 0, cards: [] }),
+			};
+			posted.length = 0;
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot: switchedSnapshot });
+			assert.deepStrictEqual(visibleTaskIds(), ['TASK-201']);
+			assert.strictEqual(find.value, '');
+			assert.strictEqual(typeFilter.value, 'all');
+			assert.strictEqual(statusFilter.value, 'all');
+			assert.strictEqual(relationshipFilter.value, 'all');
+			assert.strictEqual((dom.window.document.getElementById('taskSetSelect') as HTMLSelectElement | null)?.value, 'other-task-set');
+			assert.strictEqual(posted.length, 0, 'a task-set refresh must not create a host mutation message');
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('publishes a split child to the live board without reopening', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-live-child-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		// This test isolates the publication signal from the filesystem watcher.
+		store.watch = (() => new vscode.Disposable(() => undefined)) as TaskStore['watch'];
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-live-child-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const executor: Executor = {
+			async isAvailable() {
+				return true;
+			},
+			async run(task, _taskFileUri, prompt, stage) {
+				assert.strictEqual(stage, 'split');
+				const runId = /run:(\S+)/.exec(prompt)?.[1] ?? '';
+				assert.ok(runId);
+				await store.appendLog(task.id, `- propose-task run:${runId} title:"Live split child" note:"filed during split"`);
+				await store.appendLog(task.id, formatReceipt({
+					runId,
+					taskId: task.id,
+					stage,
+					result: 'ok',
+					note: 'split complete',
+				}));
+				return { ok: true, sessionId: 'split-session' };
+			},
+			async cancel() {
+				return { kind: 'cancelled' };
+			},
+		};
+		const runManager = new RunManager(store, executor, folder);
+		const hostListeners = new Set<(change?: BoardTaskSetChange) => void>();
+		const runSubscription = runManager.onDidChange((change) => {
+			if (change.kind !== 'task') {
+				return;
+			}
+			const published = { revision: Date.now(), kind: 'task', taskId: change.taskId };
+			for (const listener of hostListeners) {
+				listener(published);
+			}
+		});
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange(listener) {
+				hostListeners.add(listener);
+				return new vscode.Disposable(() => hostListeners.delete(listener));
+			},
+		};
+		const surface = new BrowserBoardSurface('live-child-board-test');
+		const posted: Record<string, unknown>[] = [];
+		const postMessage = surface.postMessage.bind(surface);
+		surface.postMessage = (message) => {
+			posted.push(message);
+			return postMessage(message);
+		};
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		const waitUntil = async (predicate: () => Promise<boolean> | boolean, timeoutMs = 3000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs;
+			while (!(await predicate())) {
+				if (Date.now() >= deadline) {
+					throw new Error('Timed out waiting for live board publication.');
+				}
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+		};
+		try {
+			await waitUntil(() => posted.some((message) => message.type === 'board/state'));
+			posted.length = 0;
+			const parent = await store.create('Split parent');
+			await runManager.handleAction(parent.id, 'split');
+			await waitUntil(async () => (await store.readAll()).tasks.some((task) => task.title === 'Live split child'));
+			await waitUntil(() => posted.some((message) => {
+				if (message.type !== 'board/state' || !message.snapshot || typeof message.snapshot !== 'object') {
+					return false;
+				}
+				const snapshot = message.snapshot as { columns?: { id: string; cards?: { id: string }[] }[] };
+				return snapshot.columns?.some((column) => (
+					column.id === 'backlog' && column.cards?.some((card) => card.id !== parent.id)
+				)) === true;
+			}));
+
+			const boardState = [...posted].reverse().find((message) => message.type === 'board/state') as {
+				snapshot: { columns: { id: string; cards: { id: string; title: string }[] }[] };
+			};
+			const childCard = boardState.snapshot.columns.find((column) => column.id === 'backlog')?.cards
+				.find((card) => card.title === 'Live split child');
+			assert.ok(childCard, 'the newly persisted child must be present in the refreshed board payload');
+		} finally {
+			runSubscription.dispose();
+			board.dispose();
+			runManager.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('renders and controls an interactive Task Tree sidecar without stealing detail focus', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-task-tree-ui-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-task-tree-ui-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardTaskTreeUiTest',
+			'Kanban Pilot Task Tree UI Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Tree root');
+			const tree = {
+				rootTaskId: task.id,
+				nodes: [
+					{ id: task.id, name: task.title, status: 'Backlog · idle' },
+					{ id: 'TASK-999', name: 'Tree child', status: 'In Progress · idle' },
+				],
+				edges: [{ parentId: task.id, childId: 'TASK-999' }],
+			};
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({ postMessage() {} }),
+					});
+				},
+			});
+			const detail = {
+				...detailViewFor({ id: task.id, title: task.title, sections: {} }),
+				taskTree: tree,
+			};
+			dispatchWebviewMessage(dom, { type: 'task/detail', task: detail });
+			const showTree = Array.from(dom.window.document.querySelectorAll('button'))
+				.find((button) => button.textContent === 'Show Task Tree');
+			assert.ok(showTree);
+			assert.strictEqual(showTree?.getAttribute('aria-expanded'), 'false');
+			clickElement(showTree);
+
+			const sidecar = dom.window.document.getElementById('taskTreeSidecar');
+			assert.ok(sidecar);
+			assert.strictEqual(sidecar?.hidden, false);
+			assert.strictEqual(sidecar?.getAttribute('role'), 'region');
+			assert.strictEqual(sidecar?.querySelector('#taskTreeTitle')?.textContent, 'Task Tree');
+			assert.strictEqual(showTree?.getAttribute('aria-expanded'), 'true');
+			assert.strictEqual(dom.window.document.activeElement?.getAttribute('aria-label'), 'Close Task Tree');
+			assert.strictEqual(
+				sidecar?.querySelector('[role="group"][aria-label="Task Tree view controls"]') !== null,
+				true,
+			);
+			for (const label of ['Zoom in', 'Zoom out', 'Reset view']) {
+				const control: HTMLButtonElement | null = sidecar?.querySelector('button[aria-label="' + label + '"]') ?? null;
+				assert.ok(control, label + ' control should be rendered');
+				assert.strictEqual(control?.getAttribute('title'), label);
+			}
+			const viewport = sidecar?.querySelector('.task-tree-viewport') as HTMLElement | null;
+			const canvas = sidecar?.querySelector('.task-tree-canvas') as HTMLElement | null;
+			assert.ok(viewport);
+			assert.ok(canvas);
+			assert.strictEqual(viewport?.getAttribute('aria-label'), 'Task Tree viewport');
+			assert.strictEqual(viewport?.getAttribute('tabindex'), '0');
+			assert.match(panel.webview.html, /\.task-tree-viewport[\s\S]*touch-action: none/);
+			assert.match(panel.webview.html, /\.task-tree-sidecar[\s\S]*background-color: var\(--vscode-editor-background\)/);
+			assert.match(panel.webview.html, /\.detail-dialog-layout[\s\S]*width: min\(1280px, calc\(100vw - 32px\)\)/);
+			assert.match(panel.webview.html, /\.task-tree-sidecar[\s\S]*max-width: 480px/);
+			assert.match(panel.webview.html, /\.task-tree-viewport[\s\S]*height: min\(56vh, 520px\)/);
+			assert.match(panel.webview.html, /\.task-tree-sidecar \.modal-mermaid-rendered[\s\S]*max-width: none/);
+			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*overflow-y: auto[\s\S]*\.task-tree-sidecar \{ flex: none; width: 100%; max-width: none; min-width: 0; max-height: none; \}/);
+			assert.match(sidecar?.textContent ?? '', /Mermaid renderer unavailable; source is shown below\./);
+			const bridge = loadMermaidBundles(dom);
+			dispatchWebviewMessage(dom, { type: 'task/detail', task: detail });
+			await bridge.render(sidecar, 'test-nonce');
+			assert.strictEqual(sidecar?.querySelectorAll('.modal-mermaid-rendered svg').length, 1);
+
+			Object.defineProperty(viewport, 'getBoundingClientRect', {
+				configurable: true,
+				value: () => ({ left: 0, top: 0, right: 320, bottom: 220, width: 320, height: 220 }),
+			});
+			let capturedPointer: number | undefined;
+			let releasedPointer: number | undefined;
+			Object.defineProperty(viewport, 'setPointerCapture', {
+				configurable: true,
+				value: (pointerId: number) => { capturedPointer = pointerId; },
+			});
+			Object.defineProperty(viewport, 'releasePointerCapture', {
+				configurable: true,
+				value: (pointerId: number) => { releasedPointer = pointerId; },
+			});
+			const pointerEvent = (type: string, clientX: number, clientY: number, pointerId = 1, pointerType = 'mouse') => {
+				const event = new dom!.window.Event(type, { bubbles: true, cancelable: true });
+				Object.defineProperties(event, {
+					button: { value: 0 },
+					clientX: { value: clientX },
+					clientY: { value: clientY },
+					isPrimary: { value: true },
+					pointerId: { value: pointerId },
+					pointerType: { value: pointerType },
+				});
+				return event;
+			};
+			const transformBeforeDrag = canvas?.style.transform;
+			viewport?.dispatchEvent(pointerEvent('pointerdown', 80, 80));
+			viewport?.dispatchEvent(pointerEvent('pointermove', 40, 48));
+			viewport?.dispatchEvent(pointerEvent('pointerup', 40, 48));
+			assert.strictEqual(capturedPointer, 1);
+			assert.strictEqual(releasedPointer, 1);
+			assert.notStrictEqual(canvas?.style.transform, transformBeforeDrag);
+
+			const reset = sidecar?.querySelector('button[aria-label="Reset view"]') as HTMLButtonElement | null;
+			const zoomIn = sidecar?.querySelector('button[aria-label="Zoom in"]') as HTMLButtonElement | null;
+			const zoomOut = sidecar?.querySelector('button[aria-label="Zoom out"]') as HTMLButtonElement | null;
+			clickElement(reset);
+			assert.strictEqual(canvas?.style.transform, 'translate(0px, 0px) scale(1)');			clickElement(zoomIn);
+			assert.match(canvas?.style.transform ?? '', /scale\(1\.1\)$/);
+			for (let index = 0; index < 40; index++) { clickElement(zoomIn); }
+			assert.strictEqual(zoomIn?.disabled, true);
+			assert.match(canvas?.style.transform ?? '', /scale\(4\)$/);
+			assert.strictEqual(viewport?.getAttribute('aria-valuetext'), '4x');
+			clickElement(zoomOut);
+			assert.strictEqual(zoomOut?.disabled, false);
+
+			clickElement(reset);
+			const wheel = new dom.window.Event('wheel', { bubbles: true, cancelable: true });
+			Object.defineProperties(wheel, {
+				clientX: { value: 160 },
+				clientY: { value: 110 },
+				deltaY: { value: -100 },
+			});
+			const transformBeforeWheel = canvas?.style.transform;
+			viewport?.dispatchEvent(wheel);
+			assert.strictEqual(wheel.defaultPrevented, true);
+			assert.notStrictEqual(canvas?.style.transform, transformBeforeWheel);
+			assert.strictEqual(canvas?.style.transform, 'translate(-16px, -11px) scale(1.1)');
+
+			clickElement(reset);
+			viewport?.dispatchEvent(pointerEvent('pointerdown', 80, 110, 1, 'touch'));
+			viewport?.dispatchEvent(pointerEvent('pointerdown', 160, 110, 2, 'touch'));
+			viewport?.dispatchEvent(pointerEvent('pointermove', 320, 110, 2, 'touch'));
+			assert.match(canvas?.style.transform ?? '', /scale\(3\)$/);
+			assert.strictEqual(viewport?.getAttribute('aria-valuetext'), '3x');
+			viewport?.dispatchEvent(pointerEvent('pointerup', 320, 110, 2, 'touch'));
+			viewport?.dispatchEvent(pointerEvent('pointerup', 80, 110, 1, 'touch'));
+
+			clickElement(reset);
+			viewport?.focus();
+			viewport?.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: '=', bubbles: true, cancelable: true }));
+			assert.match(canvas?.style.transform ?? '', /scale\(1\.1\)$/);
+			clickElement(reset);
+			for (let index = 0; index < 30; index++) { clickElement(zoomIn); }
+			viewport?.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowLeft', shiftKey: true, bubbles: true, cancelable: true }));
+			viewport?.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowUp', shiftKey: true, bubbles: true, cancelable: true }));
+			assert.match(canvas?.style.transform ?? '', /translate\(-\d+px, -\d+px\) scale\(4\)/);
+			viewport?.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: '0', bubbles: true, cancelable: true }));
+			assert.strictEqual(canvas?.style.transform, 'translate(0px, 0px) scale(1)');
+
+			const currentShowTree = Array.from(dom.window.document.querySelectorAll('button'))
+				.find((button) => button.textContent === 'Show Task Tree');
+			clickElement(sidecar?.querySelector('button[aria-label="Close Task Tree"]'));
+			assert.strictEqual(sidecar?.hidden, true);
+			assert.strictEqual(dom.window.document.activeElement, currentShowTree);
+			clickElement(currentShowTree);
+			const refreshedViewport = sidecar?.querySelector('.task-tree-viewport') as HTMLElement | null;
+			refreshedViewport?.focus();
+			dispatchWebviewMessage(dom, {
+				type: 'task/detail',
+				task: {
+					...detail,
+					taskTree: {
+						...tree,
+						nodes: tree.nodes.map((node) => node.id === 'TASK-999' ? { ...node, name: 'Refreshed child' } : node),
+					},
+				},
+			});
+			assert.strictEqual(sidecar?.hidden, false);
+			assert.strictEqual(dom.window.document.activeElement, refreshedViewport);
+			assert.match(sidecar?.textContent ?? '', /Refreshed child/);
+			dom.window.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+			assert.strictEqual(sidecar?.hidden, true);
+			assert.strictEqual(dom.window.document.activeElement?.textContent, 'Show Task Tree');
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
 	test('failed timeout cards keep their normal retry action', () => {
 		assert.strictEqual(primaryAction('refine', 'failed'), 'refine');
 		assert.strictEqual(primaryAction('in-progress', 'failed'), 'continue');
 		assert.strictEqual(primaryAction('validation', 'failed'), 'validate');
+	});
+
+	test('boots through the webview ready handshake and renders generated child tasks', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-startup-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const parent = await store.create('create an auth server using python');
+		await store.patch(parent.id, { state: 'refine' });
+		for (const [index, title] of [
+			'Python auth service foundation',
+			'Authentication security and JWT layer',
+			'Auth REST workflows and verification',
+		].entries()) {
+			await store.create(title, {
+				parentTaskId: parent.id,
+				origin: {
+					taskId: parent.id,
+					runId: 'r5kb6zp',
+					note: 'Generated child ' + (index + 1),
+					proposalKey: 'generated-child-' + (index + 1),
+				},
+			});
+		}
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-startup-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		class StartupSurface extends BrowserBoardSurface {
+			dom: JSDOM | undefined;
+			private hostReceivedReady = false;
+			readonly clientMessages: unknown[] = [];
+			readonly runtimeErrors: string[] = [];
+
+			override onDidReceiveMessage(listener: (message: unknown) => void): vscode.Disposable {
+				return super.onDidReceiveMessage((message) => {
+					if (message && typeof message === 'object' && (message as { type?: unknown }).type === 'board/ready') {
+						this.hostReceivedReady = true;
+					}
+					listener(message);
+				});
+			}
+
+			override setHtml(html: string): void {
+				super.setHtml(html);
+				this.dom = new JSDOM(html, {
+					url: 'http://localhost/board?token=test',
+					runScripts: 'dangerously',
+					pretendToBeVisual: true,
+					beforeParse: (window) => {
+						window.addEventListener('error', (event) => {
+							this.runtimeErrors.push(event.error instanceof Error ? event.error.message : event.message);
+						});
+						Object.defineProperty(window, 'EventSource', {
+							configurable: true,
+							value: class {
+								onmessage: ((event: MessageEvent) => void) | null = null;
+								constructor(readonly url: string) {}
+								close() {}
+							},
+						});
+						Object.defineProperty(window, 'fetch', {
+							configurable: true,
+							value: async (_input: unknown, init?: { body?: unknown }) => {
+								if (init?.body) {
+									const message = JSON.parse(String(init.body));
+									this.clientMessages.push(message);
+									this.receive(message);
+								}
+								return { ok: true };
+							},
+						});
+					},
+				});
+			}
+
+			override postMessage(message: Record<string, unknown>): Thenable<boolean> {
+				const result = super.postMessage(message);
+				if (message.type !== 'board/state' || this.hostReceivedReady) {
+					if (this.dom) {
+						dispatchWebviewMessage(this.dom, message);
+					}
+				}
+				return result;
+			}
+		}
+		const surface = new StartupSurface('board-startup-test');
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		try {
+			const waitFor = async (predicate: () => boolean): Promise<void> => {
+				const deadline = Date.now() + 3000;
+				while (!predicate()) {
+					if (Date.now() >= deadline) {
+						throw new Error('Timed out waiting for startup board DOM.');
+					}
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				}
+			};
+			await waitFor(() => surface.clientMessages.some((message) => (
+				message !== null && typeof message === 'object' && (message as { type?: unknown }).type === 'board/ready'
+			)));
+			assert.ok(surface.dom);
+			const document = surface.dom.window.document;
+			await waitFor(() => document.querySelectorAll('.column').length === 7);
+			assert.deepStrictEqual(surface.runtimeErrors, [], 'startup must not throw before rendering the board');
+			assert.strictEqual(document.querySelectorAll('.column').length, 7);
+			assert.strictEqual(document.querySelectorAll('.drop-slot.empty-slot').length, 5);
+			assert.strictEqual(document.querySelectorAll('.card').length, 4, 'generated child tasks must render on initial board load');
+			assert.strictEqual(document.querySelectorAll('.badge-task-child').length, 3);
+
+			const task = await store.create('Startup task');
+			await (board as unknown as { pushBoard(): Promise<void> }).pushBoard();
+			await waitFor(() => document.querySelector('.card[data-task-id="' + task.id + '"]') !== null);
+			const card = document.querySelector('.card[data-task-id="' + task.id + '"]');
+			assert.strictEqual(card?.querySelector('.card-title')?.textContent, task.title);
+			assert.strictEqual(document.querySelectorAll('.column').length, 7);
+			assert.strictEqual(document.querySelectorAll('.drop-slot.empty-slot').length, 5);
+
+			dispatchWebviewMessage(surface.dom, {
+				type: 'board/state',
+				snapshot: {
+					malformed: [],
+					parentOptions: [],
+					taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+					activeTaskSetId: activeSet.id,
+					activeTaskSetName: activeSet.name,
+					columns: [],
+				},
+			});
+			assert.strictEqual(document.querySelectorAll('.column').length, 7, 'an incomplete state must retain canonical board columns');
+			assert.strictEqual(document.querySelectorAll('.drop-slot.empty-slot').length, 7);
+
+			dispatchWebviewMessage(surface.dom, {
+				type: 'board/state',
+				snapshot: {
+					malformed: [],
+					parentOptions: [],
+					taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+					activeTaskSetId: activeSet.id,
+					activeTaskSetName: activeSet.name,
+					columns: [{
+						id: 'backlog',
+						label: 'Backlog',
+						agent: 'Queue Keeper',
+						count: 2,
+						cards: [
+							{ id: 'TASK-900', title: 'Valid parent', type: 'feature', typeLabel: 'Feature', status: 'idle' },
+							null,
+						],
+					}],
+				},
+			});
+			assert.strictEqual(document.querySelectorAll('.column').length, 7, 'an invalid child relationship must not blank the board');
+			assert.strictEqual(document.querySelector('.card[data-task-id="TASK-900"]')?.textContent?.includes('Valid parent'), true);
+		} finally {
+			surface.dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('registers the host listener before a webview can announce readiness', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-ready-order-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-ready-order-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		let releaseReady!: () => void;
+		const ready = new Promise<void>((resolve) => { releaseReady = resolve; });
+		const host: BoardTaskSetHost = {
+			ready,
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		class SynchronousReadySurface extends BrowserBoardSurface {
+			private listenerRegistered = false;
+			readyDelivered = false;
+
+			override onDidReceiveMessage(listener: (message: unknown) => void): vscode.Disposable {
+				this.listenerRegistered = true;
+				return super.onDidReceiveMessage(listener);
+			}
+
+			override setHtml(html: string): void {
+				super.setHtml(html);
+				if (this.listenerRegistered) {
+					this.readyDelivered = true;
+					this.receive({ type: 'board/ready' });
+				}
+			}
+		}
+		const surface = new SynchronousReadySurface('board-ready-order-test');
+		const hostMessages: Record<string, unknown>[] = [];
+		const postMessage = surface.postMessage.bind(surface);
+		surface.postMessage = (message) => {
+			hostMessages.push(message);
+			return postMessage(message);
+		};
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		try {
+			assert.strictEqual(surface.readyDelivered, true, 'the ready handshake must not be lost while loading HTML');
+			releaseReady();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			assert.ok(hostMessages.some((message) => message.type === 'board/state'));
+		} finally {
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
 	});
 
 	test('validates gate and column payload values and projects all seven effective labels', () => {
@@ -960,7 +1980,8 @@ suite('BoardPanel Settings', () => {
 			assert.doesNotMatch(panel.webview.html, /data-kanban-pilot-mermaid(?:-runtime)?[^>]+src="[^"]*(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com|raw\.githubusercontent\.com)/i);
 			const script = /<script[^>]*data-kanban-pilot-board[^>]*>([\s\S]*)<\/script>/.exec(panel.webview.html)?.[1];
 			assert.ok(script, 'generated webview script is present');
-			assert.doesNotThrow(() => new vm.Script(script), 'generated webview script must parse in the browser');
+			assert.doesNotThrow(() => new vm.Script(script), 'generated board startup script must parse before posting board/ready');
+			assert.match(script, /vscode\.postMessage\(\{ type: 'board\/ready' \}\);/, 'generated startup must retain the board-ready handshake');
 			assert.match(script, /input\.checked = gates\[gate\.key\] === 'auto';/);
 			assert.doesNotMatch(script, /input\.checked = state\[gate\.key\] === 'auto';/);
 			assert.match(script, /const DEFAULT_SETTINGS_CATEGORY = 'gates';/);
@@ -2223,6 +3244,167 @@ suite('BoardPanel Settings', () => {
 		);
 	});
 
+	test('projects a running outcome with its active stage, run, and legal stop action', () => {
+		const guidance = outcomeGuidanceFor({
+			id: 'TASK-004',
+			state: 'in-progress',
+			status: 'running',
+			run: 'r-develop-live',
+			sections: {
+				Log: '- audit:activity-start at:2026-09-03T03:06:54Z task:TASK-004 stage:develop action:develop run:r-develop-live note:"Started develop activity."',
+			},
+		}, []);
+
+		assert.deepStrictEqual(
+			{
+				kind: guidance?.kind,
+				stage: guidance?.stage,
+				runId: guidance?.runId,
+				action: guidance?.action,
+			},
+			{
+				kind: 'running',
+				stage: 'develop',
+				runId: 'r-develop-live',
+				action: 'stop',
+			},
+		);
+		assert.match(guidance?.summary ?? '', /Develop.*r-develop-live/);
+	});
+
+	test('projects blocked and failed outcomes with reasons and legal retry actions', () => {
+		const blocked = outcomeGuidanceFor({
+			id: 'TASK-004',
+			state: 'validation',
+			status: 'blocked',
+			sections: {
+				Log: [
+					'- audit:activity-start at:2026-09-03T03:06:54Z task:TASK-004 stage:validate action:validate run:r-validate-blocked note:"Started validate activity."',
+					'- run:r-validate-blocked task:TASK-004 stage:validate result:blocked note:"Needs host approval before validation can continue"',
+					'- audit:activity-finish at:2026-09-03T03:07:54Z task:TASK-004 stage:validate run:r-validate-blocked outcome:blocked note:"Needs host approval before validation can continue"',
+				].join('\n'),
+			},
+		}, []);
+		const failed = outcomeGuidanceFor({
+			id: 'TASK-004',
+			state: 'in-progress',
+			status: 'failed',
+			sections: {
+				Log: [
+					'- audit:activity-start at:2026-09-03T03:06:54Z task:TASK-004 stage:develop action:develop run:r-develop-failed note:"Started develop activity."',
+					'- run:r-develop-failed task:TASK-004 stage:develop result:failed note:"The build command failed"',
+					'- audit:activity-finish at:2026-09-03T03:07:54Z task:TASK-004 stage:develop run:r-develop-failed outcome:error note:"The build command failed"',
+				].join('\n'),
+			},
+		}, []);
+
+		assert.deepStrictEqual(
+			{
+				kind: blocked?.kind,
+				stage: blocked?.stage,
+				runId: blocked?.runId,
+				action: blocked?.action,
+				reason: blocked?.reason,
+			},
+			{
+				kind: 'blocked',
+				stage: 'validate',
+				runId: 'r-validate-blocked',
+				action: 'validate',
+				reason: 'Needs host approval before validation can continue',
+			},
+		);
+		assert.deepStrictEqual(
+			{
+				kind: failed?.kind,
+				stage: failed?.stage,
+				runId: failed?.runId,
+				action: failed?.action,
+				reason: failed?.reason,
+			},
+			{
+				kind: 'failed',
+				stage: 'develop',
+				runId: 'r-develop-failed',
+				action: 'continue',
+				reason: 'The build command failed',
+			},
+		);
+		assert.match(blocked?.summary ?? '', /Needs host approval/);
+		assert.match(failed?.summary ?? '', /The build command failed/);
+	});
+
+	test('projects pending completion before retry guidance and stale completion before failure guidance', () => {
+		const pending = outcomeGuidanceFor({
+			id: 'TASK-004',
+			state: 'in-progress',
+			status: 'idle',
+			pendingOutcome: {
+				gate: 'developToValidation',
+				stage: 'develop',
+				result: 'ok',
+				runId: 'r-develop-pending',
+			},
+			sections: {},
+		}, []);
+		const stale = outcomeGuidanceFor({
+			id: 'TASK-004',
+			state: 'in-progress',
+			status: 'failed',
+			sections: {},
+		}, [{
+			taskId: 'TASK-004',
+			runId: 'r-develop-old',
+			stage: 'develop',
+			result: 'ok',
+			note: 'implementation finished in the earlier run',
+			summary: 'implementation finished in the earlier run',
+			currentRunId: undefined,
+			latestRunId: 'r-develop-newest',
+			supersededByRunId: undefined,
+		}]);
+
+		assert.deepStrictEqual(
+			{
+				kind: pending?.kind,
+				stage: pending?.stage,
+				runId: pending?.runId,
+				gate: pending?.gate,
+				action: pending?.action,
+			},
+			{
+				kind: 'pending',
+				stage: 'develop',
+				runId: 'r-develop-pending',
+				gate: 'developToValidation',
+				action: undefined,
+			},
+		);
+		assert.match(pending?.summary ?? '', /Develop.*Validation/);
+		assert.match(pending?.holding ?? '', /gate/);
+
+		assert.deepStrictEqual(
+			{
+				kind: stale?.kind,
+				stage: stale?.stage,
+				runId: stale?.runId,
+				latestRunId: stale?.latestRunId,
+				receiptSummary: stale?.receiptSummary,
+				action: stale?.action,
+			},
+			{
+				kind: 'stale',
+				stage: 'develop',
+				runId: 'r-develop-old',
+				latestRunId: 'r-develop-newest',
+				receiptSummary: 'implementation finished in the earlier run',
+				action: undefined,
+			},
+		);
+		assert.match(stale?.summary ?? '', /old/);
+		assert.match(stale?.nextStep ?? '', /confirmation/);
+	});
+
 	test('projects and renders pending completion with an accessible apply action', async () => {
 		const directory = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-board-pending-${Date.now()}-${Math.random().toString(36).slice(2)}`),
@@ -2274,7 +3456,11 @@ suite('BoardPanel Settings', () => {
 				toView(snapshot: unknown, agentNames: unknown, taskSets: unknown[]): unknown;
 			}).toView.bind(board);
 			const projected = toView(await store.snapshot(), {}, [activeSet]) as {
-				columns: { id: string; cards: { id: string; pending?: { gate: string; label: string; stage: string; result: string; runId: string } }[] }[];
+				columns: { id: string; cards: {
+					id: string;
+					pending?: { gate: string; label: string; stage: string; result: string; runId: string };
+					outcome?: ReturnType<typeof outcomeGuidanceFor>;
+				}[] }[];
 			};
 			const projectedCard = projected.columns.find((column) => column.id === 'in-progress')?.cards
 				.find((card) => card.id === task.id);
@@ -2286,6 +3472,20 @@ suite('BoardPanel Settings', () => {
 				result: 'ok',
 				runId: 'r-pending',
 			});
+			assert.deepStrictEqual(
+				{
+					kind: projectedCard?.outcome?.kind,
+					stage: projectedCard?.outcome?.stage,
+					runId: projectedCard?.outcome?.runId,
+					gate: projectedCard?.outcome?.gate,
+				},
+				{
+					kind: 'pending',
+					stage: 'develop',
+					runId: 'r-pending',
+					gate: 'developToValidation',
+				},
+			);
 
 			const posted: unknown[] = [];
 			dom = new JSDOM(panel.webview.html, {
@@ -2325,14 +3525,17 @@ suite('BoardPanel Settings', () => {
 							status: 'idle',
 							primary: 'continue',
 							pending: pendingView,
+							outcome: projectedCard?.outcome,
 							canSplit: false,
 						}],
 					}],
 				},
 			});
 			const card = dom.window.document.querySelector('.card');
-			assert.strictEqual(card?.querySelector('.status-text.pending')?.textContent, 'Review Required');
+			assert.strictEqual(card?.querySelector('.status-text.pending')?.textContent, 'Review Required', card?.outerHTML);
 			assert.strictEqual(card?.querySelector('.status-text.pending')?.getAttribute('aria-label'), 'Review required: Develop → Validation');
+			assert.strictEqual(card?.querySelector('.card-outcome-label')?.textContent, 'Review Required');
+			assert.match(card?.querySelector('.card-outcome-summary')?.textContent ?? '', /Develop.*completion is ready for review/);
 			assert.match(card?.getAttribute('aria-label') ?? '', /Review required: Develop → Validation/);
 
 			dispatchWebviewMessage(dom, {
@@ -2351,6 +3554,7 @@ suite('BoardPanel Settings', () => {
 					scope: '',
 					lastLog: '',
 					pending: pendingView,
+					outcome: projectedCard?.outcome,
 					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
 					primary: 'continue',
 					secondary: null,
@@ -2359,14 +3563,161 @@ suite('BoardPanel Settings', () => {
 			const applyButton = Array.from(dom.window.document.querySelectorAll('button'))
 				.find((button) => button.textContent === 'Apply Develop → Validation');
 			assert.ok(applyButton);
+			assert.strictEqual(dom.window.document.querySelector('.outcome-guidance-label')?.textContent, 'Review Required');
+			assert.match(dom.window.document.querySelector('.outcome-guidance-summary')?.textContent ?? '', /Develop finished with a ok receipt in run r-pending/);
+			assert.match(dom.window.document.querySelector('.outcome-guidance-holding')?.textContent ?? '', /Develop → Validation gate/);
+			assert.match(dom.window.document.querySelector('.outcome-guidance-next')?.textContent ?? '', /Apply Develop → Validation/);
 			assert.strictEqual(applyButton?.getAttribute('aria-label'), 'Apply pending completion: Develop → Validation');
 			clickElement(applyButton);
 			assert.deepStrictEqual(
 				JSON.parse(JSON.stringify(posted.at(-1))),
 				{ type: 'pending/apply', taskId: task.id },
 			);
+			dispatchWebviewMessage(dom, {
+				type: 'board/notice',
+				level: 'warning',
+				message: 'Pending completion was not applied because the task changed.',
+			});
+			const notice = dom.window.document.querySelector('.board-notice');
+			assert.strictEqual(notice?.textContent, 'Pending completion was not applied because the task changed.');
+			assert.strictEqual(notice?.getAttribute('role'), 'alert');
+			assert.strictEqual((notice as HTMLElement | null)?.hidden, false);
+
+			const staleCandidate = {
+				taskId: 'TASK-905',
+				runId: 'r-stale-old',
+				stage: 'develop' as const,
+				result: 'ok' as const,
+				note: 'Finished in the earlier run',
+				summary: 'Finished in the earlier run',
+				latestRunId: 'r-stale-latest',
+			};
+			const presentationCases = [
+				{
+					id: 'TASK-901', state: 'in-progress' as const, stateLabel: 'In Progress', status: 'running' as const,
+					primary: 'stop' as const,
+					outcome: outcomeGuidanceFor({
+						id: 'TASK-901', state: 'in-progress', status: 'running', run: 'r-running',
+						sections: { Log: '- audit:activity-start task:TASK-901 stage:develop action:develop run:r-running note:"Started develop activity."' },
+					}, []),
+				},
+				{
+					id: 'TASK-902', state: 'validation' as const, stateLabel: 'Validation', status: 'blocked' as const,
+					primary: 'validate' as const,
+					outcome: outcomeGuidanceFor({
+						id: 'TASK-902', state: 'validation', status: 'blocked',
+						sections: { Log: '- run:r-blocked task:TASK-902 stage:validate result:blocked note:"Needs host approval"' },
+					}, []),
+				},
+				{
+					id: 'TASK-903', state: 'in-progress' as const, stateLabel: 'In Progress', status: 'failed' as const,
+					primary: 'continue' as const,
+					outcome: outcomeGuidanceFor({
+						id: 'TASK-903', state: 'in-progress', status: 'failed',
+						sections: { Log: '- run:r-failed task:TASK-903 stage:develop result:failed note:"Build failed"' },
+					}, []),
+				},
+				{
+					id: task.id, state: 'in-progress' as const, stateLabel: 'In Progress', status: 'idle' as const,
+					primary: 'continue' as const, pending: pendingView, outcome: projectedCard?.outcome,
+				},
+				{
+					id: staleCandidate.taskId, state: 'in-progress' as const, stateLabel: 'In Progress', status: 'failed' as const,
+					primary: 'continue' as const, staleCompletions: [staleCandidate],
+					outcome: outcomeGuidanceFor({ id: staleCandidate.taskId, state: 'in-progress', status: 'failed', sections: {} }, [staleCandidate]),
+				},
+			];
+			assert.ok(presentationCases.every((item) => item.outcome));
+			dispatchWebviewMessage(dom, {
+				type: 'board/state',
+				selectedTaskId: null,
+				snapshot: {
+					malformed: [],
+					taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+					activeTaskSetId: activeSet.id,
+					activeTaskSetName: activeSet.name,
+					columns: [{
+						id: 'in-progress', label: 'In Progress', agent: 'Bro Coder', stage: 'develop',
+						count: presentationCases.length,
+						cards: presentationCases.map((item) => ({
+							id: item.id, title: item.id, type: 'feature', typeLabel: 'Feature',
+							status: item.status, primary: item.primary, pending: item.pending,
+							outcome: item.outcome, canSplit: false,
+						})),
+					}],
+				},
+			});
+			for (const item of presentationCases) {
+				const renderedCard: Element | null = dom.window.document.querySelector('.card[data-task-id="' + item.id + '"]');
+				assert.strictEqual(renderedCard?.querySelector('.card-outcome-label')?.textContent, item.outcome?.label);
+				assert.ok(renderedCard?.querySelector('.card-outcome-summary')?.textContent);
+			}
 		} finally {
 			dom?.window.close();
+			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('reports a stale pending apply through a board-visible notice', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-pending-notice-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-pending-notice-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const surface = new BrowserBoardSurface('board-pending-notice-test');
+		const posted: Record<string, unknown>[] = [];
+		const postMessage = surface.postMessage.bind(surface);
+		surface.postMessage = (message) => {
+			posted.push(message);
+			return postMessage(message);
+		};
+		const host: BoardTaskSetHost = {
+			ready: new Promise<void>(() => undefined),
+			store,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const board = BoardPanel.attach(surface, host, extensionUriForTests);
+		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
+		try {
+			const task = await store.create('Stale pending completion');
+			await store.patch(task.id, {
+				state: 'in-progress',
+				status: 'idle',
+				pending_outcome: encodePendingOutcome({
+					gate: 'developToValidation',
+					stage: 'develop',
+					result: 'ok',
+					runId: 'r-missing-receipt',
+				}),
+			});
+
+			await onMessage({ type: 'pending/apply', taskId: task.id });
+			const notice = [...posted].reverse().find((message) => message.type === 'board/notice');
+			assert.deepStrictEqual(notice, {
+				type: 'board/notice',
+				level: 'warning',
+				message: 'Pending completion was not applied because the task or receipt changed.',
+			});
+		} finally {
 			board.dispose();
 			try {
 				await vscode.workspace.fs.delete(directory, { recursive: true });
@@ -2478,6 +3829,49 @@ suite('BoardPanel Settings', () => {
 				const openChatIndex = labels.indexOf('Open Chat →');
 				assert.ok(openChatIndex >= 0, `${scenario.state}/${scenario.status} includes Open Chat`);
 				assert.deepStrictEqual(labels.slice(openChatIndex + 1), scenario.afterChat);
+			}
+
+			const detailOutcomes = [
+				{
+					state: 'in-progress' as const, stateLabel: 'In Progress', status: 'running' as const,
+					outcome: outcomeGuidanceFor({
+						id: task.id, state: 'in-progress', status: 'running', run: 'r-detail-running',
+						sections: { Log: '- audit:activity-start task:' + task.id + ' stage:develop action:develop run:r-detail-running note:"Started develop activity."' },
+					}, []),
+				},
+				{
+					state: 'validation' as const, stateLabel: 'Validation', status: 'blocked' as const,
+					outcome: outcomeGuidanceFor({
+						id: task.id, state: 'validation', status: 'blocked',
+						sections: { Log: '- run:r-detail-blocked task:' + task.id + ' stage:validate result:blocked note:"Needs host approval"' },
+					}, []),
+				},
+				{
+					state: 'in-progress' as const, stateLabel: 'In Progress', status: 'failed' as const,
+					outcome: outcomeGuidanceFor({
+						id: task.id, state: 'in-progress', status: 'failed',
+						sections: { Log: '- run:r-detail-failed task:' + task.id + ' stage:develop result:failed note:"Build failed"' },
+					}, []),
+				},
+			];
+			for (const scenario of detailOutcomes) {
+				render({
+					id: task.id,
+					title: task.title,
+					sections: {},
+					state: scenario.state,
+					stateLabel: scenario.stateLabel,
+					status: scenario.status,
+					outcome: scenario.outcome,
+				}, scenario.status !== 'running');
+				assert.strictEqual(dom.window.document.querySelector('.outcome-guidance-label')?.textContent, scenario.outcome?.label);
+				assert.deepStrictEqual(
+					Array.from(dom.window.document.querySelectorAll('.outcome-guidance-key')).map((node) => node.textContent),
+					['What happened', 'What is holding this task', 'Next legal action'],
+				);
+				assert.ok(dom.window.document.querySelector('.outcome-guidance-summary')?.textContent);
+				assert.ok(dom.window.document.querySelector('.outcome-guidance-holding')?.textContent);
+				assert.ok(dom.window.document.querySelector('.outcome-guidance-next')?.textContent);
 			}
 
 			posted.length = 0;
@@ -2611,6 +4005,10 @@ suite('BoardPanel Settings', () => {
 			await seedStaleBoardCandidate(store, task.id, 'r-board-old');
 			const candidate = (await runManager.listStaleCompletionCandidates(task.id))[0];
 			assert.ok(candidate);
+			const currentTask = (await store.readAll()).tasks.find((item) => item.id === task.id);
+			assert.ok(currentTask);
+			const outcome = outcomeGuidanceFor(currentTask!, [candidate]);
+			assert.ok(outcome);
 
 			const posted: unknown[] = [];
 			dom = new JSDOM(panel.webview.html, {
@@ -2641,12 +4039,18 @@ suite('BoardPanel Settings', () => {
 					refined: '',
 					scope: '',
 					lastLog: candidate.summary,
+					outcome,
 					staleCompletions: [candidate],
 					moveTargets: [{ id: 'in-progress', label: 'In Progress' }],
 					primary: 'continue',
 					secondary: null,
 				},
 			});
+			assert.strictEqual(dom.window.document.querySelector('.outcome-guidance-label')?.textContent, 'Recovery Available');
+			assert.match(dom.window.document.querySelector('.outcome-guidance-context')?.textContent ?? '', /Stage: Develop/);
+			assert.match(dom.window.document.querySelector('.outcome-guidance-context')?.textContent ?? '', /Run: r-board-old/);
+			assert.match(dom.window.document.querySelector('.outcome-guidance-context')?.textContent ?? '', /Receipt: implementation finished in the earlier run/);
+		assert.match(dom.window.document.querySelector('.outcome-guidance-next')?.textContent ?? '', /confirmation/);
 
 			const recoveryButton = dom.window.document.querySelector(
 				'button[aria-label="Recover stale develop completion from run r-board-old"]',

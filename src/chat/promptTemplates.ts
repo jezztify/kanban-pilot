@@ -186,8 +186,14 @@ feed can be shared over a token-gated HTTP surface. Use the same UTC
 second-precision timestamp format as the receipt.
 
 ### Completion
-After completing the implementation work, append this line to the \`## Log\`
-section of the attached active task file at {{taskFilePath}}:
+After completing the implementation work, append this evidence line and then
+the success receipt to the \`## Log\` section of the attached active task file
+at {{taskFilePath}}. List each changed non-task workspace file, excluding
+generated output, and name the verification you performed:
+- implementation-evidence run:{{runId}} files:"<changed non-task files>" verify:"<verification performed>"
+Do not report success when you only created follow-up tasks, changed Kanban task
+files, or made no implementation change. In those cases, append a blocked
+receipt instead.
 - run:{{runId}} task:{{id}} stage:develop result:ok note:"<one line summary>"
 ### Non-completion
 If you cannot complete the implementation because a dependency, decision,
