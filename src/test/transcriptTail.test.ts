@@ -7,7 +7,6 @@ import * as vscode from 'vscode';
 import {
 	SUPPORTED_TRANSCRIPT_PRODUCER,
 	SUPPORTED_TRANSCRIPT_VERSION,
-	MAX_EXCERPT_LENGTH,
 	TranscriptLineReader,
 	TranscriptTailService,
 	carriesContent,
@@ -91,58 +90,38 @@ suite('Transcript tail', () => {
 		assert.strictEqual(entry.type, 'tool.execution_start');
 		assert.strictEqual(entry.at, '2026-09-01T10:00:01.000Z');
 		assert.strictEqual(entry.toolName, 'readFile');
-		// A tool invocation contributes its name only: `arguments` and `result` are
-		// the unbounded fields that carry file contents and credentials.
-		assert.strictEqual(entry.text, undefined);
+		// A tool invocation contributes only bounded structure: `arguments` and
+		// `result` are the unbounded fields that carry file contents and credentials.
+		assert.strictEqual('text' in entry, false);
+		assert.strictEqual('target' in entry, false);
 		assert.strictEqual(JSON.stringify(entry).includes(SECRET), false);
 		assert.strictEqual(JSON.stringify(entry).includes('/etc/passwd'), false);
 	});
 
-	test('message text reaches the card with its structure intact', () => {
-		const reply = projectTranscriptEntry(
-			JSON.parse(line('assistant.message', '2026-09-01T10:00:04.000Z', { content: 'Wrote  the\n  parser' }).trim()),
-		);
-		// Line breaks and indentation survive: reasoning arrives as titled sections
-		// and flattening it to one line made it unreadable.
-		assert.strictEqual(reply?.text, 'Wrote  the\n  parser');
-		assert.strictEqual(describeTranscriptEntry(reply!), 'Wrote  the\n  parser');
+	test('message, reasoning, and tool payloads become safe structural labels', () => {
+		const entries = [
+			projectTranscriptEntry(JSON.parse(line('user.message', '2026-09-01T10:00:04.000Z', {
+				content: 'private prompt ' + SECRET,
+			}).trim())),
+			projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:05.000Z', {
+				content: 'private reply ' + SECRET,
+				reasoningText: 'private reasoning ' + SECRET,
+			}).trim())),
+			projectTranscriptEntry(JSON.parse(line('tool.execution_start', '2026-09-01T10:00:06.000Z', {
+				toolName: 'read_file',
+				arguments: { filePath: 'C:\\private\\credentials.txt', command: SECRET },
+			}).trim())),
+		].filter((entry): entry is NonNullable<typeof entry> => !!entry);
 
-		const long = 'x'.repeat(MAX_EXCERPT_LENGTH + 50);
-		const truncated = projectTranscriptEntry(
-			JSON.parse(line('assistant.message', '2026-09-01T10:00:05.000Z', { content: long }).trim()),
-		);
-		assert.strictEqual(truncated?.text?.length, MAX_EXCERPT_LENGTH);
-		assert.ok(truncated?.text?.endsWith('…'), 'an over-long reply is elided, not dropped');
-
-		const prompt = projectTranscriptEntry(
-			JSON.parse(line('user.message', '2026-09-01T10:00:06.000Z', { content: 'refine TASK-012' }).trim()),
-		);
-		assert.strictEqual(describeTranscriptEntry(prompt!), 'refine TASK-012');
-	});
-
-	test('a turn that ends in a tool call falls back to the reasoning text', () => {
-		// Observed on a real session: `content` is an empty string on every turn that
-		// ends in a tool call, and the model's actual words are in `reasoningText`.
-		// Reading only `content` is why the card showed "assistant replied".
-		const toolTurn = projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:07.000Z', {
-			content: '',
-			reasoningText: 'Following the Kanban process',
-		}).trim()));
-		assert.strictEqual(toolTurn?.text, 'Following the Kanban process');
-
-		// A real reply still wins over the reasoning that produced it.
-		const spoken = projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:08.000Z', {
-			content: 'Refine completed.',
-			reasoningText: 'thinking out loud',
-		}).trim()));
-		assert.strictEqual(spoken?.text, 'Refine completed.');
-
-		// Whitespace-only content is treated as absent, not as a blank row.
-		const blank = projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:09.000Z', {
-			content: '   ',
-			reasoningText: 'still thinking',
-		}).trim()));
-		assert.strictEqual(blank?.text, 'still thinking');
+		assert.deepStrictEqual(entries.map((entry) => describeTranscriptEntry(entry)), [
+			'prompt submitted',
+			'assistant message observed',
+			'started read_file',
+		]);
+		const serialised = JSON.stringify(entries);
+		assert.strictEqual(serialised.includes(SECRET), false);
+		assert.strictEqual(serialised.includes('credentials.txt'), false);
+		assert.strictEqual(serialised.includes('private prompt'), false);
 	});
 
 	test('a completion inherits the tool name from its matching start', () => {
@@ -159,7 +138,7 @@ suite('Transcript tail', () => {
 		);
 
 		assert.strictEqual(entries.length, 2);
-		assert.strictEqual(describeTranscriptEntry(entries[0]), 'read_file — transcriptTail.ts');
+		assert.strictEqual(describeTranscriptEntry(entries[0]), 'started read_file');
 		assert.strictEqual(describeTranscriptEntry(entries[1]), 'finished read_file');
 	});
 
@@ -179,70 +158,45 @@ suite('Transcript tail', () => {
 		assert.strictEqual(describeTranscriptEntry(orphan[0]), 'finished a tool');
 	});
 
-	test('a tool row names what it acted on', () => {
-		// "started read_file" was the row; Copilot's own UI says which file, and that
-		// is the part a reader actually wants.
-		const read = projectTranscriptEntry(JSON.parse(line('tool.execution_start', '2026-09-01T10:00:20.000Z', {
-			toolName: 'read_file',
-			arguments: { filePath: 'c:\\Repositories\\kanban-pilot\\.claude\\skills\\kanban-pilot\\SKILL.md', startLine: 1 },
+	test('untrusted structural labels are rejected without exposing payload content', () => {
+		const unsafe = projectTranscriptEntry(JSON.parse(line('tool.execution_start', '2026-09-01T10:00:20.000Z', {
+			toolName: 'C:\\private\\credentials.txt',
+			arguments: { filePath: 'C:\\private\\credentials.txt', command: SECRET },
 		}).trim()));
-		assert.strictEqual(read?.target, 'SKILL.md', 'a path is reduced to its last segment');
-		assert.strictEqual(describeTranscriptEntry(read!), 'read_file — SKILL.md');
-
-		const terminal = projectTranscriptEntry(JSON.parse(line('tool.execution_start', '2026-09-01T10:00:21.000Z', {
-			toolName: 'run_in_terminal',
-			arguments: { command: 'date -u  +"%Y"', explanation: 'ignored' },
-		}).trim()));
-		assert.strictEqual(describeTranscriptEntry(terminal!), 'run_in_terminal — date -u +"%Y"');
-
-		// A tool whose arguments carry no identifying field still reads sensibly.
-		const opaque = projectTranscriptEntry(JSON.parse(line('tool.execution_start', '2026-09-01T10:00:22.000Z', {
-			toolName: 'apply_patch',
-			arguments: { input: 'a diff' },
-		}).trim()));
-		assert.strictEqual(describeTranscriptEntry(opaque!), 'started apply_patch');
+		assert.ok(unsafe);
+		assert.strictEqual(unsafe.toolName, undefined);
+		assert.strictEqual(describeTranscriptEntry(unsafe!), 'started a tool');
+		assert.strictEqual(JSON.stringify(unsafe).includes(SECRET), false);
+		assert.strictEqual(JSON.stringify(unsafe).includes('credentials.txt'), false);
+		assert.strictEqual(
+			projectTranscriptEntry({
+				type: 'future event with private ' + SECRET,
+				timestamp: '2026-09-01T10:00:21.000Z',
+			}),
+			undefined,
+		);
 	});
 
-	test('reasoning keeps its section structure and is not shortened', () => {
-		// Copilot emits reasoning as `**Title**` blocks separated by blank lines.
-		// Collapsing whitespace flattened them into one unreadable paragraph.
-		const reasoning = '**Considering timestamps**\n\nFirst thought.\n\n\n\n**Evaluating patches**\n\nSecond thought.';
-		const entry = projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:23.000Z', {
-			content: '',
-			reasoningText: reasoning,
-		}).trim()));
-
-		assert.ok(entry?.text?.includes('\n\n'), 'blank lines between sections survive');
-		assert.ok(entry?.text?.includes('**Evaluating patches**'), 'later sections are not truncated away');
-		assert.strictEqual(entry?.text?.includes('\n\n\n'), false, 'runs of blank lines are normalised');
-
-		// A few thousand characters of reasoning is kept whole.
-		const long = 'word '.repeat(600).trim();
-		const kept = projectTranscriptEntry(JSON.parse(line('assistant.message', '2026-09-01T10:00:24.000Z', {
-			content: '', reasoningText: long,
-		}).trim()));
-		assert.strictEqual(kept?.text, long, 'a long reasoning block is not shortened');
-	});
-
-	test('a bookkeeping assistant message produces no row', () => {
-		// An assistant.message with neither reply nor reasoning is the record of a
-		// tool request. Copilot shows nothing for it; a row saying "assistant
-		// replied" would claim something that did not happen.
+	test('every structurally valid message produces a safe row', () => {
 		const rows = toFeedEntries(
 			[
 				{ type: 'assistant.message', at: '2026-09-01T10:00:25.000Z' },
-				{ type: 'assistant.message', at: '2026-09-01T10:00:26.000Z', text: 'Refined TASK-018.' },
+				{ type: 'user.message', at: '2026-09-01T10:00:26.000Z' },
 				{ type: 'assistant.turn_end', at: '2026-09-01T10:00:27.000Z' },
 			],
 			20,
 		);
-		assert.deepStrictEqual(rows.map((row) => row.note), ['Refined TASK-018.', 'turn finished']);
+		assert.deepStrictEqual(rows.map((row) => row.note), [
+			'assistant message observed',
+			'prompt submitted',
+			'turn finished',
+		]);
 	});
 
 	test('an assistant message with no text still describes itself', () => {
 		assert.strictEqual(
 			describeTranscriptEntry({ type: 'assistant.message', at: '2026-09-01T10:00:00.000Z' }),
-			'assistant replied',
+			'assistant message observed',
 		);
 	});
 
@@ -264,7 +218,7 @@ suite('Transcript tail', () => {
 			describeTranscriptEntry({ type: 'tool.execution_start', at: 'x', toolName: 'runTests' }),
 			'started runTests',
 		);
-		assert.strictEqual(describeTranscriptEntry({ type: 'assistant.message', at: 'x' }), 'assistant replied');
+		assert.strictEqual(describeTranscriptEntry({ type: 'assistant.message', at: 'x' }), 'assistant message observed');
 		// An unknown future event degrades to its own name rather than throwing.
 		assert.strictEqual(describeTranscriptEntry({ type: 'future.event', at: 'x' }), 'future.event');
 	});
@@ -335,11 +289,15 @@ suite('Transcript tail', () => {
 
 			const entries = service.entriesFor('TASK-001');
 			assert.strictEqual(entries.length, 1);
-			// The fixture plants `arguments.path`, so the row now names the file it
-			// touched — its last segment only, never the full path.
-			assert.strictEqual(entries[0].note, 'readFile — passwd');
+			assert.strictEqual(entries[0].note, 'started readFile');
+			assert.match(entries[0].observedAt ?? '', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+			const snapshot = service.snapshotFor('TASK-001');
+			assert.strictEqual(snapshot.availability, 'configured');
+			assert.strictEqual(snapshot.latestEventAt, '2026-09-01T10:00:02.000Z');
+			assert.strictEqual(snapshot.latestObservedAt, entries[0].observedAt);
 			// The tailed entry here is a tool invocation, so no payload rides along.
 			assert.strictEqual(JSON.stringify(entries).includes(SECRET), false);
+			assert.strictEqual(JSON.stringify(entries).includes('passwd'), false);
 			service.dispose();
 		});
 	});
@@ -380,6 +338,7 @@ suite('Transcript tail', () => {
 			await (service as unknown as { poll(id: string, limit: number): Promise<void> }).poll('TASK-003', 20);
 
 			assert.deepStrictEqual(service.entriesFor('TASK-003'), []);
+			assert.strictEqual(service.snapshotFor('TASK-003').availability, 'unreadable');
 			service.dispose();
 		});
 	});
@@ -389,6 +348,7 @@ suite('Transcript tail', () => {
 			const service = new TranscriptTailService(storageUri);
 			await service.start('TASK-004', { sessionId: 'no-such-session', intervalMs: 60_000 });
 			assert.deepStrictEqual(service.entriesFor('TASK-004'), []);
+			assert.strictEqual(service.snapshotFor('TASK-004').availability, 'missing');
 			assert.strictEqual(await readTranscriptHeader(join(_dir, 'absent.jsonl')), false);
 			service.dispose();
 		});
@@ -396,6 +356,7 @@ suite('Transcript tail', () => {
 		const unwired = new TranscriptTailService(undefined);
 		await unwired.start('TASK-005', { sessionId: 'x' });
 		assert.deepStrictEqual(unwired.entriesFor('TASK-005'), []);
+		assert.strictEqual(unwired.snapshotFor('TASK-005').availability, 'not-configured');
 		unwired.dispose();
 	});
 
@@ -414,6 +375,29 @@ suite('Transcript tail', () => {
 
 			service.forget('TASK-006');
 			assert.deepStrictEqual(service.entriesFor('TASK-006'), []);
+			service.dispose();
+		});
+	});
+
+	test('a truncated transcript restarts at its verified header instead of splitting or replaying old data', async () => {
+		await withTranscripts(async (dir, storageUri) => {
+			const file = join(dir, 'sess-4.jsonl');
+			await writeFile(
+				file,
+				header() + line('assistant.turn_start', '2026-09-01T10:00:30.000Z') + line('assistant.turn_end', '2026-09-01T10:00:31.000Z'),
+				'utf8',
+			);
+
+			const service = new TranscriptTailService(storageUri);
+			await service.start('TASK-007', { sessionId: 'sess-4', intervalMs: 60_000 });
+			await appendFile(file, line('assistant.turn_end', '2026-09-01T10:00:32.000Z'), 'utf8');
+			await (service as unknown as { poll(id: string, limit: number): Promise<void> }).poll('TASK-007', 20);
+			assert.strictEqual(service.entriesFor('TASK-007').length, 1);
+
+			await writeFile(file, header() + line('assistant.turn_start', '2026-09-01T10:00:40.000Z'), 'utf8');
+			await (service as unknown as { poll(id: string, limit: number): Promise<void> }).poll('TASK-007', 20);
+			const notes = service.entriesFor('TASK-007').map((entry) => entry.note);
+			assert.deepStrictEqual(notes, ['chat session started', 'turn started']);
 			service.dispose();
 		});
 	});

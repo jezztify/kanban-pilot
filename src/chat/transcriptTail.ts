@@ -1,5 +1,6 @@
 import { open, readdir, stat } from 'node:fs/promises';
 import * as vscode from 'vscode';
+import { utcTimestamp } from '../model/taskLog';
 
 /**
  * Read-only tail of Copilot Chat's own session transcript, projected into the
@@ -21,11 +22,10 @@ import * as vscode from 'vscode';
  *   in the stream and must be read explicitly (TASK-011).
  * - **Runs are not delimited.** Consecutive runs append straight on, so "this
  *   run" is a byte-offset slice, not a parse.
- * - **Message text reaches the card; payloads do not.** The assistant's replies
- *   and the submitted prompt are what makes this worth showing, so they survive
- *   {@link projectTranscriptEntry} — truncated to a card-sized excerpt. Tool
- *   *arguments* and tool *results* are still dropped there: they are the fields
- *   that carry file contents and credentials, and they are unbounded in size.
+ * - **The feed is structural only.** Message bodies, reasoning, tool
+ *   arguments, tool results, paths, commands, and queries are all discarded at
+ *   {@link projectTranscriptEntry}. A row can say that a prompt, response, or
+ *   tool event was observed, but it never mirrors the Copilot conversation.
  *   Reaching the shared, token-gated browser surface additionally requires the
  *   separate `chat.transcriptFeedRemote` opt-in.
  *
@@ -45,7 +45,7 @@ export const TRANSCRIPT_DIRECTORY = 'transcripts';
 export const SUPPORTED_TRANSCRIPT_VERSION = 1;
 export const SUPPORTED_TRANSCRIPT_PRODUCER = 'copilot-agent';
 
-/** The two events whose `content` is message text, shown on the card. */
+/** The two events whose payload contains message text; neither is forwarded. */
 export const CONTENT_EVENT_TYPES: readonly string[] = ['assistant.message', 'user.message'];
 
 /** Event types whose payload carries prompts, replies, arguments, or results. */
@@ -56,13 +56,10 @@ export const CONTENT_BEARING_EVENT_TYPES = [
 	'tool.execution_complete',
 ] as const;
 
-/**
- * Hard cap on retained message text. This is a safety valve against a
- * pathological payload, not an editorial trim: the feed is a scroll box and the
- * point of it is to read what the agent actually said, so a reasoning block of a
- * few thousand characters is kept whole.
- */
-export const MAX_EXCERPT_LENGTH = 20_000;
+/** Structural labels are identifiers, not user-authored content. */
+const MAX_STRUCTURAL_LABEL_LENGTH = 64;
+const STRUCTURAL_LABEL = /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/;
+const EVENT_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 /**
  * Entries retained per task, and the row cap the card renders. The activity feed
@@ -80,24 +77,14 @@ export interface TranscriptEntry {
 	type: string;
 	/** The entry's own timestamp — when the event occurred, not when it was flushed. */
 	at: string;
-	/** Present only for `tool.execution_*`; the tool's name, never its arguments. */
+	/** Present only for `tool.execution_*`; a bounded structural tool name. */
 	toolName?: string;
-	/**
-	 * Message text for `assistant.message` and `user.message`, collapsed to one
-	 * line and truncated to {@link MAX_EXCERPT_LENGTH}. Never tool arguments or
-	 * tool results.
-	 */
-	text?: string;
 	/** Correlates `tool.execution_complete` back to the start that named the tool. */
 	toolCallId?: string;
 	/** Present on `tool.execution_complete`; false when the tool reported failure. */
 	success?: boolean;
-	/**
-	 * What a tool acted on — the file it read, the command it ran. Without it a
-	 * row says only "started read_file", which is the part Copilot's own UI shows
-	 * and this feed was dropping.
-	 */
-	target?: string;
+	/** When the extension first observed the event in the delayed transcript. */
+	observedAt?: string;
 }
 
 /** A tailed entry in the shape the activity feed renders. */
@@ -105,6 +92,19 @@ export interface TranscriptFeedEntry {
 	at: string;
 	note: string;
 	source: 'transcript';
+	/** Set when the transcript reader observed the event, not when it occurred. */
+	observedAt?: string;
+}
+
+/** Availability of an optional local feed before UI settings are applied. */
+export type FeedSourceAvailability = 'configured' | 'missing' | 'unreadable' | 'not-configured';
+
+/** The safe, in-memory view of one optional feed source. */
+export interface FeedSourceSnapshot {
+	availability: FeedSourceAvailability;
+	entries: FeedEntry[];
+	latestEventAt?: string;
+	latestObservedAt?: string;
 }
 
 /** True for an event type whose payload carries raw conversation content. */
@@ -153,90 +153,30 @@ export function projectTranscriptEntry(parsed: unknown): TranscriptEntry | undef
 			toolName?: unknown;
 			toolCallId?: unknown;
 			success?: unknown;
-			content?: unknown;
-			reasoningText?: unknown;
-			arguments?: Record<string, unknown>;
 		};
 	};
-	if (typeof line.type !== 'string' || typeof line.timestamp !== 'string') {
+	if (
+		typeof line.type !== 'string'
+		|| !STRUCTURAL_LABEL.test(line.type)
+		|| line.type.length > MAX_STRUCTURAL_LABEL_LENGTH
+		|| typeof line.timestamp !== 'string'
+		|| !EVENT_TIMESTAMP.test(line.timestamp)
+		|| !Number.isFinite(Date.parse(line.timestamp))
+	) {
 		return undefined;
 	}
 	const entry: TranscriptEntry = { type: line.type, at: line.timestamp };
-	if (typeof line.data?.toolName === 'string') {
-		entry.toolName = line.data.toolName;
+	const data = line.data && typeof line.data === 'object' ? line.data : undefined;
+	if (typeof data?.toolName === 'string' && STRUCTURAL_LABEL.test(data.toolName)) {
+		entry.toolName = data.toolName;
 	}
-	if (typeof line.data?.toolCallId === 'string') {
-		entry.toolCallId = line.data.toolCallId;
+	if (typeof data?.toolCallId === 'string' && STRUCTURAL_LABEL.test(data.toolCallId)) {
+		entry.toolCallId = data.toolCallId;
 	}
-	const target = toolTargetOf(line.data?.arguments);
-	if (target) {
-		entry.target = target;
-	}
-	if (typeof line.data?.success === 'boolean') {
-		entry.success = line.data.success;
-	}
-	// Only the message events carry text worth showing. `tool.execution_start`'s
-	// payload lives in `arguments` and `tool.execution_complete`'s in `result`;
-	// neither is read here.
-	//
-	// `content` is empty on any turn that ends in a tool call — the model's actual
-	// words are in `reasoningText` there — so both are consulted, in that order.
-	if (CONTENT_EVENT_TYPES.includes(line.type)) {
-		const spoken = typeof line.data?.content === 'string' && line.data.content.trim()
-			? line.data.content
-			: typeof line.data?.reasoningText === 'string' ? line.data.reasoningText : '';
-		const excerpt = excerptOf(spoken);
-		if (excerpt) {
-			entry.text = excerpt;
-		}
+	if (typeof data?.success === 'boolean') {
+		entry.success = data.success;
 	}
 	return entry;
-}
-
-/**
- * Normalises message text for display without flattening it.
- *
- * Reasoning arrives as several `**Title**` sections separated by blank lines,
- * which is how Copilot's own UI renders them as distinct blocks. Collapsing all
- * whitespace to single spaces destroyed exactly that structure, so only line
- * endings and runs of blank lines are normalised here.
- */
-export function excerptOf(text: string): string {
-	const normalised = text
-		.replace(/\r\n?/g, '\n')
-		.replace(/\n{3,}/g, '\n\n')
-		.trim();
-	return normalised.length > MAX_EXCERPT_LENGTH
-		? `${normalised.slice(0, MAX_EXCERPT_LENGTH - 1)}…`
-		: normalised;
-}
-
-/**
- * The one argument worth naming in a feed row, in the order a reader cares about.
- * A file path is reduced to its last segment: the row is a summary, and an
- * absolute Windows path would dominate it.
- *
- * This reads `arguments`, which the earlier design excluded wholesale. Only these
- * identifying fields are taken — never the whole payload — and reaching the
- * shared browser surface still requires `chat.transcriptFeedRemote`.
- */
-export function toolTargetOf(args: Record<string, unknown> | undefined): string | undefined {
-	if (!args) {
-		return undefined;
-	}
-	for (const key of ['filePath', 'path', 'file']) {
-		const value = args[key];
-		if (typeof value === 'string' && value.trim()) {
-			return value.split(/[\\/]/).filter(Boolean).pop();
-		}
-	}
-	for (const key of ['command', 'query', 'pattern', 'name']) {
-		const value = args[key];
-		if (typeof value === 'string' && value.trim()) {
-			return value.replace(/\s+/g, ' ').trim();
-		}
-	}
-	return undefined;
 }
 
 /** Human-readable one-liner for a tailed entry. Never includes content. */
@@ -245,16 +185,16 @@ export function describeTranscriptEntry(entry: TranscriptEntry): string {
 		case 'session.start':
 			return 'chat session started';
 		case 'user.message':
-			return entry.text ?? 'prompt submitted';
+			return 'prompt submitted';
 		case 'assistant.turn_start':
 			return 'turn started';
 		case 'assistant.message':
-			return entry.text ?? 'assistant replied';
+			return 'assistant message observed';
 		case 'assistant.turn_end':
 			return 'turn finished';
 		case 'tool.execution_start': {
 			const tool = entry.toolName ?? 'a tool';
-			return entry.target ? `${tool} — ${entry.target}` : `started ${tool}`;
+			return `started ${tool}`;
 		}
 		case 'tool.execution_complete': {
 			// The complete event carries only a toolCallId, so the name comes from the
@@ -263,22 +203,19 @@ export function describeTranscriptEntry(entry: TranscriptEntry): string {
 			return entry.success === false ? `${label} failed` : `finished ${label}`;
 		}
 		default:
-			return entry.type;
+			return STRUCTURAL_LABEL.test(entry.type) ? entry.type : 'event observed';
 	}
 }
 
 /** Projects tailed entries into feed rows, newest last, bounded to `limit`. */
 export function toFeedEntries(entries: readonly TranscriptEntry[], limit: number): TranscriptFeedEntry[] {
-	// An `assistant.message` with no reply and no reasoning is the bookkeeping
-	// record of a tool request; Copilot's own UI shows nothing for it, and a row
-	// reading "assistant replied" would be actively misleading.
 	return entries
-		.filter((entry) => entry.type !== 'assistant.message' || entry.text)
 		.slice(-limit)
 		.map((entry) => ({
 		at: entry.at,
 		note: describeTranscriptEntry(entry),
 		source: 'transcript' as const,
+		...(entry.observedAt ? { observedAt: entry.observedAt } : {}),
 	}));
 }
 
@@ -287,6 +224,8 @@ export interface FeedEntry {
 	at: string;
 	note: string;
 	source: 'progress' | 'transcript' | 'hook';
+	/** Observation time for ephemeral sources; durable progress has none. */
+	observedAt?: string;
 }
 
 /**
@@ -326,7 +265,7 @@ export class TranscriptLineReader {
 	/** toolCallId → toolName, learned from `tool.execution_start`. */
 	private readonly toolNames = new Map<string, string>();
 
-	consume(chunk: string): TranscriptEntry[] {
+	consume(chunk: string, observedAt?: string): TranscriptEntry[] {
 		const parts = (this.pending + chunk).split('\n');
 		this.pending = parts.pop() ?? '';
 
@@ -343,7 +282,8 @@ export class TranscriptLineReader {
 			}
 			const entry = projectTranscriptEntry(parsed);
 			if (entry) {
-				entries.push(this.correlateToolName(entry));
+				const correlated = this.correlateToolName(entry);
+				entries.push(observedAt ? { ...correlated, observedAt } : correlated);
 			}
 		}
 		return entries;
@@ -394,11 +334,15 @@ export async function readTranscriptHeader(fsPath: string): Promise<boolean> {
 }
 
 interface TailState {
+	taskId: string;
 	fsPath?: string;
 	offset: number;
 	reader: TranscriptLineReader;
 	entries: TranscriptEntry[];
 	gated: boolean;
+	availability: FeedSourceAvailability;
+	latestEventAt?: string;
+	latestObservedAt?: string;
 	timer?: ReturnType<typeof setInterval>;
 	polling: boolean;
 	known: Set<string>;
@@ -424,11 +368,15 @@ export interface TranscriptTailOptions {
  */
 export class TranscriptTailService {
 	private readonly tails = new Map<string, TailState>();
+	private readonly changed = new vscode.EventEmitter<string>();
 
 	constructor(
 		private readonly storageUri: vscode.Uri | undefined,
 		private readonly defaultLimit = DEFAULT_FEED_LIMIT,
 	) {}
+
+	/** Fires when a tail receives a new observation or changes availability. */
+	readonly onDidChange = this.changed.event;
 
 	/** Begins tailing for a task. A second call for the same task is ignored. */
 	async start(taskId: string, options: TranscriptTailOptions = {}): Promise<void> {
@@ -437,10 +385,12 @@ export class TranscriptTailService {
 		}
 		const directory = transcriptsDirectory(this.storageUri).fsPath;
 		const state: TailState = {
+			taskId,
 			offset: 0,
 			reader: new TranscriptLineReader(),
 			entries: [],
 			gated: false,
+			availability: 'missing',
 			polling: false,
 			known: new Set<string>(),
 			sessionId: options.sessionId,
@@ -448,16 +398,7 @@ export class TranscriptTailService {
 
 		if (options.sessionId) {
 			// A later run: the file is known, and only what this run appends is wanted.
-			const fsPath = transcriptFileFor(this.storageUri, options.sessionId).fsPath;
-			state.gated = await readTranscriptHeader(fsPath);
-			if (state.gated) {
-				state.fsPath = fsPath;
-				try {
-					state.offset = (await stat(fsPath)).size;
-				} catch {
-					state.offset = 0;
-				}
-			}
+			await this.attachKnownSession(state);
 		} else {
 			// A first run: remember what exists now, so a file appearing later is ours.
 			try {
@@ -466,8 +407,10 @@ export class TranscriptTailService {
 						state.known.add(name);
 					}
 				}
-			} catch {
+				state.availability = 'configured';
+			} catch (error) {
 				// No directory yet is a valid state to wait in.
+				state.availability = availabilityForError(error);
 			}
 		}
 
@@ -495,17 +438,31 @@ export class TranscriptTailService {
 
 	/** Bounded, time-ordered feed rows for a task; empty when nothing is tailed. */
 	entriesFor(taskId: string, limit = this.defaultLimit): TranscriptFeedEntry[] {
+		return this.snapshotFor(taskId, limit).entries as TranscriptFeedEntry[];
+	}
+
+	/** Safe source state for the board; no transcript path or payload is exposed. */
+	snapshotFor(taskId: string, limit = this.defaultLimit): FeedSourceSnapshot {
+		if (!this.storageUri) {
+			return { availability: 'not-configured', entries: [] };
+		}
 		const state = this.tails.get(taskId);
 		if (!state) {
-			return [];
+			return { availability: 'configured', entries: [] };
 		}
-		return toFeedEntries(state.entries, limit);
+		return {
+			availability: state.availability,
+			entries: toFeedEntries(state.entries, limit),
+			...(state.latestEventAt ? { latestEventAt: state.latestEventAt } : {}),
+			...(state.latestObservedAt ? { latestObservedAt: state.latestObservedAt } : {}),
+		};
 	}
 
 	dispose(): void {
 		for (const taskId of [...this.tails.keys()]) {
 			this.forget(taskId);
 		}
+		this.changed.dispose();
 	}
 
 	private async poll(taskId: string, limit: number): Promise<void> {
@@ -515,16 +472,19 @@ export class TranscriptTailService {
 		}
 		state.polling = true;
 		try {
-			if (!state.fsPath) {
+			if (!state.fsPath && state.sessionId) {
+				await this.attachKnownSession(state);
+			} else if (!state.fsPath) {
 				await this.discover(state);
 			}
 			if (!state.fsPath || !state.gated) {
 				return;
 			}
 			await this.readAppended(state, limit);
-		} catch {
+		} catch (error) {
 			// A transcript that is missing, evicted, or unreadable is "no activity",
 			// never an error surfaced to the user.
+			this.setAvailability(state, availabilityForError(error));
 		} finally {
 			state.polling = false;
 		}
@@ -536,9 +496,11 @@ export class TranscriptTailService {
 		let names: string[];
 		try {
 			names = await readdir(directory);
-		} catch {
+		} catch (error) {
+			this.setAvailability(state, availabilityForError(error));
 			return;
 		}
+		this.setAvailability(state, 'configured');
 		for (const name of names) {
 			if (!name.endsWith('.jsonl') || state.known.has(name)) {
 				continue;
@@ -553,8 +515,47 @@ export class TranscriptTailService {
 		}
 	}
 
+	/** Attaches to a known session only; a missing later-run file must not make
+	 * the first-run directory discovery attach an unrelated transcript. */
+	private async attachKnownSession(state: TailState): Promise<void> {
+		if (!state.sessionId || state.fsPath) {
+			return;
+		}
+		const fsPath = transcriptFileFor(this.storageUri!, state.sessionId).fsPath;
+		let size: number;
+		try {
+			({ size } = await stat(fsPath));
+		} catch (error) {
+			this.setAvailability(state, availabilityForError(error));
+			return;
+		}
+		if (!await readTranscriptHeader(fsPath)) {
+			this.setAvailability(state, 'unreadable');
+			return;
+		}
+		state.fsPath = fsPath;
+		state.gated = true;
+		state.offset = size;
+		this.setAvailability(state, 'configured');
+	}
+
 	private async readAppended(state: TailState, limit: number): Promise<void> {
 		const { size } = await stat(state.fsPath!);
+		if (size < state.offset) {
+			// The file was replaced or truncated. Start from its verified header so
+			// stale offsets cannot split a line or replay old retained entries.
+			state.offset = 0;
+			state.reader = new TranscriptLineReader();
+			state.entries = [];
+			state.latestEventAt = undefined;
+			state.latestObservedAt = undefined;
+			state.gated = await readTranscriptHeader(state.fsPath!);
+			if (!state.gated) {
+				state.fsPath = undefined;
+				this.setAvailability(state, 'unreadable');
+				return;
+			}
+		}
 		if (size <= state.offset) {
 			return;
 		}
@@ -564,12 +565,35 @@ export class TranscriptTailService {
 			const buffer = Buffer.alloc(length);
 			await handle.read(buffer, 0, length, state.offset);
 			state.offset = size;
-			state.entries.push(...state.reader.consume(buffer.toString('utf8')));
+			const observedAt = utcTimestamp();
+			state.latestObservedAt = observedAt;
+			state.entries.push(...state.reader.consume(buffer.toString('utf8'), observedAt));
+			for (const entry of state.entries) {
+				if (!state.latestEventAt || Date.parse(entry.at) > Date.parse(state.latestEventAt)) {
+					state.latestEventAt = entry.at;
+				}
+			}
 			if (state.entries.length > limit) {
 				state.entries.splice(0, state.entries.length - limit);
 			}
 		} finally {
 			await handle.close();
 		}
+		this.setAvailability(state, 'configured');
+		this.changed.fire(state.taskId);
 	}
+
+	private setAvailability(state: TailState, availability: FeedSourceAvailability): void {
+		if (state.availability === availability) {
+			return;
+		}
+		state.availability = availability;
+		this.changed.fire(state.taskId);
+	}
+}
+
+function availabilityForError(error: unknown): FeedSourceAvailability {
+	return error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT'
+		? 'missing'
+		: 'unreadable';
 }

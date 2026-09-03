@@ -4,9 +4,10 @@ title: Browser activity feed: agent-emitted progress lines over SSE
 type: feature
 state: done
 status: idle
+parent_task: TASK-002
 position: 3
 created: 2026-08-26T00:10:02Z
-updated: 2026-08-26T05:41:12Z
+updated: 2026-09-05T05:58:40Z
 chat: 2fd04e6f-6848-4c97-b3d7-055a1c49280d
 copilot_session_id: 2fd04e6f-6848-4c97-b3d7-055a1c49280d
 scope_hash: 71a9f89

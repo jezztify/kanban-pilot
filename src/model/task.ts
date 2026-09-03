@@ -90,6 +90,8 @@ export interface Task {
 	type: TaskType;
 	state: Column;
 	status: Status;
+	/** Optional parent task within the same task set. */
+	parentTaskId?: string;
 	created?: string;
 	updated?: string;
 	/** Active run id, or undefined when idle. */
@@ -460,6 +462,10 @@ function isStatus(value: string): value is Status {
 	return (STATUSES as readonly string[]).includes(value);
 }
 
+function isTaskId(value: unknown): value is string {
+	return typeof value === 'string' && /^TASK-\d+$/.test(value);
+}
+
 /** Positions are non-negative finite numbers; missing/invalid values use the legacy fallback order. */
 export function isValidTaskPosition(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -575,6 +581,7 @@ export function taskFromRaw(raw: string, fallbackId?: string, setId = 'default')
 		type: normalizeTaskType(frontmatter.type),
 		state: state && isColumn(state) ? state : 'backlog',
 		status: status && isStatus(status) ? status : 'idle',
+		parentTaskId: isTaskId(frontmatter.parent_task) ? frontmatter.parent_task : undefined,
 		created: frontmatter.created || undefined,
 		updated: frontmatter.updated || undefined,
 		run: frontmatter.run && frontmatter.run !== 'null' ? frontmatter.run : undefined,
@@ -600,6 +607,7 @@ const KEY_ORDER = [
 	'type',
 	'state',
 	'status',
+	'parent_task',
 	'position',
 	'created',
 	'updated',
@@ -826,6 +834,8 @@ export interface TaskOrigin {
 export interface NewTaskOptions {
 	/** Canonical task classification; legacy callers resolve to Feature. */
 	type?: TaskType;
+	/** Optional parent task within the active task set. */
+	parentTaskId?: string;
 	/** The human-typed description (§6.16's New Task modal); falls back to the title if blank. Ignored when `origin` is set. */
 	request?: string;
 	/** Transient images staged by the create form; never serialized as binary metadata. */
@@ -856,6 +866,7 @@ export function newTaskFile(
 		type: normalizeTaskType(options.type),
 		state: 'backlog',
 		status: 'idle',
+		...(isTaskId(options.parentTaskId) ? { parent_task: options.parentTaskId } : {}),
 		...(isValidTaskPosition(position) ? { position: String(position) } : {}),
 		created: stamp,
 		updated: stamp,

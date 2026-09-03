@@ -190,7 +190,7 @@ export class BrowserBoardSurface implements BoardSurface {
 		}
 		const relative = path.relative(this.roots[root].fsPath, uri.fsPath).split(path.sep).join('/');
 		const segments = relative.split('/').map((segment) => encodeURIComponent(segment));
-		return `/resource/${root}/${segments.join('/')}`;
+		return `/resource/${root}/${segments.join('/')}?session=${encodeURIComponent(this.sessionId)}`;
 	}
 
 	setHtml(html: string): void {

@@ -1,17 +1,22 @@
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { deleteTask, pickTaskFor } from './board/actions';
-import { BoardPanel, BoardTaskSetChange } from './board/boardPanel';
+import { BoardPanel, BoardTaskSetChange, BoardTaskSetHost } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
-import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, OutboundPayloadSeam } from './chat/executor';
+import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, CHAT_COMPACT_COMMAND, OutboundPayloadSeam } from './chat/executor';
+import { ContextCompactionService, NATIVE_COMPACTION_ENABLED, NATIVE_COMPACTION_THRESHOLD } from './chat/contextCompaction';
 import { CommandExecutor, normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
 import { TranscriptTailService } from './chat/transcriptTail';
 import { HookSpoolReceiver, SPOOL_RELATIVE_PATH } from './chat/hookSpool';
 import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore, TaskStoreChange } from './model/taskStore';
+import { WorkspaceActivityStore } from './model/workspaceActivity';
 import { CHAT_SESSION_SCHEME, parseSessionUri } from './chat/sessionUri';
-import { endpointConnectionUrl, httpEndpointConfig, isNonLoopbackBindAddress, RealtimeBoardServer, startRealtimeBoardServer } from './http/realtimeBoardServer';
+import { automaticHttpEndpointConfig, endpointConnectionUrl, isNonLoopbackBindAddress, RealtimeBoardServer, startRealtimeBoardServer } from './http/realtimeBoardServer';
 import { showEndpointSharePanel } from './http/endpointSharePanel';
+import { connectSharedLocalWorkspaceRegistry, SharedLocalWorkspaceRegistry } from './http/localWorkspaceRegistry';
+import { WorkspaceRegistryClient, WorkspaceRegistryConfig } from './http/workspaceRegistry';
 
 /**
  * Observe/adjust the executor's own outbound turn — row 1 of the hijack spike
@@ -43,6 +48,7 @@ const outboundSeam: OutboundPayloadSeam = {
 };
 
 const executor = new ChatSessionExecutor(tracedChatCommands(), {}, outboundSeam);
+const contextCompactionService = new ContextCompactionService(executor);
 
 /**
  * Diagnostic tracing for the chat-open path. Every VS Code command that can
@@ -71,7 +77,7 @@ function describeChatCommandArgs(command: string, args: readonly unknown[]): str
 function logChatCommand(source: string, command: string, args: readonly unknown[]): void {
 	const isChatCommand = command === 'vscode.open'
 		? args[0] instanceof vscode.Uri && (args[0] as vscode.Uri).scheme === CHAT_SESSION_SCHEME
-		: command.startsWith('workbench.action.chat.');
+		: command.startsWith('workbench.action.chat.') || command === CHAT_COMPACT_COMMAND;
 	if (!isChatCommand) {
 		return;
 	}
@@ -101,7 +107,7 @@ function traceRunManagerAction(message: string): void {
 	outboundLog.appendLine(`[chat-trace] ${new Date().toISOString()} via=action ${message}`);
 }
 
-export type WorkspaceChangeKind = 'task' | 'attachment' | 'configuration' | 'task-set' | 'run' | 'reconnect';
+export type WorkspaceChangeKind = 'task' | 'attachment' | 'configuration' | 'task-set' | 'run' | 'activity' | 'reconnect';
 
 export interface WorkspaceTaskSetChange extends BoardTaskSetChange {
 	kind: WorkspaceChangeKind;
@@ -121,13 +127,92 @@ export interface WorkspaceTaskSetChange extends BoardTaskSetChange {
 let transcriptTail: TranscriptTailService | undefined;
 let hookSpool: HookSpoolReceiver | undefined;
 
+export class EndpointTaskSetHost implements BoardTaskSetHost {
+	private currentSet: TaskSet;
+	private currentStore: TaskStore;
+	private currentWorkspaceActivity: WorkspaceActivityStore;
+	private currentRunManager: RunManager;
+	private readyValue: Promise<void>;
+	private readonly changed = new vscode.EventEmitter<BoardTaskSetChange>();
+	private revisionValue = 0;
+	private disposables: vscode.Disposable[] = [];
+	private disposed = false;
+
+	constructor(
+		activeSet: TaskSet,
+		private readonly folder: vscode.WorkspaceFolder,
+		private readonly registry: TaskSetRegistry,
+		private readonly updatePort: (id: string, port: number | undefined) => Promise<void>,
+	) {
+		this.currentSet = activeSet;
+		this.currentStore = new TaskStore(activeSet.directory, activeSet.id);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(folder.uri, activeSet.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
+		this.readyValue = this.initialize();
+	}
+
+	get activeSet(): TaskSet { return this.currentSet; }
+	get store(): TaskStore { return this.currentStore; }
+	get workspaceActivity(): WorkspaceActivityStore { return this.currentWorkspaceActivity; }
+	get runManager(): RunManager { return this.currentRunManager; }
+	get ready(): Promise<void> { return this.readyValue; }
+
+	private async initialize(): Promise<void> {
+		const manager = this.currentRunManager;
+		const emit = (kind: string, taskId?: string, note?: string): void => {
+			this.revisionValue = Math.max(this.revisionValue, this.currentStore.revision) + 1;
+			this.changed.fire({ revision: this.revisionValue, kind, taskId, note });
+		};
+		this.disposables = [
+			this.currentStore.watchChanges((change) => { void manager.reconcileTaskChange(change.taskId).then(() => manager.applyGatePolicies()).catch(() => undefined); emit(change.kind === 'attachment' ? 'attachment' : 'task', change.taskId); }),
+			manager.onDidChange((change) => emit(change.kind, change.taskId, change.note)),
+			this.currentWorkspaceActivity.onDidChange((record) => emit('activity', record.taskId)),
+		];
+		await manager.reconcileOnActivation();
+		await manager.applyGatePolicies();
+	}
+
+	get revision(): number { return Math.max(this.revisionValue, this.currentStore.revision, this.currentWorkspaceActivity.revision); }
+	onDidChange(listener: (change?: BoardTaskSetChange) => void): vscode.Disposable { return this.changed.event(listener); }
+	async listTaskSets(): Promise<TaskSet[]> { await this.ready; return this.registry.list(); }
+	async switchTaskSet(id: string): Promise<void> {
+		await this.ready;
+		if (id === this.currentSet.id || this.disposed) { return; }
+		const next = await this.registry.get(id);
+		if (this.disposed) { return; }
+		for (const disposable of this.disposables) { disposable.dispose(); }
+		this.disposables = [];
+		this.currentRunManager.dispose();
+		this.currentWorkspaceActivity.dispose();
+		this.currentSet = next;
+		this.currentStore = new TaskStore(next.directory, next.id);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(this.folder.uri, next.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
+		this.readyValue = this.initialize();
+		await this.ready;
+		this.revisionValue++;
+		this.changed.fire({ revision: this.revisionValue, kind: 'task-set', note: 'browser task set changed' });
+	}
+	async createTaskSet(): Promise<void> { throw new TaskSetError('not-found', 'This browser endpoint is bound to one task set.'); }
+	async renameTaskSet(): Promise<void> { throw new TaskSetError('not-found', 'This browser endpoint is bound to one task set.'); }
+	async setTaskSetHttpPort(port: number | undefined): Promise<void> { await this.updatePort(this.currentSet.id, port); }
+	async deleteTaskSet(): Promise<void> { throw new TaskSetError('not-found', 'This browser endpoint is bound to one task set.'); }
+	async createBrowserSessionHost(): Promise<EndpointTaskSetHost> {
+		await this.ready;
+		return new EndpointTaskSetHost(this.currentSet, this.folder, this.registry, this.updatePort);
+	}
+	dispose(): void { this.disposed = true; for (const disposable of this.disposables) { disposable.dispose(); } this.currentRunManager.dispose(); this.currentWorkspaceActivity.dispose(); this.changed.dispose(); }
+}
+
 export class WorkspaceTaskSetContext {
 	readonly registry: TaskSetRegistry;
 	private currentSet: TaskSet;
 	private currentStore: TaskStore;
+	private currentWorkspaceActivity: WorkspaceActivityStore;
 	private currentRunManager: RunManager;
 	private watcher: vscode.Disposable | undefined;
 	private runChange: vscode.Disposable | undefined;
+	private activityChange: vscode.Disposable | undefined;
 	private readonly configurationWatcher: vscode.Disposable;
 	private watcherQueue: Promise<void> = Promise.resolve();
 	private taskSetOperationTail: Promise<void> = Promise.resolve();
@@ -146,8 +231,18 @@ export class WorkspaceTaskSetContext {
 		this.registry = new TaskSetRegistry(folder, tasksDir);
 		this.currentSet = this.registry.defaultSet;
 		this.currentStore = new TaskStore(this.currentSet.directory, this.currentSet.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(folder.uri, this.currentSet.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
 		this.configurationWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
+			if (
+				event.affectsConfiguration('kanbanPilot.chat.autoCompact') ||
+				event.affectsConfiguration('kanbanPilot.chat.autoCompactThreshold') ||
+				event.affectsConfiguration(NATIVE_COMPACTION_ENABLED) ||
+				event.affectsConfiguration(NATIVE_COMPACTION_THRESHOLD)
+			) {
+				contextCompactionService.invalidate();
+				void contextCompactionService.synchronize().catch(() => undefined);
+			}
 			if (event.affectsConfiguration('kanbanPilot') || event.affectsConfiguration('chat.agentFilesLocations')) {
 				this.emitChange('configuration');
 			}
@@ -156,7 +251,7 @@ export class WorkspaceTaskSetContext {
 	}
 
 	get revision(): number {
-		return Math.max(this.revisionValue, this.currentStore.revision);
+		return Math.max(this.revisionValue, this.currentStore.revision, this.currentWorkspaceActivity.revision);
 	}
 
 	get activeSet(): TaskSet {
@@ -169,6 +264,10 @@ export class WorkspaceTaskSetContext {
 
 	get runManager(): RunManager {
 		return this.currentRunManager;
+	}
+
+	get workspaceActivity(): WorkspaceActivityStore {
+		return this.currentWorkspaceActivity;
 	}
 
 	onDidChange(listener: (change?: WorkspaceTaskSetChange) => void): vscode.Disposable {
@@ -217,15 +316,19 @@ export class WorkspaceTaskSetContext {
 		const generation = ++this.setGeneration;
 		this.watcher?.dispose();
 		this.runChange?.dispose();
+		this.activityChange?.dispose();
 		if (this.storeChangeTimer !== undefined) {
 			clearTimeout(this.storeChangeTimer);
 			this.storeChangeTimer = undefined;
 		}
 		this.pendingStoreChanges.clear();
 		const previousManager = this.currentRunManager;
+		const previousActivity = this.currentWorkspaceActivity;
 		this.currentSet = set;
 		this.currentStore = new TaskStore(set.directory, set.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(this.folder.uri, set.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
+		previousActivity.dispose();
 		if (previousManager !== this.currentRunManager) {
 			previousManager.dispose();
 		}
@@ -234,7 +337,14 @@ export class WorkspaceTaskSetContext {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {
 				return;
 			}
-			this.emitChange('run', change.taskId, change.note);
+			this.emitChange(change.kind === 'task' ? 'task' : 'run', change.taskId, change.note);
+		});
+		const activity = this.currentWorkspaceActivity;
+		this.activityChange = activity.onDidChange((record) => {
+			if (generation !== this.setGeneration || activity !== this.currentWorkspaceActivity) {
+				return;
+			}
+			this.emitChange('activity', record.taskId, 'workspace activity appended');
 		});
 		this.watcher = this.currentStore.watchChanges((change) => {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {
@@ -332,6 +442,16 @@ export class WorkspaceTaskSetContext {
 		return this.registry.list();
 	}
 
+	async endpointHost(set: TaskSet): Promise<EndpointTaskSetHost> {
+		await this.ensureReady();
+		const fixedSet = await this.registry.get(set.id);
+		return new EndpointTaskSetHost(fixedSet, this.folder, this.registry, async (id, port) => {
+			const updated = await this.registry.setHttpPort(id, port);
+			if (this.currentSet.id === updated.id) { this.currentSet = updated; }
+			this.emitChange('task-set', undefined, 'task set HTTP port changed');
+		});
+	}
+
 	async switchTaskSet(id: string): Promise<void> {
 		await this.runTaskSetOperation(async () => {
 			await this.ensureReady();
@@ -402,6 +522,18 @@ export class WorkspaceTaskSetContext {
 		});
 	}
 
+	async setTaskSetHttpPort(port: number | undefined): Promise<void> {
+		await this.runTaskSetOperation(async () => {
+			await this.ensureReady();
+			const updated = await this.registry.setHttpPort(this.currentSet.id, port);
+			if (this.disposed || updated.id !== this.currentSet.id) {
+				return;
+			}
+			this.currentSet = updated;
+			this.emitChange('task-set', undefined, 'task set HTTP port changed');
+		});
+	}
+
 	async deleteTaskSet(): Promise<void> {
 		await this.runTaskSetOperation(async () => {
 			await this.ensureReady();
@@ -469,8 +601,11 @@ export class WorkspaceTaskSetContext {
 		this.pendingStoreChanges.clear();
 		this.runChange?.dispose();
 		this.runChange = undefined;
+		this.activityChange?.dispose();
+		this.activityChange = undefined;
 		this.configurationWatcher.dispose();
 		this.currentRunManager.dispose();
+		this.currentWorkspaceActivity.dispose();
 		this.changed.dispose();
 	}
 }
@@ -591,6 +726,8 @@ function registerActionCommand(
 }
 
 export function activate(context_: vscode.ExtensionContext) {
+	context_.subscriptions.push({ dispose: () => contextCompactionService.dispose() });
+	void contextCompactionService.synchronize().catch(() => undefined);
 	if (context_.storageUri) {
 		transcriptTail = new TranscriptTailService(context_.storageUri);
 		context_.subscriptions.push({ dispose: () => transcriptTail?.dispose() });
@@ -607,23 +744,22 @@ export function activate(context_: vscode.ExtensionContext) {
 		}
 	}
 	let sharedEndpointUrl: string | undefined;
+	let registryShareUrl: string | undefined;
 	const endpointStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-	endpointStatusItem.name = 'Kanban Pilot Connection';
+	endpointStatusItem.name = 'Kanban Pilot Share';
 	endpointStatusItem.command = 'kanban-pilot.showEndpointConnection';
-	endpointStatusItem.text = '$(broadcast) Kanban Pilot';
-	endpointStatusItem.tooltip = 'Show the Kanban Pilot endpoint QR code and URL';
+	endpointStatusItem.text = '$(broadcast) Kanban Pilot: Share';
+	endpointStatusItem.tooltip = 'The automatic Kanban Pilot Registry is starting';
 	endpointStatusItem.show();
 	context_.subscriptions.push(
 		endpointStatusItem,
 		outboundLog,
 		vscode.commands.registerCommand('kanban-pilot.showEndpointConnection', async () => {
-			if (!sharedEndpointUrl) {
-				void vscode.window.showWarningMessage(
-					'Kanban Pilot HTTP endpoint is not enabled. Configure it in Kanban Pilot Settings under HTTP endpoint.',
-				);
+			if (!registryShareUrl) {
+				void vscode.window.showWarningMessage('Kanban Pilot Registry is still starting. Try again in a moment.');
 				return;
 			}
-			await showEndpointSharePanel(context_.extensionUri, sharedEndpointUrl);
+			await showEndpointSharePanel(context_.extensionUri, registryShareUrl, 'Registry');
 		}),
 	);
 	// §6.4: a window reload loses every in-flight run's promise. Reconcile
@@ -634,53 +770,139 @@ export function activate(context_: vscode.ExtensionContext) {
 		const runConfig = vscode.workspace.getConfiguration('kanbanPilot.run');
 		void workspaceContext?.ready;
 		let previousMaxParallelTasks = normalizeMaxParallelTasks(runConfig.get<number>('maxParallelTasks', 1));
-		let endpointServer: RealtimeBoardServer | undefined;
+		const endpoint = automaticHttpEndpointConfig();
+		const endpointServers = new Map<string, { server: RealtimeBoardServer; host: EndpointTaskSetHost; url: string; requestedPort: number }>();
 		let endpointGeneration = 0;
-		const restartEndpoint = async (): Promise<void> => {
-			const generation = ++endpointGeneration;
-			endpointServer?.dispose();
-			endpointServer = undefined;
-			sharedEndpointUrl = undefined;
-			endpointStatusItem.text = '$(broadcast) Kanban Pilot';
-			endpointStatusItem.tooltip = 'Configure the Kanban Pilot HTTP endpoint in Settings';
-			try {
-				const endpointSettings = vscode.workspace.getConfiguration('kanbanPilot.http');
-				const endpoint = httpEndpointConfig({
-					enabled: endpointSettings.get<unknown>('enabled', false),
-					host: endpointSettings.get<unknown>('host', '127.0.0.1'),
-					port: endpointSettings.get<unknown>('port', 4173),
-					token: endpointSettings.get<unknown>('token', ''),
-					publicUrl: endpointSettings.get<unknown>('publicUrl', ''),
-				});
-				if (!endpoint || !workspaceContext) { return; }
-				const server = await startRealtimeBoardServer({
-					host: workspaceContext,
-					extensionUri: context_.extensionUri,
-					port: endpoint.port,
-					token: endpoint.token,
-					bindAddress: endpoint.bindAddress,
-				});
-				if (generation !== endpointGeneration) {
-					server.dispose();
+		let lifecycleDisposed = false;
+		let localRegistry: SharedLocalWorkspaceRegistry | undefined;
+		let localRegistryConfig: WorkspaceRegistryConfig | undefined;
+		const localRegistryReady = connectSharedLocalWorkspaceRegistry({
+			directory: context_.globalStorageUri.fsPath,
+			registryScript: vscode.Uri.joinPath(context_.extensionUri, 'dist', 'registry.js').fsPath,
+			bindAddress: endpoint.bindAddress,
+		}).then((service) => {
+			if (lifecycleDisposed) {
+				service.dispose();
+				return;
+			}
+			localRegistry = service;
+			registryShareUrl = service.baseUrl;
+			localRegistryConfig = { baseUrl: service.baseUrl, credential: service.credential, includeConnectionUrl: true };
+			endpointStatusItem.tooltip = `Share the Kanban Pilot Registry: ${registryShareUrl}`;
+		}).catch((error: unknown) => {
+			void vscode.window.showWarningMessage(`Kanban Pilot Registry could not start: ${error instanceof Error ? error.message : String(error)}`);
+		});
+		const registryClient = new WorkspaceRegistryClient(
+			context_.workspaceState.get<string>('kanbanPilot.workspaceRegistryId')
+				?? `workspace-${randomUUID()}`,
+		);
+		if (!context_.workspaceState.get<string>('kanbanPilot.workspaceRegistryId')) {
+			void context_.workspaceState.update('kanbanPilot.workspaceRegistryId', registryClient.workspaceId);
+		}
+		let registeredRegistry: WorkspaceRegistryConfig | undefined;
+		let registrySyncTail: Promise<void> = Promise.resolve();
+		let lastRegistryDiagnostic: string | undefined;
+		const syncRegistry = (): Promise<void> => {
+			const operation = registrySyncTail.then(async () => {
+				if (lifecycleDisposed) {
 					return;
 				}
-				endpointServer = server;
-				sharedEndpointUrl = endpointConnectionUrl(endpoint, server.port);
-				endpointStatusItem.text = '$(broadcast) Kanban Pilot: Share';
-				endpointStatusItem.tooltip = `Show QR code and copy ${sharedEndpointUrl}`;
-				void vscode.window.showInformationMessage(`Kanban Pilot real-time HTTP endpoint listening on ${sharedEndpointUrl}.`);
+				await localRegistryReady;
+				if (lifecycleDisposed) {
+					return;
+				}
+				const config = localRegistryConfig;
+				if (!config) {
+					return;
+				}
+				if (!sharedEndpointUrl) {
+					if (registeredRegistry) {
+						await registryClient.remove(registeredRegistry);
+						registeredRegistry = undefined;
+					}
+					return;
+				}
+				const diagnostic = await registryClient.sync(config, sharedEndpointUrl, startupFolder.name, {
+					directoryPath: startupFolder.uri.fsPath,
+					activeWorkspace: workspaceContext?.activeSet.name ?? 'Default',
+				});
+				if (diagnostic) {
+					if (diagnostic !== lastRegistryDiagnostic) {
+						lastRegistryDiagnostic = diagnostic;
+						void vscode.window.showWarningMessage(`Kanban Pilot could not register this workspace: ${diagnostic}`);
+					}
+					return;
+				}
+				registeredRegistry = config;
+				lastRegistryDiagnostic = undefined;
+			});
+			registrySyncTail = operation.catch(() => undefined);
+			return operation;
+		};
+		const restartEndpoint = async (): Promise<void> => {
+			const generation = ++endpointGeneration;
+			sharedEndpointUrl = undefined;
+			endpointStatusItem.tooltip = registryShareUrl ? `Share the Kanban Pilot Registry: ${registryShareUrl}` : 'The automatic Kanban Pilot Registry is starting';
+			void syncRegistry();
+			try {
+				if (!workspaceContext) {
+					for (const entry of endpointServers.values()) { entry.server.dispose(); entry.host.dispose(); }
+					endpointServers.clear();
+					return;
+				}
+				const taskSets = await workspaceContext.listTaskSets();
+				const desired = new Map(taskSets.map((set) => [set.id, { set, requestedPort: 0 }] as const));
+				for (const [id, entry] of [...endpointServers]) {
+					if (!desired.has(id)) {
+						entry.server.dispose(); entry.host.dispose(); endpointServers.delete(id);
+					}
+				}
+				for (const [id, wanted] of desired) {
+					if (endpointServers.has(id)) { continue; }
+					const host = await workspaceContext.endpointHost(wanted.set);
+					try {
+						const server = await startRealtimeBoardServer({ host, extensionUri: context_.extensionUri, port: wanted.requestedPort, token: endpoint.token, bindAddress: endpoint.bindAddress });
+						if (generation !== endpointGeneration) { server.dispose(); host.dispose(); return; }
+						const url = endpointConnectionUrl(endpoint, server.port);
+						endpointServers.set(id, { server, host, url, requestedPort: wanted.requestedPort });
+						void vscode.window.showInformationMessage(`Kanban Pilot HTTP endpoint for '${wanted.set.name}' is ready.`);
+					} catch (error) {
+						host.dispose();
+						void vscode.window.showErrorMessage(`Kanban Pilot HTTP endpoint for '${wanted.set.name}' could not start: ${error instanceof Error ? error.message : String(error)}`);
+					}
+				}
+				sharedEndpointUrl = endpointServers.get(workspaceContext.activeSet.id)?.url;
+				if (sharedEndpointUrl) {
+					endpointStatusItem.tooltip = registryShareUrl ? `Share the Kanban Pilot Registry: ${registryShareUrl}` : 'The automatic Kanban Pilot Registry is starting';
+				}
+				void syncRegistry();
 				if (isNonLoopbackBindAddress(endpoint.bindAddress)) {
 					void vscode.window.showWarningMessage(
 						`Kanban Pilot HTTP endpoint is bound to ${endpoint.bindAddress} and reachable from other machines. The share URL carries the access token in plain text over HTTP with no TLS — only expose it on networks you trust, or front it with a TLS reverse proxy.`,
 					);
 				}
-			} catch (error) {
-				if (generation === endpointGeneration) {
-					void vscode.window.showErrorMessage(`Kanban Pilot HTTP endpoint could not start: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			}
+			} catch (error) { if (generation === endpointGeneration) { void vscode.window.showErrorMessage(`Kanban Pilot HTTP endpoint could not start: ${error instanceof Error ? error.message : String(error)}`); } }
 		};
-		context_.subscriptions.push({ dispose: () => endpointServer?.dispose() });
+		const registryHeartbeat = setInterval(() => { void syncRegistry(); }, 30_000);
+		registryHeartbeat.unref?.();
+		context_.subscriptions.push({
+			dispose: () => {
+				lifecycleDisposed = true;
+				clearInterval(registryHeartbeat);
+				for (const entry of endpointServers.values()) { entry.server.dispose(); entry.host.dispose(); }
+				endpointServers.clear();
+				void (async () => {
+					await localRegistryReady;
+					await registrySyncTail;
+					if (registeredRegistry) {
+						await registryClient.remove(registeredRegistry);
+						registeredRegistry = undefined;
+					}
+					localRegistry?.dispose();
+				})();
+			},
+		});
+		context_.subscriptions.push(workspaceContext?.onDidChange((change) => { if (change?.kind === 'task-set') { void restartEndpoint(); } }) ?? new vscode.Disposable(() => undefined));
 		context_.subscriptions.push(
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (event.affectsConfiguration('kanbanPilot.tasksDir')) {
@@ -695,9 +917,6 @@ export function activate(context_: vscode.ExtensionContext) {
 				}
 				const capacityChanged = event.affectsConfiguration('kanbanPilot.run.maxParallelTasks');
 				const gatesChanged = event.affectsConfiguration('kanbanPilot.gates');
-				if (event.affectsConfiguration('kanbanPilot.http')) {
-					void restartEndpoint();
-				}
 				if (!capacityChanged && !gatesChanged) {
 					return;
 				}
@@ -711,7 +930,12 @@ export function activate(context_: vscode.ExtensionContext) {
 				}
 			}),
 		);
-		void restartEndpoint();
+		void (async () => {
+			await localRegistryReady;
+			await restartEndpoint();
+		})().catch((error: unknown) => {
+			void vscode.window.showWarningMessage(`Kanban Pilot automatic HTTP startup did not complete: ${error instanceof Error ? error.message : String(error)}`);
+		});
 	}
 
 	context_.subscriptions.push(

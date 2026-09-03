@@ -4,9 +4,48 @@ All notable changes to the "kanban-pilot" extension will be documented in this f
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
-## [Unreleased]
+## [0.4.4] - 2026-09-06
 
-_No unreleased changes._
+### Added
+
+- Parent and child tasks, including parent-aware agent proposals and a Task Tree view that makes
+	related work and its workflow status easier to follow.
+- Board-local search and filters for task ID, title, type, runtime status, and parent/child
+	relationships without changing task data or workflow state.
+- Persistent Workspace Activity History for each task set, replacing transient board notices with
+	a reviewable record shared by the editor and browser boards.
+- Optional native Copilot conversation compaction with a configurable context-window threshold,
+	while preserving the task's bound conversation and reporting unsupported configurations safely.
+- Independent browser boards for each task set, including per-task-set ports and browser-local
+	task-set selection without changing the editor's active board.
+- An opt-in hosted Central Registry where live workspaces can be discovered and selected before
+	opening their existing authenticated browser board. The registry stores only sanitized discovery
+	metadata and does not proxy task data or board tokens.
+- A responsive, accessible Central Registry landing page with clear loading, empty, error, and
+	available-workspace states.
+
+### Changed
+
+- Task cards and details now explain running, blocked, failed, pending, and stale-completion
+	conditions together with the next legal action, so workflow outcomes do not have to be inferred
+	from raw logs.
+- Activity feeds now identify durable progress, near-real-time hook observations, and delayed
+	transcript observations, including freshness and availability, while keeping private Copilot
+	content out of editor and browser projections.
+- The README now documents the Central Registry workflow, including the deployment-specific
+	demonstration URL, Registry-to-board redirect, and HTTP/TLS security boundary, with sanitized
+	directory and browser-board screenshots.
+
+### Fixed
+
+- Repeated reconciliation no longer creates duplicate child tasks, and proposal-only or
+	no-op Develop runs cannot advance as completed without implementation evidence.
+- Late receipts and stale-run outcomes are reconciled without allowing superseded work to overwrite
+	the current task state.
+- Task Tree diagrams now have a larger layout and expanded zoom range, and narrow task-detail
+	views keep their header and content reachable while scrolling.
+- Empty board banners and misleading successful pending-completion notices no longer consume space
+	or obscure the actual workflow state.
 
 ## [0.4.3] - 2026-09-02
 

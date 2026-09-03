@@ -35,11 +35,12 @@ async function withFixture(callback) {
 	}
 }
 
-test('package scripts expose both installers and one focused test command', async () => {
+test('package metadata exposes a stable publisher and installer scripts', async () => {
 	const packageJson = JSON.parse(
 		await readFile(join(repositoryRoot, 'package.json'), 'utf8'),
 	);
 
+	assert.equal(packageJson.publisher, 'jezztify');
 	assert.equal(packageJson.scripts['install:skill:claude'], 'node scripts/install-skill.mjs claude');
 	assert.equal(packageJson.scripts['install:skill:copilot'], 'node scripts/install-skill.mjs copilot');
 	assert.equal(

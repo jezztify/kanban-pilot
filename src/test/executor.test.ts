@@ -6,6 +6,7 @@ import {
 	ChatCommandApi,
 	ChatSessionExecutor,
 	CHAT_CANCEL_COMMAND,
+	CHAT_COMPACT_COMMAND,
 	CHAT_NEW_COMMAND,
 	capabilityDiagnostic,
 	orderedTaskChatAttachments,
@@ -467,6 +468,100 @@ suite('task chat cancellation', () => {
 			commands.responses[0].resolve(undefined);
 			await run;
 		}
+	});
+});
+
+suite('task chat compaction', () => {
+	test('reports an unavailable native compact command without opening a session', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands = ['vscode.open', 'workbench.action.chat.openagent'];
+		const executor = new ChatSessionExecutor(commands);
+
+		const result = await executor.compact(executorTask('TASK-040'), executorRunOptions);
+
+		assert.deepStrictEqual(result.kind, 'unsupported');
+		assert.strictEqual(result.kind === 'unsupported' ? result.diagnostic.code : '', 'missing-compact-command');
+		assert.deepStrictEqual(commands.calls, []);
+	});
+
+	test('does not invoke a focus-only compact command without a supported task-session target', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands.push(CHAT_COMPACT_COMMAND);
+		const executor = new ChatSessionExecutor(commands);
+		const task = executorTask('TASK-041');
+		task.chat = 'stable-task-chat';
+		task.copilotSessionId = 'copilot-uuid-must-not-be-used';
+
+		const result = await executor.compact(task, executorRunOptions);
+
+		assert.strictEqual(result.kind, 'unsupported');
+		assert.strictEqual(result.kind === 'unsupported' ? result.diagnostic.code : '', 'unsupported-compact-session-target');
+		assert.deepStrictEqual(commands.calls, []);
+		assert.ok(!commands.calls.some(({ command }) => command === CHAT_NEW_COMMAND));
+	});
+
+	test('uses a proven task-session target and never falls back to focused commands or New Chat', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands.push(CHAT_COMPACT_COMMAND);
+		const targetUris: string[] = [];
+		const executor = new ChatSessionExecutor(commands, {}, {}, {
+			compact: async (uri) => {
+				targetUris.push(uri.toString());
+			},
+		});
+		const task = executorTask('TASK-042');
+		task.chat = 'stable-task-chat';
+
+		const result = await executor.compact(task, executorRunOptions);
+
+		assert.deepStrictEqual(result, { kind: 'success', targeting: 'session' });
+		assert.deepStrictEqual(targetUris, [sessionUriForId('stable-task-chat').toString()]);
+		assert.deepStrictEqual(commands.calls, []);
+		assert.ok(!commands.calls.some(({ command }) => command === CHAT_NEW_COMMAND));
+	});
+
+	test('reports a proven task-session compaction failure without falling back to New Chat', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands.push(CHAT_COMPACT_COMMAND);
+		const executor = new ChatSessionExecutor(commands, {}, {}, {
+			compact: async () => {
+				throw new Error('verified target compaction failed');
+			},
+		});
+
+		const result = await executor.compact(executorTask('TASK-043'), executorRunOptions);
+
+		assert.strictEqual(result.kind, 'failed');
+		assert.match(result.kind === 'failed' ? result.error : '', /verified target compaction failed/);
+		assert.strictEqual(result.kind === 'failed' ? result.diagnostic?.code : '', 'compact-command-failed');
+		assert.deepStrictEqual(commands.calls, []);
+		assert.ok(!commands.calls.some(({ command }) => command === CHAT_NEW_COMMAND));
+	});
+
+	test('serializes concurrent proven task-session compactions through the injection mutex', async () => {
+		const commands = new ControlledChatCommands();
+		commands.availableCommands.push(CHAT_COMPACT_COMMAND);
+		const gate = deferred<void>();
+		const targetUris: string[] = [];
+		const executor = new ChatSessionExecutor(commands, {}, {}, {
+			compact: async (uri) => {
+				targetUris.push(uri.toString());
+				await gate.promise;
+			},
+		});
+
+		const first = executor.compact(executorTask('TASK-044'), executorRunOptions);
+		await waitUntil(() => targetUris.length === 1);
+		const second = executor.compact(executorTask('TASK-045'), executorRunOptions);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.strictEqual(targetUris.length, 1);
+		gate.resolve();
+
+		assert.deepStrictEqual(await Promise.all([first, second]), [
+			{ kind: 'success', targeting: 'session' },
+			{ kind: 'success', targeting: 'session' },
+		]);
+		assert.strictEqual(targetUris.length, 2);
 	});
 });
 

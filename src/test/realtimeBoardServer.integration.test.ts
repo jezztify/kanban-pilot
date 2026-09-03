@@ -1,10 +1,13 @@
 import * as assert from 'assert';
 import * as http from 'node:http';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { BoardTaskSetHost } from '../board/boardPanel';
 import { formatProgressLine } from '../chat/progress';
+import type { FeedSourceSnapshot } from '../chat/transcriptTail';
 import { BoardSnapshot } from '../model/taskStore';
+import { WorkspaceActivityStore } from '../model/workspaceActivity';
 import { startRealtimeBoardServer } from '../http/realtimeBoardServer';
 
 interface Reply { status: number; body: string }
@@ -79,13 +82,24 @@ function dataMessages(streamBody: string): unknown[] {
 		.map((frame) => JSON.parse(frame.slice('data: '.length).trim()));
 }
 
-function fakeHost(snapshot: BoardSnapshot, sink: { actions: string[] }): BoardTaskSetHost {
+interface ActivitySources {
+	hook?: FeedSourceSnapshot;
+	transcript?: FeedSourceSnapshot;
+}
+
+function fakeHost(
+	snapshot: BoardSnapshot,
+	sink: { actions: string[] },
+	activity: ActivitySources = {},
+	workspaceActivity?: WorkspaceActivityStore,
+): BoardTaskSetHost {
 	// The endpoint only needs the host contract's transport-facing surface;
 	// the board's own reads are allowed to reject and are caught internally.
 	return {
 		ready: Promise.resolve(),
 		revision: 9,
 		activeSet: { id: 'default', name: 'Default', isDefault: true, directory: extensionUri },
+		workspaceActivity,
 		store: {
 			directory: extensionUri,
 			revision: snapshot.revision,
@@ -104,24 +118,31 @@ function fakeHost(snapshot: BoardSnapshot, sink: { actions: string[] }): BoardTa
 			listStaleCompletionCandidates: async () => [],
 			applyGatePolicies: async () => undefined,
 			dockTaskChat: () => undefined,
+			...(activity.hook ? {
+				hookSpool: { snapshotFor: () => activity.hook },
+			} : {}),
+			...(activity.transcript ? {
+				transcriptTail: { snapshotFor: () => activity.transcript },
+			} : {}),
 		},
 		listTaskSets: async () => [],
 		switchTaskSet: async () => undefined,
 		createTaskSet: async () => undefined,
 		renameTaskSet: async () => undefined,
+		setTaskSetHttpPort: async () => undefined,
 		deleteTaskSet: async () => undefined,
 		onDidChange: () => new vscode.Disposable(() => undefined),
 	} as unknown as BoardTaskSetHost;
 }
 
-function observableHost(snapshot: BoardSnapshot, sink: { actions: string[] }): {
+function observableHost(snapshot: BoardSnapshot, sink: { actions: string[] }, workspaceActivity?: WorkspaceActivityStore): {
 	host: BoardTaskSetHost;
 	emit(change: { revision: number; kind: string; taskId?: string; note?: string }): void;
 	subscriptionDisposals(): number;
 } {
 	let listener: ((change?: { revision: number; kind: string; taskId?: string; note?: string }) => void) | undefined;
 	let subscriptionDisposals = 0;
-	const host = fakeHost(snapshot, sink);
+	const host = fakeHost(snapshot, sink, {}, workspaceActivity);
 	return {
 		host: {
 			...host,
@@ -138,8 +159,107 @@ function observableHost(snapshot: BoardSnapshot, sink: { actions: string[] }): {
 	};
 }
 
+function browserSessionHost(
+	snapshots: Readonly<Record<string, BoardSnapshot>>,
+	sink: { actions: string[] },
+	created: BoardTaskSetHost[],
+): BoardTaskSetHost {
+	const sets = [
+		{ id: 'default', name: 'Default', isDefault: true, directory: extensionUri },
+		{ id: 'set-mobile', name: 'Mobile release', isDefault: false, directory: extensionUri },
+	];
+	let activeIndex = 0;
+	let listener: ((change?: { revision: number; kind: string; taskId?: string; note?: string }) => void) | undefined;
+	const base = fakeHost(snapshots.default, sink);
+	const sessionHost: BoardTaskSetHost = {
+		...base,
+		get activeSet() { return sets[activeIndex]; },
+		get store() {
+			return { ...base.store, directory: sets[activeIndex].directory, snapshot: async () => snapshots[sets[activeIndex].id] } as typeof base.store;
+		},
+		listTaskSets: async () => sets,
+		switchTaskSet: async (id) => {
+			const next = sets.findIndex((set) => set.id === id);
+			if (next < 0) { throw new Error('Task set was not found.'); }
+			activeIndex = next;
+			listener?.({ revision: 10 + activeIndex, kind: 'task-set' });
+		},
+		onDidChange: (next) => {
+			listener = next;
+			return new vscode.Disposable(() => { listener = undefined; });
+		},
+	};
+	created.push(sessionHost);
+	return sessionHost;
+}
+
 suite('Realtime board HTTP endpoint integration', () => {
 	const snapshot: BoardSnapshot = { revision: 4, malformed: [], columns: [] };
+
+	test('keeps independently bound task-set endpoints isolated', async () => {
+		const firstActions = { actions: [] as string[] };
+		const secondActions = { actions: [] as string[] };
+		const first = await startRealtimeBoardServer({
+			port: 0, token: 'first-token', extensionUri,
+			host: { ...fakeHost({ revision: 1, malformed: [], columns: [] }, firstActions), activeSet: { id: 'set-first', name: 'First', isDefault: false, directory: extensionUri } },
+		});
+		const second = await startRealtimeBoardServer({
+			port: 0, token: 'second-token', extensionUri,
+			host: { ...fakeHost({ revision: 2, malformed: [], columns: [] }, secondActions), activeSet: { id: 'set-second', name: 'Second', isDefault: false, directory: extensionUri } },
+		});
+		try {
+			assert.strictEqual(JSON.parse((await request(first.port, '/api/board', 'first-token')).body).activeTaskSet.id, 'set-first');
+			assert.strictEqual(JSON.parse((await request(second.port, '/api/board', 'second-token')).body).activeTaskSet.id, 'set-second');
+			await post(first.port, '/api/tasks/TASK-001/actions', 'first-token', { action: 'develop' });
+			assert.deepStrictEqual(firstActions.actions, ['TASK-001:develop']);
+			assert.deepStrictEqual(secondActions.actions, []);
+		} finally { first.dispose(); second.dispose(); }
+	});
+
+	test('projects registered task sets and keeps browser task-set switching session-local', async () => {
+		const snapshots = {
+			default: { revision: 1, malformed: [], columns: [] },
+			'set-mobile': { revision: 2, malformed: [], columns: [] },
+		};
+		const created: BoardTaskSetHost[] = [];
+		const rootHost = browserSessionHost(snapshots, { actions: [] }, created) as BoardTaskSetHost & {
+			createBrowserSessionHost(): Promise<BoardTaskSetHost>;
+		};
+		rootHost.createBrowserSessionHost = async () => browserSessionHost(snapshots, { actions: [] }, created);
+		const server = await startRealtimeBoardServer({ port: 0, token: 'test-token', extensionUri, host: rootHost });
+		const sessionFrom = (body: string): string => {
+			const session = /var session = "([^"]+)"/.exec(body)?.[1];
+			assert.ok(session, 'the served board carries its session id');
+			return session!;
+		};
+		try {
+			const first = sessionFrom((await request(server.port, '/?token=test-token')).body);
+			const firstPath = `/session/events?session=${first}&token=test-token`;
+			const initial = await stream(server.port, firstPath, (value) => value.includes('"activeTaskSetId":"default"'));
+			assert.match(initial, /"taskSets":\[\{"id":"default".*"id":"set-mobile"/);
+
+			const switchedPromise = stream(server.port, firstPath, (value) => value.includes('"activeTaskSetId":"set-mobile"'));
+			setTimeout(() => { void post(server.port, `/session/messages?session=${first}`, 'test-token', { type: 'taskSet/select', taskSetId: 'set-mobile' }); }, 50);
+			await switchedPromise;
+			assert.strictEqual(created[1].activeSet.id, 'set-mobile');
+
+			const second = sessionFrom((await request(server.port, '/?token=test-token')).body);
+			const secondState = await stream(server.port, `/session/events?session=${second}&token=test-token`, (value) => value.includes('"activeTaskSetId":"default"'));
+			assert.match(secondState, /"activeTaskSetName":"Default"/);
+			assert.strictEqual(created[2].activeSet.id, 'default');
+
+			const rejectedPromise = stream(
+				server.port,
+				firstPath,
+				(value) => (value.match(/"activeTaskSetId":"set-mobile"/g) ?? []).length >= 2,
+			);
+			setTimeout(() => { void post(server.port, `/session/messages?session=${first}`, 'test-token', { type: 'taskSet/select', taskSetId: 'set-missing' }); }, 50);
+			await rejectedPromise;
+			assert.strictEqual(created[1].activeSet.id, 'set-mobile');
+		} finally {
+			server.dispose();
+		}
+	});
 
 	test('routes REST actions through the existing manager and rejects anonymous callers', async () => {
 		const sink = { actions: [] as string[] };
@@ -191,10 +311,84 @@ suite('Realtime board HTTP endpoint integration', () => {
 			assert.match(page.body, /window\.acquireVsCodeApi = function/);
 			assert.match(page.body, /connect-src 'self'/);
 			// Bundled assets are rewritten to endpoint-served paths.
-			assert.match(page.body, /src="\/resource\/0\/dist\/mermaid-runtime\.js"/);
+			assert.match(page.body, /src="\/resource\/0\/dist\/mermaid-runtime\.js\?session=[^"]+"/);
 			assert.strictEqual(server.sessionCount, 1);
 		} finally {
 			server.dispose();
+		}
+	});
+
+	test('delivers the active task-set Workspace Activity through the canonical browser board', async () => {
+		const root = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-realtime-activity-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const workspaceActivity = new WorkspaceActivityStore(root, 'default');
+		const otherActivity = new WorkspaceActivityStore(root, 'set-other');
+		await workspaceActivity.append({
+			timestamp: '2026-09-04T07:00:00Z',
+			level: 'warning',
+			message: 'Default board activity',
+			taskId: 'TASK-007',
+			taskTitle: 'Default task',
+		});
+		await otherActivity.append({
+			timestamp: '2026-09-04T07:01:00Z',
+			level: 'error',
+			message: 'Other task-set activity',
+		});
+		const observable = observableHost(snapshot, { actions: [] }, workspaceActivity);
+		const server = await startRealtimeBoardServer({
+			port: 0,
+			token: 'test-token',
+			extensionUri,
+			host: observable.host,
+		});
+		const activityStateFrom = (body: string): { activeTaskSetId: string; records: unknown[] } | undefined => (
+			dataMessages(body).filter((message) => (
+				message !== null && typeof message === 'object' &&
+				(message as { type?: unknown }).type === 'workspaceActivity/state'
+			)).at(-1) as { activeTaskSetId: string; records: unknown[] } | undefined
+		);
+		try {
+			const page = await request(server.port, '/?token=test-token');
+			assert.match(page.body, /id="workspaceActivityToggle"/);
+			assert.match(page.body, /id="workspaceActivityModal"/);
+			const session = /var session = "([^"]+)"/.exec(page.body)?.[1];
+			assert.ok(session);
+			const sessionPath = `/session/events?session=${session}&token=test-token`;
+			const initial = await stream(
+				server.port,
+				sessionPath,
+				(value) => value.includes('"type":"workspaceActivity/state"') && value.includes('Default board activity'),
+			);
+			const initialState = activityStateFrom(initial);
+			assert.strictEqual(initialState?.activeTaskSetId, 'default');
+			assert.deepStrictEqual(initialState?.records, await workspaceActivity.readAll());
+			assert.doesNotMatch(initial, /Other task-set activity/);
+
+			const livePromise = stream(
+				server.port,
+				sessionPath,
+				(value) => value.includes('Live default board activity'),
+			);
+			await workspaceActivity.append({
+				timestamp: '2026-09-04T07:02:00Z',
+				level: 'success',
+				message: 'Live default board activity',
+			});
+			observable.emit({ revision: 10, kind: 'activity', taskId: 'TASK-007', note: 'activity appended' });
+			const live = await livePromise;
+			const liveState = activityStateFrom(live);
+			assert.strictEqual(liveState?.activeTaskSetId, 'default');
+			assert.deepStrictEqual(liveState?.records, await workspaceActivity.readAll());
+			assert.doesNotMatch(live, /Other task-set activity/);
+		} finally {
+			server.dispose();
+			try {
+				await vscode.workspace.fs.delete(root, { recursive: true });
+			} catch {
+				/* already gone */
+			}
 		}
 	});
 
@@ -269,11 +463,22 @@ suite('Realtime board HTTP endpoint integration', () => {
 			extensionUri,
 			host: observable.host,
 		});
+		const detailFrom = (body: string): {
+			task?: {
+				feed?: { note: string; source?: string; observedAt?: string }[];
+				activity?: { sources?: { source: string; status: string; freshness: string; latestEventAt?: string; latestObservedAt?: string }[] };
+			};
+		} | undefined => dataMessages(body).filter((message) => (
+			message !== null && typeof message === 'object' &&
+			(message as { type?: unknown }).type === 'task/detail'
+		)).at(-1) as {
+			task?: {
+				feed?: { note: string; source?: string; observedAt?: string }[];
+				activity?: { sources?: { source: string; status: string; freshness: string; latestEventAt?: string; latestObservedAt?: string }[] };
+			};
+		} | undefined;
 		const feedFrom = (body: string): string[] => {
-			const detail = dataMessages(body).filter((message) => (
-				message !== null && typeof message === 'object' &&
-				(message as { type?: unknown }).type === 'task/detail'
-			)).at(-1) as { task?: { feed?: { note: string }[] } } | undefined;
+			const detail = detailFrom(body);
 			assert.ok(detail?.task, 'the session stream should include a selected-task detail');
 			return detail?.task?.feed?.map((entry) => entry.note) ?? [];
 		};
@@ -300,6 +505,14 @@ suite('Realtime board HTTP endpoint integration', () => {
 			assert.match(initial, /^data: \{/m, 'session details use ordinary default data frames');
 			assert.doesNotMatch(initial, /^event:/m, 'session details do not introduce named event frames');
 			assert.deepStrictEqual(feedFrom(initial), ['first activity']);
+			const initialActivity = detailFrom(initial)?.task?.activity?.sources;
+			assert.deepStrictEqual(initialActivity?.map((source) => [source.source, source.status, source.freshness]), [
+				['progress', 'available', 'durable'],
+				['hook', 'disabled', 'unknown'],
+				['transcript', 'disabled', 'unknown'],
+			]);
+			assert.strictEqual(initialActivity?.[0]?.latestEventAt, '2026-08-26T04:31:07Z');
+			assert.strictEqual(initialActivity?.[0]?.latestObservedAt, undefined);
 
 			const livePromise = stream(
 				server.port,
@@ -319,8 +532,152 @@ suite('Realtime board HTTP endpoint integration', () => {
 				(value) => value.includes('"note":"second activity"'),
 			);
 			assert.deepStrictEqual(feedFrom(reconnect), ['first activity', 'second activity']);
+			const reconnectActivity = detailFrom(reconnect)?.task?.activity?.sources;
+			assert.deepStrictEqual(reconnectActivity?.map((source) => [source.source, source.status, source.freshness]), [
+				['progress', 'available', 'durable'],
+				['hook', 'disabled', 'unknown'],
+				['transcript', 'disabled', 'unknown'],
+			]);
+			assert.strictEqual(reconnectActivity?.[0]?.latestEventAt, '2026-08-26T04:31:08Z');
+			assert.strictEqual(reconnectActivity?.[0]?.latestObservedAt, undefined);
 		} finally {
 			server.dispose();
+		}
+	});
+
+	test('withholds optional activity remotely until the existing sharing gate is enabled', async () => {
+		const task = {
+			setId: 'default',
+			id: 'TASK-008',
+			title: 'Remote activity gate',
+			type: 'feature' as const,
+			state: 'in-progress' as const,
+			status: 'running' as const,
+			chatResetRequired: false,
+			sections: { Request: '', Refined: '', Scope: '', Log: '' },
+			body: '',
+		};
+		const progress = formatProgressLine({
+			runId: 'r-progress', taskId: task.id, at: '2026-08-26T04:31:07Z', note: 'durable summary',
+		});
+		task.sections.Log = progress;
+		task.body = ['## Request', '', '## Refined', '', '## Scope', '', '## Log', progress].join('\n');
+		const observedAt = new Date(Date.now() - 1_000).toISOString();
+		const hookNote = 'near-real-time hook row';
+		const transcriptNote = 'delayed transcript row';
+		const sources: ActivitySources = {
+			hook: {
+				availability: 'configured',
+				entries: [{ at: observedAt, note: hookNote, source: 'hook', observedAt }],
+				latestEventAt: observedAt,
+				latestObservedAt: observedAt,
+			},
+			transcript: {
+				availability: 'configured',
+				entries: [{ at: observedAt, note: transcriptNote, source: 'transcript', observedAt }],
+				latestEventAt: observedAt,
+				latestObservedAt: observedAt,
+			},
+		};
+		const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+		const restore = async (): Promise<void> => {
+			await cfg.update('chat.hookFeed', undefined, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.transcriptFeed', undefined, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.transcriptFeedRemote', undefined, vscode.ConfigurationTarget.Global);
+		};
+		const start = async (): Promise<{ server: Awaited<ReturnType<typeof startRealtimeBoardServer>>; sessionPath: string }> => {
+			const host = fakeHost(snapshot, { actions: [] }, sources);
+			const store = host.store as unknown as {
+				readAll: () => Promise<{ tasks: typeof task[]; malformed: string[] }>;
+			};
+			store.readAll = async () => ({ tasks: [task], malformed: [] });
+			const server = await startRealtimeBoardServer({
+				port: 0,
+				token: 'test-token',
+				extensionUri,
+				host,
+			});
+			const page = await request(server.port, '/?token=test-token');
+			const session = /var session = "([^"]+)"/.exec(page.body)?.[1];
+			assert.ok(session);
+			return { server, sessionPath: `/session/events?session=${session}&token=test-token` };
+		};
+		const detailFrom = (body: string): {
+			task?: {
+				feed?: { note: string; source?: string }[];
+				activity?: { sources?: { source: string; status: string; availability: string; freshness: string; latestObservedAt?: string }[] };
+			};
+		} | undefined => dataMessages(body).filter((message) => (
+			message !== null && typeof message === 'object' &&
+			(message as { type?: unknown }).type === 'task/detail'
+		)).at(-1) as {
+			task?: {
+				feed?: { note: string; source?: string }[];
+				activity?: { sources?: { source: string; status: string; availability: string; freshness: string; latestObservedAt?: string }[] };
+			};
+		} | undefined;
+		try {
+			await cfg.update('chat.hookFeed', true, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.transcriptFeed', true, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.transcriptFeedRemote', false, vscode.ConfigurationTarget.Global);
+			const withheld = await start();
+			try {
+				const streamPromise = stream(withheld.server.port, withheld.sessionPath, (value) => value.includes('durable summary'));
+				setTimeout(() => {
+					void post(withheld.server.port, withheld.sessionPath.split('&')[0].replace('/session/events?', '/session/messages?'), 'test-token', {
+						type: 'task/select', taskId: task.id,
+					});
+				}, 50);
+				const body = await streamPromise;
+				const detail = detailFrom(body);
+				assert.deepStrictEqual(detail?.task?.feed?.map((entry) => entry.note), ['durable summary']);
+				assert.deepStrictEqual(detail?.task?.activity?.sources?.slice(1).map((source) => [source.source, source.status, source.availability]), [
+					['hook', 'disabled', 'not-shared'],
+					['transcript', 'disabled', 'not-shared'],
+				]);
+				assert.strictEqual(body.includes(hookNote), false);
+				assert.strictEqual(body.includes(transcriptNote), false);
+			} finally {
+				withheld.server.dispose();
+			}
+
+			await cfg.update('chat.transcriptFeedRemote', true, vscode.ConfigurationTarget.Global);
+			const shared = await start();
+			try {
+				const streamPath = shared.sessionPath;
+				const streamPromise = stream(shared.server.port, streamPath, (value) => value.includes(transcriptNote));
+				setTimeout(() => {
+					void post(shared.server.port, streamPath.split('&')[0].replace('/session/events?', '/session/messages?'), 'test-token', {
+						type: 'task/select', taskId: task.id,
+					});
+				}, 50);
+				const body = await streamPromise;
+				const detail = detailFrom(body);
+				assert.deepStrictEqual(detail?.task?.feed?.map((entry) => [entry.note, entry.source]), [
+					['durable summary', 'progress'],
+					[hookNote, 'hook'],
+					[transcriptNote, 'transcript'],
+				]);
+				const activity = detail?.task?.activity?.sources;
+				assert.deepStrictEqual(activity?.slice(1).map((source) => [source.source, source.status, source.freshness]), [
+					['hook', 'available', 'current'],
+					['transcript', 'available', 'delayed'],
+				]);
+				assert.strictEqual(activity?.[1]?.latestObservedAt, observedAt);
+				assert.strictEqual(activity?.[2]?.latestObservedAt, observedAt);
+
+				const reconnect = await stream(shared.server.port, streamPath, (value) => value.includes(transcriptNote));
+				const reconnectDetail = detailFrom(reconnect);
+				assert.deepStrictEqual(reconnectDetail?.task?.feed?.map((entry) => entry.note), [
+					'durable summary', hookNote, transcriptNote,
+				]);
+				assert.strictEqual(reconnectDetail?.task?.activity?.sources?.[1]?.latestObservedAt, observedAt);
+				assert.strictEqual(reconnectDetail?.task?.activity?.sources?.[2]?.latestObservedAt, observedAt);
+			} finally {
+				shared.server.dispose();
+			}
+		} finally {
+			await restore();
 		}
 	});
 

@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 export interface TaskSet {
 	id: string;
 	name: string;
+	httpPort?: number;
 	directory: vscode.Uri;
 	isDefault: boolean;
 }
@@ -14,6 +15,7 @@ export const DEFAULT_TASK_SET_NAME = 'Default';
 interface StoredTaskSet {
 	id: string;
 	name: string;
+	httpPort?: number;
 }
 
 interface RegistryDocument {
@@ -31,7 +33,9 @@ export class TaskSetError extends Error {
 			| 'not-found'
 			| 'default-set'
 			| 'not-empty'
-			| 'active-run',
+			| 'active-run'
+			| 'invalid-port'
+			| 'duplicate-port',
 		message: string,
 	) {
 		super(message);
@@ -156,7 +160,9 @@ export class TaskSetRegistry {
 				if (sets.some((set) => set.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
 					continue;
 				}
-				sets.push({ id: value.id, name });
+				const httpPort = typeof value.httpPort === 'number' && Number.isInteger(value.httpPort) && value.httpPort >= 0 && value.httpPort <= 65535
+					? value.httpPort : undefined;
+				sets.push({ id: value.id, name, ...(httpPort === undefined ? {} : { httpPort }) });
 				seen.add(value.id);
 			}
 		}
@@ -179,6 +185,7 @@ export class TaskSetRegistry {
 		return {
 			id: stored.id,
 			name: stored.name,
+			...(stored.httpPort === undefined ? {} : { httpPort: stored.httpPort }),
 			directory: isDefault
 				? this.defaultDirectory
 				: vscode.Uri.joinPath(this.additionalSetsUri, stored.id, 'tasks'),
@@ -294,6 +301,26 @@ export class TaskSetRegistry {
 			document.activeSetId = id;
 			await this.write(document);
 			return this.taskSetFromStored(this.requireSet(id));
+		});
+	}
+
+	/** Sets or clears one task set's endpoint port without changing other sets. */
+	async setHttpPort(id: string, port: number | undefined): Promise<TaskSet> {
+		return this.mutate(async (document) => {
+			const stored = this.requireSet(id);
+			if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) {
+				throw new TaskSetError('invalid-port', 'Task-set HTTP port must be an integer from 0 to 65535; use 0 for a random available port.');
+			}
+			if (port !== undefined && port !== 0 && document.sets.some((set) => set.id !== id && set.httpPort === port)) {
+				throw new TaskSetError('duplicate-port', `HTTP port ${port} is already assigned to another task set.`);
+			}
+			if (port === undefined) {
+				delete stored.httpPort;
+			} else {
+				stored.httpPort = port;
+			}
+			await this.write(document);
+			return this.taskSetFromStored(stored);
 		});
 	}
 
