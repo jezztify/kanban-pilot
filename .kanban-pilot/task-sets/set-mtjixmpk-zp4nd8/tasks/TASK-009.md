@@ -2,11 +2,11 @@
 id: TASK-009
 title: Task Tree Modal: Visual clarity is an issue
 type: bug
-state: in-progress
-status: blocked
-position: 3
+state: done
+status: idle
+position: 9
 created: 2026-09-03T03:08:35Z
-updated: 2026-09-03T03:28:00Z
+updated: 2026-09-04T04:31:30Z
 chat: kanban-pilot-set-mtjixmpk-zp4nd8-TASK-009
 copilot_session_id: a998a8d7-82b2-49e8-88c5-c347f872ef73
 scope_hash: 60ab595
@@ -55,3 +55,6 @@ Acceptance criteria:
 - run:rana9tg task:TASK-009 stage:develop result:ok note:"2026-09-03T03:27:26Z — develop completed: expanded Task Tree layout, Mermaid sizing, 4x zoom, zoom and pan paths, responsive containment, accessibility coverage, and focused verification; full suite retains unrelated BoardPanel and RunManager failures"
 - audit:status-change at:2026-09-03T03:28:00Z task:TASK-009 from:running to:blocked action:receipt run:rana9tg outcome:blocked note:"Status changed from running to blocked via receipt."
 - audit:activity-finish at:2026-09-03T03:28:00Z task:TASK-009 stage:develop action:receipt run:rana9tg outcome:blocked note:"Develop completion requires implementation evidence with changed files and verification."
+- audit:state-change at:2026-09-04T04:31:24Z task:TASK-009 from:in-progress to:validation action:move note:"State changed from in-progress to validation via move."
+- audit:status-change at:2026-09-04T04:31:24Z task:TASK-009 from:blocked to:idle action:move note:"Status changed from blocked to idle via move."
+- audit:state-change at:2026-09-04T04:31:30Z task:TASK-009 from:validation to:done action:move note:"State changed from validation to done via move."

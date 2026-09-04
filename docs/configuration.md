@@ -40,6 +40,10 @@ The board's outcome callout separates four states that can otherwise look simila
 - A **Blocked** task has stopped because host approval or another host action is required. Its
 	detail explains the reason when available and offers the state-machine retry action for that
 	column.
+	For Develop, a chat `PASSED` message alone is not acceptance. The task file's same-run
+	receipt, implementation-evidence entry, and current state are authoritative; a manager
+	correction for missing or invalid evidence remains blocked and supplies the reason shown by
+	the card and detail view.
 - A **Failed** task has a failed run or receipt. Its detail shows the failure reason when it can be
 	recovered from the audit or receipt history and offers the legal retry action.
 - A **Recovery Available** result is a successful receipt from an older run that passed the
@@ -51,6 +55,29 @@ If the task changes between display and the click, the board reports that Apply 
 applied and refreshes the card and open detail. An active-run conflict, missing receipt, pending
 outcome, or stale candidate is therefore an explicit recovery result rather than an apparently
 successful transition.
+
+## Understand activity source state
+
+The task detail Activity section keeps three bounded sources visibly separate:
+
+- **Durable progress** contains coarse summaries parsed from `## Log` and is labeled **Recorded
+	in task log**. It is durable evidence of a recorded summary, not proof that a run is currently
+	active or complete.
+- **Near-real-time hook** contains structural events from the local hook spool. Its event time is
+	distinct from the time the extension observed it. The board labels a recent observation
+	**Observed recently** and one older than 30 seconds **Last observation is stale**; it does not
+	infer task state from either label.
+- **Delayed transcript** contains only structural rows from the read-only Copilot transcript tail.
+	It is always labeled as delayed, and its event and observed timestamps remain separate because
+	transcript flushes can lag the event.
+
+For each optional source, the summary distinguishes **Disabled**, **Unavailable**, **Enabled ·
+empty**, and **Available**. Missing or unreadable local inputs are unavailable; enabled sources
+with no rows are empty. Enabling the editor feed does not share it with a browser. The existing
+`chat.transcriptFeedRemote` setting is a second, explicit opt-in for browser sharing, and a
+browser that lacks it receives no hook/transcript rows or timestamps. All surfaces receive only
+bounded structural summaries: no prompts, assistant/reasoning text, tool arguments/results,
+credentials, tokens, absolute paths, or sensitive command/query/file-target content.
 
 ## Tune it in Settings
 
@@ -75,6 +102,30 @@ chat run.
 Gate changes take effect immediately. Chat, tools, model, and run settings apply to the *next*
 run, so changing them never disturbs something already running. Changing the tasks folder or the
 open-on-startup option shows a reload notice, because those are read when the extension starts.
+
+## Automatic chat compaction
+
+`chat.autoCompact` is opt-in and delegates the threshold decision to Copilot's native background
+compaction. When enabled, `chat.autoCompactThreshold` is a ratio greater than `0` and at most `1`:
+`0.8` means 80% of the active model context window. Kanban Pilot does not reconstruct usage from
+transcripts, hook events, or completed-turn token totals, and it does not provide a live usage
+dashboard in this feature.
+
+The native settings are experimental and remain Copilot-owned:
+`github.copilot.chat.summarizeAgentConversationHistory.enabled` and
+`github.copilot.chat.summarizeAgentConversationHistoryThreshold`. Kanban Pilot writes missing
+native values at workspace scope only after its setting is enabled. An explicit Copilot value is
+never silently overwritten; a conflicting or unavailable value is reported as unsupported while
+normal task execution remains usable. Copilot also accepts an absolute-token threshold, but
+Kanban Pilot intentionally accepts ratios only.
+
+The currently installed Copilot builds expose `github.copilot.chat.compact` as a focus-only
+command. It has no supported `vscode-chat-session://local` target argument, so Kanban Pilot never
+invokes it and never risks compacting an unrelated focused chat. Explicit task-session compaction
+will remain unavailable until Copilot exposes a supported target contract; native automatic
+compaction is still used when the two native settings are available. Availability is checked at
+runtime because the feature is experimental and no minimum Copilot version is guaranteed by the
+Kanban Pilot `^1.125.0` VS Code engine range.
 
 ## How many tasks run at once
 
@@ -108,9 +159,11 @@ for this coordination, and adding one would not provide workspace or chat-sessio
 | `chat.sessionPrefix` | `kanban-pilot-` | Prefix for each task's private session id. |
 | `chat.closeTabOnDone` | `true` | Close a task's chat tab when it's finished (the session is kept). |
 | `chat.resetOnApprove` | `false` | Clear the task's conversation at the Approve gate. |
-| `chat.hookFeed` | `false` | Show structural Copilot hook activity as it happens. Requires the manually configured receiver described in [Optional Copilot hook feed](copilot-hook-feed.md). |
-| `chat.transcriptFeed` | `false` | Show Copilot session activity from its delayed transcript flushes. |
-| `chat.transcriptFeedRemote` | `false` | Also send observed hook or transcript activity to the browser board. Requires the existing authenticated HTTP endpoint and this separate remote opt-in; its token-bearing share URL is covered by the security warning in [Real-time HTTP endpoint](http-endpoint.md). |
+| `chat.hookFeed` | `false` | Show the optional near-real-time structural hook source. The detail summary reports whether its local spool is available, empty, missing, or unreadable, and stale observations remain visibly stale. Requires the manually configured receiver described in [Optional Copilot hook feed](copilot-hook-feed.md). |
+| `chat.transcriptFeed` | `false` | Show the optional delayed structural transcript source. Transcript rows include separate event and observed times and never mirror Copilot content. |
+| `chat.transcriptFeedRemote` | `false` | Also share the bounded structural hook/transcript activity projection with the browser board. This is a separate remote opt-in; otherwise the browser sees the sources as not shared and receives no optional rows or timestamps. The authenticated endpoint and its token-bearing share URL are covered by [Real-time HTTP endpoint](http-endpoint.md). |
+| `chat.autoCompact` | `false` | Opt in to Copilot's experimental native automatic compaction. Focus-only compact commands are not used without a supported task-session target. |
+| `chat.autoCompactThreshold` | `0.8` | Ratio greater than 0 and at most 1 for Copilot native compaction; `0.8` means 80% of the model context window. |
 | `chat.agentDirectories` | `[]` | Ordered additional custom-agent directories. Enter one absolute, `~/`-relative, or workspace-relative path per line; this complements VS Code's `chat.agentFilesLocations`. |
 | `chat.toolsExclude` | `["memory", "resolveMemoryFileUri"]` | Tools blocked on every stage. |
 | `refine.toolsInclude` | `[]` | Optional allowlist of tools available during Refine. |

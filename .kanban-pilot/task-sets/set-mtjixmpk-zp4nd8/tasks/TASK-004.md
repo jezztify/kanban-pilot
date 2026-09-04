@@ -2,12 +2,12 @@
 id: TASK-004
 title: Make workflow outcomes and recovery next steps visible
 type: feature
-state: in-progress
-status: blocked
+state: done
+status: idle
 parent_task: TASK-003
-position: 1
+position: 3
 created: 2026-09-03T02:44:07Z
-updated: 2026-09-03T04:43:07Z
+updated: 2026-09-04T02:25:22Z
 chat: kanban-pilot-set-mtjixmpk-zp4nd8-TASK-004
 copilot_session_id: b82fc7ca-24c9-421a-ab15-569bf650ead5
 scope_hash: faa398d
@@ -70,3 +70,6 @@ The board currently exposes the task column and short runtime status, while the 
 - run:rhlswn2 task:TASK-004 stage:develop result:ok note:"2026-09-03T04:43:00Z — implemented visible outcome and recovery guidance across board cards and task detail with accessible host-result notices; focused board tests, build, and lint pass; the full suite retains 13 unrelated RunManager failures"
 - implementation-evidence run:rhlswn2 files:"src/board/boardPanel.ts,src/test/boardPanel.test.ts,docs/board-guide.md,docs/configuration.md" verify:"npm run compile-tests, npm run compile, npm run lint, BoardPanel Settings suite 36 passing"
 - audit:activity-finish at:2026-09-03T04:43:07Z task:TASK-004 stage:develop action:late-receipt run:rhlswn2 outcome:blocked correction:true note:"Develop completion requires implementation evidence with changed files and verification."
+- audit:status-change at:2026-09-03T06:40:48Z task:TASK-004 from:blocked to:idle action:late-receipt run:rhlswn2 outcome:ok note:"Status changed from blocked to idle via late-receipt."
+- audit:activity-finish at:2026-09-03T06:40:48Z task:TASK-004 stage:develop action:late-receipt run:rhlswn2 outcome:ok correction:true note:"2026-09-03T04:43:00Z — implemented visible outcome and recovery guidance across board cards and task detail with accessible host-result notices; focused board tests, build, and lint pass; the full suite retains 13 unrelated RunManager failures"
+- audit:state-change at:2026-09-04T02:25:22Z task:TASK-004 from:in-progress to:done action:move note:"State changed from in-progress to done via move."

@@ -12,9 +12,8 @@ import {
 } from '../chat/agentNames';
 import { RunManager } from '../chat/runManager';
 import { DEFAULT_FEED_LIMIT, mergeFeedEntries } from '../chat/transcriptTail';
-import type { FeedEntry } from '../chat/transcriptTail';
+import type { FeedEntry, FeedSourceSnapshot } from '../chat/transcriptTail';
 import { suppressDuplicatedTailEntries } from '../chat/hookSpool';
-import type { TranscriptFeedEntry } from '../chat/transcriptTail';
 import type { StaleCompletionCandidate } from '../chat/runManager';
 import type { Stage } from '../chat/receipt';
 import { parseReceipts } from '../chat/receipt';
@@ -37,6 +36,11 @@ import { gateForId, GATE_CATALOG } from '../model/gates';
 import { parseAuditEvents } from '../model/taskLog';
 import { TaskSet } from '../model/taskSets';
 import { BoardSnapshot, TaskStore } from '../model/taskStore';
+import type {
+  WorkspaceActivityInput,
+  WorkspaceActivityRecord,
+  WorkspaceActivityStore,
+} from '../model/workspaceActivity';
 import { deleteTask } from './actions';
 import { BoardSurface, WebviewPanelSurface } from './boardSurface';
 import { TASK_ACTIONS, TaskAction } from './stateMachine';
@@ -514,10 +518,17 @@ function terminalEvidenceFor(task: OutcomeGuidanceTask): {
       (!terminal?.stage || candidate.stage === terminal.stage) &&
       (!terminal?.runId || candidate.runId === terminal.runId)
     ));
+  const correctionReason = terminal && (
+    terminal.correction === true ||
+    terminal.provisional === true ||
+    terminal.outcome !== 'ok' && terminal.outcome !== receipt?.result
+  )
+    ? terminal.note
+    : undefined;
   return {
     stage: terminal?.stage ?? receipt?.stage,
     runId: terminal?.runId ?? receipt?.runId,
-    reason: receipt?.note ?? terminal?.note,
+    reason: correctionReason ?? receipt?.note ?? terminal?.note,
   };
 }
 
@@ -692,13 +703,212 @@ export interface BoardTaskSetChange {
   note?: string;
 }
 
-/** Most activity rows shown for a task, across both feed sources. */
+/** Most activity rows shown for a task, across all feed sources. */
 const ACTIVITY_FEED_LIMIT = DEFAULT_FEED_LIMIT;
+const HOOK_STALE_AFTER_MS = 30_000;
+
+export type ActivitySource = 'progress' | 'hook' | 'transcript';
+export type ActivitySourceStatus = 'disabled' | 'unavailable' | 'empty' | 'available';
+export type ActivityFreshness = 'durable' | 'current' | 'stale' | 'delayed' | 'unknown';
+export type ActivitySourceAvailability = FeedSourceSnapshot['availability'] | 'not-shared';
+
+/** Safe provenance and freshness state rendered for one activity source. */
+export interface ActivitySourceView {
+  source: ActivitySource;
+  label: string;
+  status: ActivitySourceStatus;
+  statusLabel: string;
+  availability: ActivitySourceAvailability;
+  freshness: ActivityFreshness;
+  freshnessLabel: string;
+  delayed: boolean;
+  entryCount: number;
+  description: string;
+  latestEventAt?: string;
+  latestObservedAt?: string;
+}
+
+/** Shared activity metadata for editor and browser task-detail projections. */
+export interface ActivityView {
+  sources: ActivitySourceView[];
+}
+
+export interface ActivityViewOptions {
+  hookEnabled: boolean;
+  transcriptEnabled: boolean;
+  remoteAllowed: boolean;
+  now?: number;
+}
+
+const ACTIVITY_SOURCE_LABELS: Record<ActivitySource, string> = {
+  progress: 'Durable progress',
+  hook: 'Near-real-time hook',
+  transcript: 'Delayed transcript',
+};
+
+const ACTIVITY_STATUS_LABELS: Record<ActivitySourceStatus, string> = {
+  disabled: 'Disabled',
+  unavailable: 'Unavailable',
+  empty: 'Enabled · empty',
+  available: 'Available',
+};
+
+const ACTIVITY_FRESHNESS_LABELS: Record<ActivityFreshness, string> = {
+  durable: 'Recorded in task log',
+  current: 'Observed recently',
+  stale: 'Last observation is stale',
+  delayed: 'Delayed observation',
+  unknown: 'Freshness unavailable',
+};
+
+/** Returns the stable user-facing label for one safe activity source id. */
+export function activitySourceLabel(source: ActivitySource): string {
+  return ACTIVITY_SOURCE_LABELS[source];
+}
+
+function activityFreshnessForHook(snapshot: FeedSourceSnapshot, now: number): ActivityFreshness {
+  if (snapshot.entries.length === 0 || !snapshot.latestObservedAt) {
+    return 'unknown';
+  }
+  const observedAt = Date.parse(snapshot.latestObservedAt);
+  if (!Number.isFinite(observedAt)) {
+    return 'unknown';
+  }
+  return now - observedAt <= HOOK_STALE_AFTER_MS ? 'current' : 'stale';
+}
+
+function latestEventAtOf(entries: readonly FeedEntry[]): string | undefined {
+  return entries.reduce<string | undefined>((latest, entry) => (
+    !latest || Date.parse(entry.at) > Date.parse(latest) ? entry.at : latest
+  ), undefined);
+}
+
+function sourceView(
+  source: ActivitySource,
+  snapshot: FeedSourceSnapshot,
+  enabled: boolean,
+  remoteAllowed: boolean,
+  now: number,
+): ActivitySourceView {
+  const label = activitySourceLabel(source);
+  const delayed = source === 'transcript';
+  if (!enabled) {
+    return {
+      source,
+      label,
+      status: 'disabled',
+      statusLabel: ACTIVITY_STATUS_LABELS.disabled,
+      availability: 'not-configured',
+      freshness: 'unknown',
+      freshnessLabel: ACTIVITY_FRESHNESS_LABELS.unknown,
+      delayed,
+      entryCount: 0,
+      description: `${label} observations are disabled in settings.`,
+    };
+  }
+  if (!remoteAllowed) {
+    return {
+      source,
+      label,
+      status: 'disabled',
+      statusLabel: ACTIVITY_STATUS_LABELS.disabled,
+      availability: 'not-shared',
+      freshness: 'unknown',
+      freshnessLabel: ACTIVITY_FRESHNESS_LABELS.unknown,
+      delayed,
+      entryCount: 0,
+      description: `${label} observations are enabled locally but are not shared with this browser.`,
+    };
+  }
+
+  if (snapshot.availability !== 'configured') {
+    const reason = snapshot.availability === 'missing'
+      ? 'The source is not present.'
+      : snapshot.availability === 'unreadable'
+        ? 'The source could not be read.'
+        : 'The source is not configured.';
+    return {
+      source,
+      label,
+      status: 'unavailable',
+      statusLabel: ACTIVITY_STATUS_LABELS.unavailable,
+      availability: snapshot.availability,
+      freshness: 'unknown',
+      freshnessLabel: ACTIVITY_FRESHNESS_LABELS.unknown,
+      delayed,
+      entryCount: 0,
+      description: `${label} observations are unavailable. ${reason}`,
+    };
+  }
+
+  const entryCount = snapshot.entries.length;
+  const status: ActivitySourceStatus = entryCount ? 'available' : 'empty';
+  const freshness = source === 'progress'
+    ? 'durable'
+    : source === 'hook'
+      ? activityFreshnessForHook(snapshot, now)
+      : 'delayed';
+  let description: string;
+  if (source === 'progress') {
+    description = entryCount
+      ? 'Durable progress summaries are recorded in the task log.'
+      : 'No durable progress summaries have been recorded for this task.';
+  } else if (source === 'hook') {
+    description = entryCount
+      ? freshness === 'stale'
+        ? 'Near-real-time hook observations are available, but the last one is stale.'
+        : 'Near-real-time hook observations are available.'
+      : 'Hook observations are enabled and available, but none have been recorded for this task.';
+  } else {
+    description = entryCount
+      ? 'Delayed transcript observations are available; they can arrive after the event occurred.'
+      : 'Transcript observations are enabled and available, but none have arrived for this task. They can be delayed.';
+  }
+  return {
+    source,
+    label,
+    status,
+    statusLabel: ACTIVITY_STATUS_LABELS[status],
+    availability: snapshot.availability,
+    freshness,
+    freshnessLabel: ACTIVITY_FRESHNESS_LABELS[freshness],
+    delayed,
+    entryCount,
+    description,
+    ...(snapshot.latestEventAt ? { latestEventAt: snapshot.latestEventAt } : {}),
+    ...(snapshot.latestObservedAt ? { latestObservedAt: snapshot.latestObservedAt } : {}),
+  };
+}
+
+/** Builds the shared, safe activity status projection used by both surfaces. */
+export function activityViewFor(
+  progress: readonly FeedEntry[],
+  hook: FeedSourceSnapshot,
+  transcript: FeedSourceSnapshot,
+  options: ActivityViewOptions,
+): ActivityView {
+  const now = options.now ?? Date.now();
+  const boundedProgress = progress.slice(-ACTIVITY_FEED_LIMIT);
+  const latestProgressEventAt = latestEventAtOf(boundedProgress);
+  const progressSnapshot: FeedSourceSnapshot = {
+    availability: 'configured',
+    entries: [...boundedProgress],
+    ...(latestProgressEventAt ? { latestEventAt: latestProgressEventAt } : {}),
+  };
+  return {
+    sources: [
+      sourceView('progress', progressSnapshot, true, true, now),
+      sourceView('hook', hook, options.hookEnabled, options.remoteAllowed, now),
+      sourceView('transcript', transcript, options.transcriptEnabled, options.remoteAllowed, now),
+    ],
+  };
+}
 
 export interface BoardTaskSetHost {
   readonly ready: Promise<void>;
   readonly revision?: number;
   readonly store: TaskStore;
+  readonly workspaceActivity?: WorkspaceActivityStore;
   readonly runManager: RunManager;
   readonly activeSet: TaskSet;
   listTaskSets(): Promise<TaskSet[]>;
@@ -735,6 +945,7 @@ export interface SettingDefinition {
   defaultValue: unknown;
   options?: readonly string[];
   minimum?: number;
+  maximum?: number;
   integer?: boolean;
   maxLength?: number;
   requiresReload?: boolean;
@@ -798,6 +1009,24 @@ export const SETTING_DEFINITIONS: readonly SettingDefinition[] = [
     label: 'Reset chat on Approve',
     description: "Clear the task's conversation at the Approve gate before development continues.",
     defaultValue: false,
+  },
+  {
+    key: 'chat.autoCompact',
+    category: 'chat',
+    kind: 'boolean',
+    label: 'Enable automatic chat compaction',
+    description: "Delegate context-window compaction to Copilot's native experimental setting; no transcript or token counter is used. Focus-only compact commands are not used without a supported task-session target.",
+    defaultValue: false,
+  },
+  {
+    key: 'chat.autoCompactThreshold',
+    category: 'chat',
+    kind: 'number',
+    label: 'Automatic compaction threshold',
+    description: 'Context-window ratio for Copilot native compaction. Use 0.8 for 80%; must be greater than 0 and at most 1. Copilot absolute-token thresholds are not used.',
+    defaultValue: 0.8,
+    minimum: 0,
+    maximum: 1,
   },
   {
     key: 'chat.agentDirectories',
@@ -901,6 +1130,8 @@ export const ALL_KANBAN_SETTING_KEYS: readonly string[] = [
   'chat.sessionPrefix',
   'chat.closeTabOnDone',
   'chat.resetOnApprove',
+  'chat.autoCompact',
+  'chat.autoCompactThreshold',
   'chat.agentDirectories',
   'refine.toolsInclude',
   'chat.toolsExclude',
@@ -997,6 +1228,9 @@ export function validateSettingValue(key: unknown, rawValue: unknown): SettingVa
       }
       if (definition.minimum !== undefined && rawValue <= definition.minimum) {
         return { ok: false, error: `${definition.label} must be greater than ${definition.minimum}.` };
+      }
+      if (definition.maximum !== undefined && rawValue > definition.maximum) {
+        return { ok: false, error: `${definition.label} must be at most ${definition.maximum}.` };
       }
       return { ok: true, value: rawValue };
     case 'array':
@@ -1231,6 +1465,10 @@ export class BoardPanel {
 		this.disposables.push(
       this.surface.onDidReceiveMessage((message) => this.onMessage(message as InMessage)),
       this.host.onDidChange((change) => {
+        if (change?.kind === 'activity') {
+          void this.pushWorkspaceActivity();
+          return;
+        }
         if (change?.kind === 'task') {
           void this.pushBoard();
           if (change.taskId === this.selectedTaskId) {
@@ -1239,7 +1477,7 @@ export class BoardPanel {
           return;
         }
         if (change?.kind === 'attachment' || change?.kind === 'run') {
-          if (change.taskId === this.selectedTaskId) {
+          if (!change.taskId || change.taskId === this.selectedTaskId) {
             void this.pushDetail(true);
           }
           return;
@@ -1560,33 +1798,34 @@ export class BoardPanel {
 
       case 'pending/apply':
         if (typeof message.taskId === 'string') {
-          let noticeLevel: 'success' | 'warning' | 'error' | undefined;
-          let noticeMessage: string | undefined;
+          let activityLevel: 'warning' | 'error' | undefined;
+          let activityMessage: string | undefined;
           try {
             const result = await this.runManager.applyPendingOutcome(message.taskId);
-            if (result.kind === 'applied') {
-              noticeLevel = 'success';
-              noticeMessage = `Applied ${result.gate} pending completion.`;
-            } else if (result.kind === 'no-pending') {
-              noticeLevel = 'warning';
-              noticeMessage = 'Pending completion was not applied because no pending outcome is available.';
+            if (result.kind === 'no-pending') {
+              activityLevel = 'warning';
+              activityMessage = 'Pending completion was not applied because no pending outcome is available.';
             } else if (result.kind === 'not-found') {
-              noticeLevel = 'warning';
-              noticeMessage = `Pending completion was not applied because ${message.taskId} was not found.`;
-            } else {
-              noticeLevel = 'warning';
-              noticeMessage = 'Pending completion was not applied because the task or receipt changed.';
+              activityLevel = 'warning';
+              activityMessage = `Pending completion was not applied because ${message.taskId} was not found.`;
+            } else if (result.kind === 'stale') {
+              activityLevel = 'warning';
+              activityMessage = 'Pending completion was not applied because the task or receipt changed.';
             }
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
-            noticeLevel = 'error';
-            noticeMessage = `Pending completion could not be applied: ${detail}`;
-            void vscode.window.showErrorMessage(noticeMessage);
+            activityLevel = 'error';
+            activityMessage = `Pending completion could not be applied: ${detail}`;
+            void vscode.window.showErrorMessage(activityMessage);
           } finally {
             await this.pushAll();
           }
-          if (noticeLevel && noticeMessage) {
-            await this.reportBoardNotice(noticeLevel, noticeMessage);
+          if (activityLevel && activityMessage) {
+            await this.recordWorkspaceActivity({
+              level: activityLevel,
+              message: activityMessage,
+              taskId: message.taskId,
+            });
           }
         }
         return;
@@ -1608,7 +1847,11 @@ export class BoardPanel {
         );
         if (!candidate) {
           await this.pushAll();
-          await this.reportBoardNotice('warning', 'Recovery was not applied because the selected stale completion is no longer eligible.');
+          await this.recordWorkspaceActivity({
+            level: 'warning',
+            message: 'Recovery was not applied because the selected stale completion is no longer eligible.',
+            taskId: message.taskId,
+          });
           return;
         }
 
@@ -1621,8 +1864,8 @@ export class BoardPanel {
           return;
         }
 
-        let noticeLevel: 'success' | 'warning' | 'error' | undefined;
-        let noticeMessage: string | undefined;
+        let activityLevel: 'success' | 'warning' | 'error' | undefined;
+        let activityMessage: string | undefined;
         try {
           const result = await this.runManager.recoverStaleCompletion(
             candidate.taskId,
@@ -1630,35 +1873,39 @@ export class BoardPanel {
             candidate.stage,
           );
           if (result.kind === 'recovered') {
-            noticeLevel = 'success';
-            noticeMessage = `Recovered ${candidate.stage} completion from old run ${candidate.runId}${result.gate ? ` and applied ${result.gate}` : ''}.`;
+            activityLevel = 'success';
+            activityMessage = `Recovered ${candidate.stage} completion from old run ${candidate.runId}${result.gate ? ` and applied ${result.gate}` : ''}.`;
           } else if (result.kind === 'active-run') {
-            noticeLevel = 'warning';
-            noticeMessage = 'Recovery was not applied because a newer run is active.';
+            activityLevel = 'warning';
+            activityMessage = 'Recovery was not applied because a newer run is active.';
             void vscode.window.showWarningMessage('Recovery was not applied because a newer run is active.');
           } else if (result.kind === 'pending-outcome') {
-            noticeLevel = 'warning';
-            noticeMessage = 'Recovery was not applied because a completion is already waiting for review.';
+            activityLevel = 'warning';
+            activityMessage = 'Recovery was not applied because a completion is already waiting for review.';
             void vscode.window.showWarningMessage('Recovery was not applied because a completion is already waiting for review.');
           } else if (result.kind === 'not-found') {
-            noticeLevel = 'warning';
-            noticeMessage = 'Recovery was not applied because the task was not found.';
+            activityLevel = 'warning';
+            activityMessage = 'Recovery was not applied because the task was not found.';
             void vscode.window.showWarningMessage('Recovery was not applied because the task was not found.');
           } else {
-            noticeLevel = 'warning';
-            noticeMessage = 'Recovery was not applied because the selected completion is stale or no longer eligible.';
+            activityLevel = 'warning';
+            activityMessage = 'Recovery was not applied because the selected completion is stale or no longer eligible.';
             void vscode.window.showWarningMessage('Recovery was not applied because the selected completion is stale.');
           }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          noticeLevel = 'error';
-          noticeMessage = `Recovery could not be applied: ${detail}`;
-          void vscode.window.showErrorMessage(noticeMessage);
+          activityLevel = 'error';
+          activityMessage = `Recovery could not be applied: ${detail}`;
+          void vscode.window.showErrorMessage(activityMessage);
         } finally {
           await this.pushAll();
         }
-        if (noticeLevel && noticeMessage) {
-          await this.reportBoardNotice(noticeLevel, noticeMessage);
+        if (activityLevel && activityMessage) {
+          await this.recordWorkspaceActivity({
+            level: activityLevel,
+            message: activityMessage,
+            taskId: candidate.taskId,
+          });
         }
         return;
       }
@@ -1681,6 +1928,12 @@ export class BoardPanel {
 
       case 'settings/refresh':
         await this.pushSettings();
+        return;
+
+      case 'workspaceActivity/refresh':
+        if (!message.taskSetId || message.taskSetId === this.host.activeSet.id) {
+          await this.pushWorkspaceActivity();
+        }
         return;
 
       case 'settings/set': {
@@ -1788,6 +2041,7 @@ export class BoardPanel {
 		await this.pushBoard();
 		await this.pushDetail();
     await this.pushSettings();
+    await this.pushWorkspaceActivity();
 	}
 
   private configuredAgentNames(): AgentNameOverrides {
@@ -1819,15 +2073,16 @@ export class BoardPanel {
    * The entries are a record, not a live view — Copilot flushes its transcript
    * in batches, so tool activity can lag by seconds to a minute (TASK-009).
    */
-  private transcriptFeedEntries(taskId: string): TranscriptFeedEntry[] {
+  private transcriptFeedSnapshot(taskId: string): FeedSourceSnapshot {
     const cfg = vscode.workspace.getConfiguration('kanbanPilot');
     if (!cfg.get<boolean>('chat.transcriptFeed', false)) {
-      return [];
+      return { availability: 'not-configured', entries: [] };
     }
     if (!this.surface.hostEditor && !cfg.get<boolean>('chat.transcriptFeedRemote', false)) {
-      return [];
+      return { availability: 'not-configured', entries: [] };
     }
-    return this.host.runManager.transcriptTail?.entriesFor(taskId, ACTIVITY_FEED_LIMIT) ?? [];
+    return this.host.runManager.transcriptTail?.snapshotFor(taskId, ACTIVITY_FEED_LIMIT)
+      ?? { availability: 'not-configured', entries: [] };
   }
 
   /**
@@ -1835,15 +2090,16 @@ export class BoardPanel {
    * and the feed is enabled. Unlike the transcript tail this arrives at the
    * moment of the event, which is what lets the browser board keep up.
    */
-  private hookFeedEntries(taskId: string): FeedEntry[] {
+  private hookFeedSnapshot(taskId: string): FeedSourceSnapshot {
     const cfg = vscode.workspace.getConfiguration('kanbanPilot');
     if (!cfg.get<boolean>('chat.hookFeed', false)) {
-      return [];
+      return { availability: 'not-configured', entries: [] };
     }
     if (!this.surface.hostEditor && !cfg.get<boolean>('chat.transcriptFeedRemote', false)) {
-      return [];
+      return { availability: 'not-configured', entries: [] };
     }
-    return this.host.runManager.hookSpool?.entriesFor(taskId, ACTIVITY_FEED_LIMIT) ?? [];
+    return this.host.runManager.hookSpool?.snapshotFor(taskId, ACTIVITY_FEED_LIMIT)
+      ?? { availability: 'not-configured', entries: [] };
   }
 
   private async pushDetail(preserveOpenModal = false): Promise<void> {
@@ -1871,11 +2127,27 @@ export class BoardPanel {
     // Hook entries are the real-time source; the transcript tail is 6-53 s behind
     // and reports the same tool calls, so its duplicates are dropped whenever the
     // hook feed has anything to say for this task.
-    const hookFeed = this.hookFeedEntries(task.id);
+    const hookSnapshot = this.hookFeedSnapshot(task.id);
+    const transcriptSnapshot = this.transcriptFeedSnapshot(task.id);
+    const hookFeed = hookSnapshot.entries;
+    const transcriptFeed = transcriptSnapshot.entries;
     const feed = mergeFeedEntries(
       [...progressFeed, ...hookFeed],
-      suppressDuplicatedTailEntries(this.transcriptFeedEntries(task.id), hookFeed),
+      suppressDuplicatedTailEntries(transcriptFeed, hookFeed),
       ACTIVITY_FEED_LIMIT,
+    );
+    const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+    const remoteActivityAllowed = this.surface.hostEditor
+      || cfg.get<boolean>('chat.transcriptFeedRemote', false);
+    const activity = activityViewFor(
+      progressFeed,
+      hookSnapshot,
+      transcriptSnapshot,
+      {
+        hookEnabled: cfg.get<boolean>('chat.hookFeed', false),
+        transcriptEnabled: cfg.get<boolean>('chat.transcriptFeed', false),
+        remoteAllowed: remoteActivityAllowed,
+      },
     );
     const attachments = await this.store.listAttachments(task.id);
     const attachmentViews = attachments.map((attachment) => ({
@@ -1908,6 +2180,7 @@ export class BoardPanel {
         scopeHtml: renderTaskMarkdown(scope, attachmentViews),
 				lastLog: logLines.at(-1) ?? '',
         feed,
+        activity,
 				originTask: task.originTask,
         attachments: attachmentViews,
         pending: pendingView(task),
@@ -1923,16 +2196,34 @@ export class BoardPanel {
 		});
 	}
 
+  private async pushWorkspaceActivity(): Promise<void> {
+    const activeSet = this.host.activeSet;
+    const activityStore = this.host.workspaceActivity;
+    const records = activityStore ? await activityStore.readAll() : [];
+    if (this.host.activeSet !== activeSet || this.host.workspaceActivity !== activityStore) {
+      return;
+    }
+    await this.surface.postMessage({
+      type: 'workspaceActivity/state',
+      activeTaskSetId: activeSet.id,
+      activeTaskSetName: activeSet.name,
+      records,
+    });
+  }
+
   private async reportEditError(taskId: string | undefined, error: string): Promise<void> {
     void vscode.window.showErrorMessage(error);
     await this.surface.postMessage({ type: 'task/editError', taskId, error });
   }
 
-  private async reportBoardNotice(
-    level: 'success' | 'warning' | 'error',
-    message: string,
+  private async recordWorkspaceActivity(
+    input: WorkspaceActivityInput,
   ): Promise<void> {
-    await this.surface.postMessage({ type: 'board/notice', level, message });
+    try {
+      await this.host.workspaceActivity?.append(input);
+    } catch {
+      // Activity is an audit aid and must not hide the task/run result.
+    }
   }
 
   private async reportCreateError(error: string): Promise<void> {
@@ -2338,6 +2629,50 @@ ${bootstrapMarkup}
 
   .settings-modal { width: min(760px, 100vw - 32px); }
   .settings-head { align-items: flex-start; }
+  .workspace-activity-modal { width: min(720px, 100vw - 32px); }
+  .workspace-activity-body { min-height: 0; overflow-y: auto; padding: 18px; }
+  .workspace-activity-toolbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .workspace-activity-set { min-width: 0; }
+  .workspace-activity-set-label {
+    color: var(--vscode-descriptionForeground); font-size: 11px; font-weight: 700;
+    letter-spacing: .04em; text-transform: uppercase;
+  }
+  .workspace-activity-set-name { margin-top: 3px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  .workspace-activity-refresh { flex: none; }
+  .workspace-activity-state {
+    color: var(--vscode-descriptionForeground); font-size: 13px; line-height: 1.45;
+    padding: 12px; border: 1px dashed var(--vscode-panel-border); border-radius: 8px;
+  }
+  .workspace-activity-state[hidden] { display: none; }
+  .workspace-activity-list { display: flex; flex-direction: column; gap: 8px; }
+  .workspace-activity-list[hidden] { display: none; }
+  .workspace-activity-row {
+    display: grid; grid-template-columns: minmax(155px, max-content) minmax(0, 1fr);
+    gap: 12px; padding: 10px 0; border-top: 1px solid var(--vscode-panel-border);
+  }
+  .workspace-activity-row:first-child { padding-top: 0; border-top: none; }
+  .workspace-activity-meta { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+  .workspace-activity-time {
+    color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
+    font-size: 11px; line-height: 1.35; white-space: nowrap;
+  }
+  .workspace-activity-level {
+    align-self: flex-start; padding: 2px 7px; border: 1px solid var(--vscode-panel-border);
+    border-radius: 100px; color: var(--vscode-descriptionForeground); font-size: 10px;
+    font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  }
+  .workspace-activity-row.success .workspace-activity-level { color: #4ade80; border-color: color-mix(in srgb, #4ade80 50%, transparent); }
+  .workspace-activity-row.warning .workspace-activity-level { color: #fbbf24; border-color: color-mix(in srgb, #fbbf24 50%, transparent); }
+  .workspace-activity-row.error .workspace-activity-level { color: var(--vscode-errorForeground); border-color: color-mix(in srgb, var(--vscode-errorForeground) 50%, transparent); }
+  .workspace-activity-content { min-width: 0; }
+  .workspace-activity-message { overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+  .workspace-activity-context {
+    margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 11px;
+    line-height: 1.35; overflow-wrap: anywhere;
+  }
   .settings-body {
     display: grid; grid-template-columns: minmax(160px, .32fr) minmax(0, 1fr);
     min-height: 0; overflow: hidden; padding: 0;
@@ -2480,6 +2815,8 @@ ${bootstrapMarkup}
     .setting-model-fields { grid-template-columns: 1fr; }
     .activity-row { grid-template-columns: 1fr; gap: 2px; }
     .activity-time { white-space: normal; }
+    .workspace-activity-row { grid-template-columns: 1fr; gap: 4px; }
+    .workspace-activity-time { white-space: normal; }
   }
 
   /*
@@ -2556,31 +2893,7 @@ ${bootstrapMarkup}
     flex: none;
     margin: var(--kp-pad-page) var(--kp-pad-page) 0;
   }
-  .board-notice {
-    display: flex; align-items: flex-start; gap: 8px;
-    margin: var(--kp-pad-page) var(--kp-pad-page) 0;
-    padding: 9px 12px; border-radius: 10px;
-    background: color-mix(in srgb, #fbbf24 15%, var(--vscode-editor-background));
-    border: 1px solid color-mix(in srgb, #fbbf24 55%, transparent);
-    color: color-mix(in srgb, #f59e0b 72%, var(--vscode-foreground));
-    font-size: 0.8rem; font-weight: 600; line-height: 1.4;
-  }
-  .board-notice::before {
-    content: ''; width: 8px; height: 8px; margin-top: 0.35em; border-radius: 100px; flex: none;
-    background: #fbbf24; box-shadow: 0 0 10px #fbbf24;
-  }
-  .board-notice.success {
-    background: color-mix(in srgb, #4ade80 13%, var(--vscode-editor-background));
-    border-color: color-mix(in srgb, #4ade80 50%, transparent);
-    color: color-mix(in srgb, #16a34a 72%, var(--vscode-foreground));
-  }
-  .board-notice.success::before { background: #4ade80; box-shadow: 0 0 10px #4ade80; }
-  .board-notice.error {
-    background: color-mix(in srgb, var(--vscode-errorForeground) 12%, var(--vscode-editor-background));
-    border-color: color-mix(in srgb, var(--vscode-errorForeground) 50%, transparent);
-    color: var(--vscode-errorForeground);
-  }
-  .board-notice.error::before { background: var(--vscode-errorForeground); box-shadow: 0 0 10px var(--vscode-errorForeground); }
+  #warn[hidden] { display: none; }
   .warn-banner {
     display: flex; align-items: center; gap: 8px;
     padding: 9px 12px; border-radius: 10px;
@@ -3016,12 +3329,18 @@ ${bootstrapMarkup}
   }
   .task-tree-sidecar .task-tree-alternative { margin: 0; }
   @media (max-width: 900px) {
-    .detail-dialog-layout {
-      flex-direction: column; align-items: stretch; width: min(720px, calc(100vw - 32px));
-      max-height: min(86vh, 960px); overflow-y: auto;
+    .modal-backdrop {
+      align-items: flex-start;
+      overflow-y: auto;
     }
-    .detail-dialog-layout > .modal { flex: none; width: 100%; max-height: none; }
-    .task-tree-sidecar { flex: none; width: 100%; max-width: none; min-width: 0; max-height: none; }
+    .detail-dialog-layout {
+      flex-direction: column; align-items: stretch; width: min(720px, 100%); max-width: 100%;
+      max-height: none; overflow: visible; margin: 0 auto;
+    }
+    .detail-dialog-layout > .modal {
+      flex: none; width: 100%; max-height: min(calc(100vh - 32px), 960px);
+    }
+    .task-tree-sidecar { flex: none; width: 100%; max-width: 100%; min-width: 0; max-height: none; }
   }
   .modal {
     position: relative;
@@ -3087,7 +3406,7 @@ ${bootstrapMarkup}
     color: color-mix(in srgb, var(--col) 22%, var(--vscode-foreground));
   }
   .modal-body {
-    overflow-y: auto; padding: 18px;
+    min-height: 0; overflow-y: auto; padding: 18px;
     display: flex; flex-direction: column; gap: 22px;
   }
   .modal-section-label {
@@ -3146,15 +3465,42 @@ ${bootstrapMarkup}
     border-radius: 4px;
     background: var(--vscode-editorWidget-background, transparent);
   }
+  .activity-overview {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+    margin-bottom: 8px;
+  }
+  .activity-source-summary {
+    min-width: 0; padding: 9px 10px; border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px; background: var(--vscode-editorWidget-background, transparent);
+  }
+  .activity-source-heading { display: flex; flex-wrap: wrap; gap: 5px 8px; align-items: baseline; }
+  .activity-source-label { font-size: 12px; font-weight: 700; }
+  .activity-source-status, .activity-source-freshness {
+    color: var(--vscode-descriptionForeground); font-size: 11px;
+  }
+  .activity-source-description {
+    margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .activity-source-times {
+    display: flex; flex-direction: column; gap: 2px; margin-top: 5px;
+    color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
+    font-size: 10px; line-height: 1.35;
+  }
   .activity-row.activity-transcript { border-left: 2px solid var(--vscode-panel-border, #454545); padding-left: 6px; opacity: 0.85; }
   .activity-row {
-    display: grid; grid-template-columns: minmax(150px, max-content) minmax(0, 1fr);
+    display: grid; grid-template-columns: minmax(170px, max-content) minmax(0, 1fr);
     gap: 12px; padding: 8px 0; border-top: 1px solid var(--vscode-panel-border);
   }
   .activity-row:first-child { padding-top: 0; border-top: none; }
+  .activity-meta { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .activity-time {
     color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
     font-size: 11px; line-height: 1.45; white-space: nowrap;
+  }
+  .activity-observed {
+    color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
+    font-size: 10px; line-height: 1.35; white-space: nowrap;
   }
   .activity-note { min-width: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
   .activity-empty {
@@ -3265,6 +3611,7 @@ ${bootstrapMarkup}
     <div class="task-set-controls" aria-label="Task-set management">
       <label class="task-set-label" for="taskSetSelect">Task set</label>
       <select class="task-set-select" id="taskSetSelect" aria-label="Active task set"></select>
+      <button class="task-set-btn" id="workspaceActivityToggle" type="button" aria-haspopup="dialog" aria-controls="workspaceActivityBackdrop">Workspace Activity</button>
       <button class="task-set-btn" id="taskSetCreate" aria-label="Create task set">New</button>
       <button class="task-set-btn" id="taskSetRename" aria-label="Rename active task set">Rename</button>
       <button class="task-set-btn" id="taskSetDelete" aria-label="Delete active task set">Delete</button>
@@ -3367,6 +3714,28 @@ ${bootstrapMarkup}
     </div>
   </div>
 </div>
+<div class="modal-backdrop" id="workspaceActivityBackdrop">
+  <div class="modal workspace-activity-modal" id="workspaceActivityModal" role="dialog" aria-modal="true" aria-labelledby="workspaceActivityTitle" aria-describedby="workspaceActivitySubtitle" tabindex="-1">
+    <div class="new-task-head settings-head">
+      <div class="new-task-head-text">
+        <div class="modal-title" id="workspaceActivityTitle">Workspace Activity History</div>
+        <div class="new-task-subtitle" id="workspaceActivitySubtitle">Read-only history of board activities for the active task set.</div>
+      </div>
+      <button class="modal-close" id="workspaceActivityClose" type="button" aria-label="Close Workspace Activity History dialog">×</button>
+    </div>
+    <div class="workspace-activity-body">
+      <div class="workspace-activity-toolbar">
+        <div class="workspace-activity-set">
+          <div class="workspace-activity-set-label">Active task set</div>
+          <div class="workspace-activity-set-name" id="workspaceActivitySetName">Loading…</div>
+        </div>
+        <button class="btn-chip workspace-activity-refresh" id="workspaceActivityRefresh" type="button">Refresh</button>
+      </div>
+      <div class="workspace-activity-state" id="workspaceActivityState" role="status" aria-live="polite">Loading activity…</div>
+      <div class="workspace-activity-list" id="workspaceActivityList" aria-label="Workspace activity records" hidden></div>
+    </div>
+  </div>
+</div>
 <div class="modal-backdrop" id="newTaskBackdrop">
   <div class="modal new-task-modal" id="newTaskModal" role="dialog" aria-modal="true" aria-label="Create a new task">
     <div class="new-task-head">
@@ -3412,8 +3781,7 @@ ${bootstrapMarkup}
     </form>
   </div>
 </div>
-<div id="warn"></div>
-<div id="boardNotice" class="board-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+<div id="warn" hidden></div>
 <div id="reorderAnnouncement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 <div class="layout">
   <div class="board" id="board"></div>
@@ -3454,12 +3822,169 @@ ${bootstrapMarkup}
   let boardScrollLeft = 0;
   const boardFilterState = { query: '', type: 'all', status: 'all', relationship: 'all' };
   const columnScrollTops = new Map();
+  let lastWorkspaceActivity = { activeTaskSetId: '', activeTaskSetName: '', records: [] };
+  let workspaceActivityReturnFocus = null;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) { node.className = className; }
     if (text !== undefined) { node.textContent = text; }
     return node;
+  }
+
+  function workspaceActivityRecordList(value) {
+    if (!Array.isArray(value)) { return []; }
+    return value.map((record, position) => {
+      if (!record || typeof record !== 'object') { return null; }
+      const timestamp = safeActivityTimestamp(record.timestamp);
+      const level = record.level === 'success' || record.level === 'warning' || record.level === 'error'
+        ? record.level : null;
+      if (!timestamp || !level || typeof record.message !== 'string' || !record.message.trim() || record.message.length > 1000) {
+        return null;
+      }
+      const taskId = typeof record.taskId === 'string' && /^TASK-\\d+$/.test(record.taskId)
+        ? record.taskId : undefined;
+      const taskTitle = typeof record.taskTitle === 'string' && record.taskTitle.trim()
+        ? record.taskTitle : undefined;
+      return { timestamp, level, message: record.message, taskId, taskTitle, position };
+    }).filter(Boolean).sort((left, right) => {
+      const order = Date.parse(right.timestamp) - Date.parse(left.timestamp);
+      return order || right.position - left.position;
+    }).slice(0, 100);
+  }
+
+  function renderWorkspaceActivityLoading() {
+    const state = document.getElementById('workspaceActivityState');
+    const list = document.getElementById('workspaceActivityList');
+    if (state) {
+      state.textContent = 'Loading activity…';
+      state.hidden = false;
+    }
+    if (list) {
+      list.textContent = '';
+      list.hidden = true;
+    }
+  }
+
+  function renderWorkspaceActivityState(message) {
+    if (!message || typeof message !== 'object' || typeof message.activeTaskSetId !== 'string') { return; }
+    if (renderedBoardTaskSetId && message.activeTaskSetId !== renderedBoardTaskSetId) { return; }
+    const records = workspaceActivityRecordList(message.records);
+    const activeTaskSetName = typeof message.activeTaskSetName === 'string' && message.activeTaskSetName.trim()
+      ? message.activeTaskSetName : 'Active task set';
+    lastWorkspaceActivity = {
+      activeTaskSetId: message.activeTaskSetId,
+      activeTaskSetName,
+      records,
+    };
+    const setName = document.getElementById('workspaceActivitySetName');
+    if (setName) { setName.textContent = activeTaskSetName; }
+    const state = document.getElementById('workspaceActivityState');
+    const list = document.getElementById('workspaceActivityList');
+    if (!state || !list) { return; }
+    list.textContent = '';
+    if (!records.length) {
+      state.textContent = 'No workspace activity recorded yet.';
+      state.hidden = false;
+      list.hidden = true;
+      return;
+    }
+    state.textContent = '';
+    state.hidden = true;
+    for (const record of records) {
+      const row = el('article', 'workspace-activity-row ' + record.level);
+      row.dataset.level = record.level;
+      const meta = el('div', 'workspace-activity-meta');
+      const time = document.createElement('time');
+      time.className = 'workspace-activity-time';
+      time.dateTime = record.timestamp;
+      time.textContent = record.timestamp;
+      time.setAttribute('aria-label', record.timestamp + ' UTC');
+      meta.appendChild(time);
+      meta.appendChild(el('span', 'workspace-activity-level', record.level));
+      row.appendChild(meta);
+      const content = el('div', 'workspace-activity-content');
+      content.appendChild(el('div', 'workspace-activity-message', record.message));
+      if (record.taskId || record.taskTitle) {
+        const context = el('div', 'workspace-activity-context');
+        context.textContent = 'Task: ' + (record.taskId || '—') + (record.taskTitle ? ' · ' + record.taskTitle : '');
+        content.appendChild(context);
+      }
+      row.appendChild(content);
+      list.appendChild(row);
+    }
+    list.hidden = false;
+  }
+
+  const ACTIVITY_SOURCE_LABELS = {
+    progress: 'Durable progress',
+    hook: 'Near-real-time hook',
+    transcript: 'Delayed transcript',
+  };
+  const ACTIVITY_STATUS_LABELS = {
+    disabled: 'Disabled',
+    unavailable: 'Unavailable',
+    empty: 'Enabled · empty',
+    available: 'Available',
+  };
+
+  function activitySourceLabel(source) {
+    return ACTIVITY_SOURCE_LABELS[source] || 'Activity source';
+  }
+
+  function safeActivityTimestamp(value) {
+    if (typeof value !== 'string' ||
+      !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$/.test(value) ||
+      !Number.isFinite(Date.parse(value))) {
+      return '';
+    }
+    return value;
+  }
+
+  function appendActivityOverview(parent, activity) {
+    if (!activity || typeof activity !== 'object' || !Array.isArray(activity.sources)) {
+      return false;
+    }
+    const overview = el('div', 'activity-overview');
+    overview.setAttribute('role', 'group');
+    overview.setAttribute('aria-label', 'Activity source status');
+    for (const source of activity.sources) {
+      if (!source || typeof source !== 'object' ||
+        !['progress', 'hook', 'transcript'].includes(source.source)) {
+        continue;
+      }
+      const sourceId = source.source;
+      const status = ['disabled', 'unavailable', 'empty', 'available'].includes(source.status)
+        ? source.status : 'unavailable';
+      const item = el('div', 'activity-source-summary activity-source-' + sourceId);
+      item.dataset.source = sourceId;
+      item.dataset.status = status;
+      item.setAttribute('aria-label', activitySourceLabel(sourceId) + ': ' + (ACTIVITY_STATUS_LABELS[status] || 'Unavailable'));
+      const heading = el('div', 'activity-source-heading');
+      heading.appendChild(el('span', 'activity-source-label', activitySourceLabel(sourceId)));
+      heading.appendChild(el('span', 'activity-source-status', ACTIVITY_STATUS_LABELS[status] || 'Unavailable'));
+      if (typeof source.freshnessLabel === 'string' && source.freshnessLabel) {
+        heading.appendChild(el('span', 'activity-source-freshness', source.freshnessLabel));
+      }
+      item.appendChild(heading);
+      if (typeof source.description === 'string' && source.description) {
+        item.appendChild(el('div', 'activity-source-description', source.description));
+      }
+      const latestEventAt = safeActivityTimestamp(source.latestEventAt);
+      const latestObservedAt = safeActivityTimestamp(source.latestObservedAt);
+      if (latestEventAt || latestObservedAt) {
+        const latest = el('div', 'activity-source-times');
+        if (latestEventAt) { latest.appendChild(el('span', 'activity-source-event-time', 'Latest event: ' + latestEventAt)); }
+        if (latestObservedAt) { latest.appendChild(el('span', 'activity-source-observed-time', 'Latest observed: ' + latestObservedAt)); }
+        item.appendChild(latest);
+      }
+      overview.appendChild(item);
+    }
+    if (!overview.childElementCount) {
+      return false;
+    }
+    parent.appendChild(overview);
+    return true;
   }
 
   function compareTaskIds(left, right) {
@@ -3472,16 +3997,6 @@ ${bootstrapMarkup}
   function announceReorder(message) {
     const live = document.getElementById('reorderAnnouncement');
     if (live) { live.textContent = message; }
-  }
-
-  function renderBoardNotice(message, level) {
-    const notice = document.getElementById('boardNotice');
-    if (!notice || typeof message !== 'string' || !message.trim()) { return; }
-    const knownLevel = level === 'success' || level === 'error' ? level : 'warning';
-    notice.className = 'board-notice ' + knownLevel;
-    notice.setAttribute('role', knownLevel === 'success' ? 'status' : 'alert');
-    notice.textContent = message;
-    notice.hidden = false;
   }
 
   function focusPendingCard() {
@@ -3819,8 +4334,12 @@ ${bootstrapMarkup}
     const generation = ++boardRenderGeneration;
     const warn = document.getElementById('warn');
     warn.textContent = '';
+    warn.hidden = true;
     if (snapshot.malformed.length) {
-      warn.appendChild(el('div', 'warn-banner', 'Could not parse: ' + snapshot.malformed.join(', ')));
+      const parseWarning = el('div', 'warn-banner', 'Could not parse: ' + snapshot.malformed.join(', '));
+      parseWarning.setAttribute('role', 'alert');
+      warn.appendChild(parseWarning);
+      warn.hidden = false;
     }
 
     const board = document.getElementById('board');
@@ -4129,6 +4648,7 @@ ${bootstrapMarkup}
       input.step = definition.integer ? '1' : 'any';
       if (definition.key === 'run.timeoutMinutes') { input.min = '0.01'; }
       else if (typeof definition.minimum === 'number') { input.min = String(definition.minimum); }
+      if (typeof definition.maximum === 'number') { input.max = String(definition.maximum); }
     }
     input.value = value === undefined || value === null ? '' : String(value);
     input.setAttribute('aria-label', definition.label);
@@ -4980,6 +5500,7 @@ ${bootstrapMarkup}
 
     const activitySection = el('div');
     activitySection.appendChild(el('div', 'modal-section-label', 'Activity'));
+    const hasActivityOverview = appendActivityOverview(activitySection, task.activity);
     if (task.status === 'blocked') {
       const blocked = el('div', 'activity-blocked', 'This task is blocked; approval or action is required in the VS Code host.');
       blocked.setAttribute('role', 'status');
@@ -4993,19 +5514,39 @@ ${bootstrapMarkup}
       ))
       : [];
     if (!feed.length) {
-      activityFeed.appendChild(el('div', 'activity-empty', 'No activity recorded yet.'));
+      activityFeed.appendChild(el(
+        'div',
+        'activity-empty',
+        hasActivityOverview ? 'No activity entries are available from the enabled sources.' : 'No activity recorded yet.',
+      ));
     } else {
       for (const entry of feed) {
-        // Copilot's own words and the agent's progress summaries are different
-        // kinds of statement, so they are not rendered as one undifferentiated
-        // list. Tailed rows also lag by seconds to a minute (TASK-009).
-        const source = entry.source === 'transcript' ? 'transcript' : 'progress';
+        // Source labels are text, not just colors or row styling. Tailed rows
+        // also carry a separate observation time because they can lag the event.
+        const source = entry.source === 'hook' || entry.source === 'transcript' ? entry.source : 'progress';
+        const eventAt = safeActivityTimestamp(entry.at);
+        if (!eventAt) { continue; }
+        const observedAt = safeActivityTimestamp(entry.observedAt);
         const row = el('div', 'activity-row activity-' + source);
+        row.setAttribute('aria-label', activitySourceLabel(source) + '. Event time: ' + eventAt +
+          (observedAt ? '. Observed: ' + observedAt : ''));
+        const meta = el('div', 'activity-meta');
+        meta.appendChild(el('div', 'activity-source-label', activitySourceLabel(source)));
         const time = document.createElement('time');
         time.className = 'activity-time';
-        time.dateTime = entry.at;
-        time.textContent = entry.at;
-        row.appendChild(time);
+        time.dateTime = eventAt;
+        time.setAttribute('aria-label', 'Event time: ' + eventAt);
+        time.textContent = eventAt;
+        meta.appendChild(time);
+        if (observedAt && source !== 'progress') {
+          const observed = document.createElement('time');
+          observed.className = 'activity-observed';
+          observed.dateTime = observedAt;
+          observed.setAttribute('aria-label', 'Observed time: ' + observedAt);
+          observed.textContent = 'Observed: ' + observedAt;
+          meta.appendChild(observed);
+        }
+        row.appendChild(meta);
         row.appendChild(el('div', 'activity-note', entry.note));
         activityFeed.appendChild(row);
       }
@@ -5497,6 +6038,18 @@ ${bootstrapMarkup}
     const msg = event.data;
     if (!msg) { return; }
     if (msg.type === 'board/state') {
+      const nextTaskSetId = msg.snapshot && typeof msg.snapshot.activeTaskSetId === 'string'
+        ? msg.snapshot.activeTaskSetId : '';
+      if (renderedBoardTaskSetId && nextTaskSetId !== renderedBoardTaskSetId) {
+        lastWorkspaceActivity = { activeTaskSetId: nextTaskSetId, activeTaskSetName: '', records: [] };
+        const nextTaskSetName = msg.snapshot && typeof msg.snapshot.activeTaskSetName === 'string'
+          ? msg.snapshot.activeTaskSetName : 'Active task set';
+        const activitySetName = document.getElementById('workspaceActivitySetName');
+        if (activitySetName) { activitySetName.textContent = nextTaskSetName; }
+        if (document.getElementById('workspaceActivityBackdrop').classList.contains('open')) {
+          renderWorkspaceActivityLoading();
+        }
+      }
       lastBoardSnapshot = msg.snapshot;
       lastSelectedId = msg.selectedTaskId;
       renderTaskSets(msg.snapshot);
@@ -5518,8 +6071,8 @@ ${bootstrapMarkup}
       }
     } else if (msg.type === 'task/detail') {
       renderDetail(msg.task, msg.preserveOpenModal === true);
-    } else if (msg.type === 'board/notice') {
-      renderBoardNotice(msg.message, msg.level);
+    } else if (msg.type === 'workspaceActivity/state') {
+      renderWorkspaceActivityState(msg);
     } else if (msg.type === 'task/editError') {
       const error = document.getElementById('taskEditError');
       if (error && (!msg.taskId || msg.taskId === editingTaskId)) {
@@ -5728,6 +6281,64 @@ ${bootstrapMarkup}
     if (!focusable.includes(document.activeElement) || (e.shiftKey && document.activeElement === first)) {
       e.preventDefault();
       (e.shiftKey ? last : first).focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+
+  const workspaceActivityBackdrop = document.getElementById('workspaceActivityBackdrop');
+  const workspaceActivityModal = document.getElementById('workspaceActivityModal');
+  const workspaceActivityToggle = document.getElementById('workspaceActivityToggle');
+  const workspaceActivitySetName = document.getElementById('workspaceActivitySetName');
+  function closeWorkspaceActivityModal() {
+    workspaceActivityBackdrop.classList.remove('open');
+    const returnFocus = workspaceActivityReturnFocus || workspaceActivityToggle;
+    workspaceActivityReturnFocus = null;
+    if (returnFocus && typeof returnFocus.focus === 'function') { returnFocus.focus(); }
+  }
+  function openWorkspaceActivityModal() {
+    closeTaskTree(false);
+    document.getElementById('detailBackdrop').classList.remove('open');
+    newTaskBackdrop.classList.remove('open');
+    settingsBackdrop.classList.remove('open');
+    workspaceActivityReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement : workspaceActivityToggle;
+    workspaceActivityBackdrop.classList.add('open');
+    workspaceActivitySetName.textContent = lastBoardSnapshot && typeof lastBoardSnapshot.activeTaskSetName === 'string'
+      ? lastBoardSnapshot.activeTaskSetName : 'Loading…';
+    renderWorkspaceActivityLoading();
+    workspaceActivityModal.focus();
+    const taskSetId = lastBoardSnapshot && typeof lastBoardSnapshot.activeTaskSetId === 'string'
+      ? lastBoardSnapshot.activeTaskSetId : renderedBoardTaskSetId;
+    vscode.postMessage({ type: 'workspaceActivity/refresh', ...(taskSetId ? { taskSetId } : {}) });
+  }
+  workspaceActivityToggle.addEventListener('click', openWorkspaceActivityModal);
+  document.getElementById('workspaceActivityClose').addEventListener('click', closeWorkspaceActivityModal);
+  document.getElementById('workspaceActivityRefresh').addEventListener('click', () => {
+    renderWorkspaceActivityLoading();
+    const taskSetId = lastBoardSnapshot && typeof lastBoardSnapshot.activeTaskSetId === 'string'
+      ? lastBoardSnapshot.activeTaskSetId : renderedBoardTaskSetId;
+    vscode.postMessage({ type: 'workspaceActivity/refresh', ...(taskSetId ? { taskSetId } : {}) });
+  });
+  workspaceActivityBackdrop.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) { closeWorkspaceActivityModal(); }
+  });
+  window.addEventListener('keydown', (e) => {
+    if (!workspaceActivityBackdrop.classList.contains('open')) { return; }
+    if (e.key === 'Escape') {
+      closeWorkspaceActivityModal();
+      return;
+    }
+    if (e.key !== 'Tab') { return; }
+    const focusable = Array.from(workspaceActivityModal.querySelectorAll('button'))
+      .filter((node) => !node.disabled && node.tabIndex >= 0);
+    if (!focusable.length) { return; }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
     } else if (!e.shiftKey && document.activeElement === last) {
       e.preventDefault();
       first.focus();

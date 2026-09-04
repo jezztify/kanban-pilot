@@ -9,6 +9,7 @@ import { BrowserBoardSurface } from '../http/browserBoardSurface';
 
 import {
 	ALL_KANBAN_SETTING_KEYS,
+	activityViewFor,
 	BoardPanel,
 	BoardTaskSetChange,
 	BoardTaskSetHost,
@@ -36,6 +37,7 @@ import {
 import { Executor } from '../chat/executor';
 import { formatProgressLine } from '../chat/progress';
 import { DEFAULT_FEED_LIMIT } from '../chat/transcriptTail';
+import type { FeedSourceSnapshot } from '../chat/transcriptTail';
 import { CommandExecutor, RunManager } from '../chat/runManager';
 import { formatReceipt } from '../chat/receipt';
 import { DEFAULT_TASK_SET_ID, DEFAULT_TASK_SET_NAME, TaskSet } from '../model/taskSets';
@@ -50,6 +52,7 @@ import {
 	newTaskFile,
 } from '../model/task';
 import { TaskStore } from '../model/taskStore';
+import { WorkspaceActivityStore } from '../model/workspaceActivity';
 
 const noopExecutor: Executor = {
 	async isAvailable() {
@@ -126,11 +129,14 @@ function detailViewFor(task: {
 		summary: string;
 	}[];
 	outcome?: ReturnType<typeof outcomeGuidanceFor>;
+	activity?: ReturnType<typeof activityViewFor>;
 	feed?: readonly {
 		runId: string;
 		taskId: string;
 		at: string;
 		note: string;
+		source?: 'progress' | 'hook' | 'transcript';
+		observedAt?: string;
 	}[];
 	attachments?: readonly {
 		name: string;
@@ -157,6 +163,7 @@ function detailViewFor(task: {
 		scopeHtml: renderTaskMarkdown(task.sections.Scope ?? '', task.attachments ?? []),
 		lastLog: task.sections.Log ?? '',
 		feed: task.feed ?? [],
+		activity: task.activity,
 		attachments: task.attachments ?? [],
 		moveTargets: [{ id: 'backlog', label: 'Backlog' }],
 		primary: task.primary === undefined
@@ -215,6 +222,83 @@ async function seedStaleBoardCandidate(store: TaskStore, taskId: string, runId: 
 }
 
 suite('BoardPanel Settings', () => {
+	test('projects source provenance, availability, freshness, delay, and remote gating', () => {
+		const now = Date.parse('2026-09-01T10:01:00Z');
+		const hook: FeedSourceSnapshot = {
+			availability: 'configured',
+			entries: [{ at: '2026-09-01T10:00:59Z', note: 'finished build', source: 'hook', observedAt: '2026-09-01T10:00:59Z' }],
+			latestEventAt: '2026-09-01T10:00:59Z',
+			latestObservedAt: '2026-09-01T10:00:59Z',
+		};
+		const transcript: FeedSourceSnapshot = {
+			availability: 'configured',
+			entries: [{ at: '2026-09-01T10:00:40.000Z', note: 'assistant message observed', source: 'transcript', observedAt: '2026-09-01T10:00:59Z' }],
+			latestEventAt: '2026-09-01T10:00:40.000Z',
+			latestObservedAt: '2026-09-01T10:00:59Z',
+		};
+		const view = activityViewFor(
+			[{ at: '2026-09-01T10:00:58Z', note: 'running tests', source: 'progress' }],
+			hook,
+			transcript,
+			{ hookEnabled: true, transcriptEnabled: true, remoteAllowed: true, now },
+		);
+
+		assert.deepStrictEqual(view.sources.map((source) => [source.source, source.status, source.freshness]), [
+			['progress', 'available', 'durable'],
+			['hook', 'available', 'current'],
+			['transcript', 'available', 'delayed'],
+		]);
+		assert.match(view.sources[0].description, /task log/);
+		assert.match(view.sources[2].description, /delayed/i);
+		assert.strictEqual(view.sources[1].latestEventAt, '2026-09-01T10:00:59Z');
+		assert.strictEqual(view.sources[1].latestObservedAt, '2026-09-01T10:00:59Z');
+
+		const states = activityViewFor(
+			[],
+			{ availability: 'missing', entries: [] },
+			{ availability: 'configured', entries: [] },
+			{ hookEnabled: true, transcriptEnabled: false, remoteAllowed: true, now },
+		).sources;
+		assert.strictEqual(states[1].status, 'unavailable');
+		assert.strictEqual(states[1].description.includes('not present'), true);
+		assert.strictEqual(states[2].status, 'disabled');
+		assert.strictEqual(states[2].description.includes('disabled in settings'), true);
+
+		const remote = activityViewFor(
+			[],
+			hook,
+			transcript,
+			{ hookEnabled: true, transcriptEnabled: true, remoteAllowed: false, now },
+		).sources;
+		assert.deepStrictEqual(remote.slice(1).map((source) => [source.status, source.availability, source.entryCount]), [
+			['disabled', 'not-shared', 0],
+			['disabled', 'not-shared', 0],
+		]);
+	});
+
+	test('bounds durable source metadata and keeps stale hook freshness honest', () => {
+		const now = Date.parse('2026-09-01T10:01:00Z');
+		const progress = Array.from({ length: DEFAULT_FEED_LIMIT + 5 }, (_, index) => ({
+			at: `2026-09-01T10:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}Z`,
+			note: `progress-${index}`,
+			source: 'progress' as const,
+		}));
+		const view = activityViewFor(
+			progress,
+			{
+				availability: 'configured',
+				entries: [{ at: '2026-09-01T09:59:00Z', note: 'old hook', source: 'hook', observedAt: '2026-09-01T10:00:00Z' }],
+				latestObservedAt: '2026-09-01T10:00:00Z',
+			},
+			{ availability: 'configured', entries: [] },
+			{ hookEnabled: true, transcriptEnabled: true, remoteAllowed: true, now },
+		);
+		assert.strictEqual(view.sources[0].entryCount, DEFAULT_FEED_LIMIT);
+		assert.strictEqual(view.sources[1].freshness, 'stale');
+		assert.strictEqual(view.sources[2].status, 'empty');
+		assert.match(view.sources[2].description, /delayed/i);
+	});
+
 	test('renders task detail Markdown as safe CommonMark/GFM HTML', () => {
 		const source = [
 			'# Heading',
@@ -739,6 +823,15 @@ suite('BoardPanel Settings', () => {
 			dispatchWebviewMessage(dom, { type: 'board/state', snapshot });
 			assert.strictEqual(dom.window.document.querySelectorAll('.column').length, 7);
 			assert.strictEqual(dom.window.document.querySelectorAll('.card').length, 5);
+			const warn = dom.window.document.getElementById('warn') as HTMLElement | null;
+			assert.strictEqual(dom.window.document.getElementById('boardNotice'), null, 'transient board notices are removed');
+			const activityToggle = dom.window.document.getElementById('workspaceActivityToggle') as HTMLButtonElement | null;
+			assert.ok(activityToggle, 'the board exposes Workspace Activity beside task-set controls');
+			assert.strictEqual(activityToggle?.getAttribute('aria-haspopup'), 'dialog');
+			assert.strictEqual(activityToggle?.getAttribute('aria-controls'), 'workspaceActivityBackdrop');
+			assert.strictEqual(warn?.childElementCount, 0);
+			assert.strictEqual(warn?.hidden, true, 'an empty parse-warning host must remain hidden');
+			assert.strictEqual(dom.window.getComputedStyle(warn!).display, 'none', 'an empty parse-warning host must not reserve layout space');
 			const find = dom.window.document.getElementById('boardFind') as HTMLInputElement | null;
 			assert.ok(find, 'the board exposes a local find field');
 			const visibleTaskIds = () => Array.from(dom!.window.document.querySelectorAll('.card'))
@@ -929,9 +1022,191 @@ suite('BoardPanel Settings', () => {
 			assert.strictEqual(relationshipFilter.value, 'all');
 			assert.strictEqual((dom.window.document.getElementById('taskSetSelect') as HTMLSelectElement | null)?.value, 'other-task-set');
 			assert.strictEqual(posted.length, 0, 'a task-set refresh must not create a host mutation message');
+
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot: { ...switchedSnapshot, malformed: ['TASK-999.md'] } });
+			const parseWarning = warn?.querySelector('.warn-banner');
+			assert.ok(parseWarning);
+			assert.strictEqual(parseWarning?.getAttribute('role'), 'alert');
+			assert.strictEqual(parseWarning?.textContent, 'Could not parse: TASK-999.md');
+			assert.strictEqual(warn?.hidden, false);
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot: switchedSnapshot });
+			assert.strictEqual(warn?.childElementCount, 0, 'the parse warning must clear when board data is valid');
+			assert.strictEqual(warn?.hidden, true);
+			assert.strictEqual(dom.window.getComputedStyle(warn!).display, 'none');
+			assert.strictEqual(dom.window.document.getElementById('boardNotice'), null);
 		} finally {
 			dom?.window.close();
 			board.dispose();
+			try {
+				await vscode.workspace.fs.delete(directory, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	test('renders task-set-scoped Workspace Activity history and keeps modal lifecycle read-only', async () => {
+		const directory = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-board-workspace-activity-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const store = new TaskStore(directory);
+		await store.ensureDirectory();
+		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-workspace-activity-test', index: 0 };
+		const activeSet = makeTaskSet(directory);
+		const workspaceActivity = new WorkspaceActivityStore(directory, activeSet.id);
+		const runManager = new RunManager(store, noopExecutor, folder);
+		const host: BoardTaskSetHost = {
+			ready: Promise.resolve(),
+			store,
+			workspaceActivity,
+			runManager,
+			activeSet,
+			async listTaskSets() {
+				return [activeSet];
+			},
+			async switchTaskSet() {},
+			async createTaskSet() {},
+			async renameTaskSet() {},
+			async deleteTaskSet() {},
+			onDidChange() {
+				return new vscode.Disposable(() => undefined);
+			},
+		};
+		const panel = vscode.window.createWebviewPanel(
+			'kanbanPilot.boardWorkspaceActivityTest',
+			'Kanban Pilot Workspace Activity Test',
+			vscode.ViewColumn.One,
+			{ enableScripts: true },
+		);
+		const constructor = BoardPanel as unknown as new (panel: vscode.WebviewPanel, host: BoardTaskSetHost, extensionUri: vscode.Uri) => BoardPanel;
+		const board = new constructor(panel, host, extensionUriForTests);
+		let dom: JSDOM | undefined;
+		try {
+			const task = await store.create('Activity context task');
+			const taskFile = vscode.Uri.joinPath(directory, `${task.id}.md`);
+			const taskFileBefore = Buffer.from(await vscode.workspace.fs.readFile(taskFile));
+			await workspaceActivity.append({
+				timestamp: '2026-09-04T07:00:00Z',
+				level: 'warning',
+				message: 'Older activity',
+				taskId: task.id,
+				taskTitle: task.title,
+			});
+			await workspaceActivity.append({
+				timestamp: '2026-09-04T07:01:00Z',
+				level: 'success',
+				message: 'Newer activity',
+			});
+			const posted: unknown[] = [];
+			dom = new JSDOM(panel.webview.html, {
+				runScripts: 'dangerously',
+				pretendToBeVisual: true,
+				beforeParse(window) {
+					Object.defineProperty(window, 'acquireVsCodeApi', {
+						value: () => ({ postMessage(message: unknown) { posted.push(message); } }),
+					});
+				},
+			});
+			posted.length = 0;
+			const snapshot = {
+				malformed: [],
+				taskSets: [{ id: activeSet.id, name: activeSet.name, isDefault: true }],
+				activeTaskSetId: activeSet.id,
+				activeTaskSetName: activeSet.name,
+				columns: [],
+			};
+			dispatchWebviewMessage(dom, { type: 'board/state', snapshot });
+			const toggle = dom.window.document.getElementById('workspaceActivityToggle') as HTMLButtonElement;
+			const backdrop = dom.window.document.getElementById('workspaceActivityBackdrop') as HTMLElement;
+			const modal = dom.window.document.getElementById('workspaceActivityModal') as HTMLElement;
+			assert.strictEqual(toggle.getAttribute('aria-haspopup'), 'dialog');
+			assert.strictEqual(toggle.getAttribute('aria-controls'), 'workspaceActivityBackdrop');
+			assert.strictEqual(modal.getAttribute('role'), 'dialog');
+			assert.strictEqual(modal.getAttribute('aria-labelledby'), 'workspaceActivityTitle');
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivityTitle')?.textContent, 'Workspace Activity History');
+			assert.strictEqual(backdrop.classList.contains('open'), false);
+
+			toggle.focus();
+			clickElement(toggle);
+			assert.strictEqual(backdrop.classList.contains('open'), true);
+			assert.strictEqual(dom.window.document.activeElement, modal);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'workspaceActivity/refresh',
+				taskSetId: activeSet.id,
+			});
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivityState')?.textContent, 'Loading activity…');
+
+			dispatchWebviewMessage(dom, {
+				type: 'workspaceActivity/state',
+				activeTaskSetId: activeSet.id,
+				activeTaskSetName: activeSet.name,
+				records: await workspaceActivity.readAll(),
+			});
+			const rows = () => Array.from(dom!.window.document.querySelectorAll('.workspace-activity-row'));
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivitySetName')?.textContent, activeSet.name);
+			assert.deepStrictEqual(rows().map((row) => row.querySelector('.workspace-activity-message')?.textContent), [
+				'Newer activity',
+				'Older activity',
+			]);
+			assert.strictEqual(rows()[0].classList.contains('success'), true);
+			assert.strictEqual(rows()[0].querySelector('.workspace-activity-time')?.textContent, '2026-09-04T07:01:00.000Z');
+			assert.strictEqual(rows()[0].querySelector('.workspace-activity-time')?.getAttribute('aria-label'), '2026-09-04T07:01:00.000Z UTC');
+			assert.match(rows()[1].querySelector('.workspace-activity-context')?.textContent ?? '', new RegExp(task.id));
+			assert.match(rows()[1].querySelector('.workspace-activity-context')?.textContent ?? '', /Activity context task/);
+
+			const beforeStale = rows().map((row) => row.textContent);
+			dispatchWebviewMessage(dom, {
+				type: 'workspaceActivity/state',
+				activeTaskSetId: 'set-other',
+				activeTaskSetName: 'Other task set',
+				records: [{ timestamp: '2026-09-04T08:00:00Z', level: 'error', message: 'wrong set' }],
+			});
+			assert.deepStrictEqual(rows().map((row) => row.textContent), beforeStale, 'stale activity is not rendered');
+
+			dispatchWebviewMessage(dom, {
+				type: 'workspaceActivity/state',
+				activeTaskSetId: activeSet.id,
+				activeTaskSetName: activeSet.name,
+				records: [],
+			});
+			assert.strictEqual(rows().length, 0);
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivityList')?.hidden, true);
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivityState')?.textContent, 'No workspace activity recorded yet.');
+
+			posted.length = 0;
+			clickElement(dom.window.document.getElementById('workspaceActivityRefresh'));
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(posted.at(-1))), {
+				type: 'workspaceActivity/refresh',
+				taskSetId: activeSet.id,
+			});
+			clickElement(dom.window.document.getElementById('workspaceActivityClose'));
+			assert.strictEqual(backdrop.classList.contains('open'), false);
+			assert.strictEqual(dom.window.document.activeElement, toggle, 'close restores focus to the activity button');
+			clickElement(toggle);
+			dom.window.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+			assert.strictEqual(backdrop.classList.contains('open'), false);
+			clickElement(toggle);
+			backdrop.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+			assert.strictEqual(backdrop.classList.contains('open'), false);
+			clickElement(toggle);
+			dispatchWebviewMessage(dom, {
+				type: 'board/state',
+				snapshot: {
+					...snapshot,
+					taskSets: [{ id: 'set-other', name: 'Other task set', isDefault: false }],
+					activeTaskSetId: 'set-other',
+					activeTaskSetName: 'Other task set',
+				},
+			});
+			assert.strictEqual(rows().length, 0, 'task-set refresh clears the previous history rows');
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivitySetName')?.textContent, 'Other task set');
+			assert.strictEqual(dom.window.document.getElementById('workspaceActivityState')?.textContent, 'Loading activity…');
+			clickElement(dom.window.document.getElementById('workspaceActivityClose'));
+			assert.deepStrictEqual(Buffer.from(await vscode.workspace.fs.readFile(taskFile)), taskFileBefore);
+		} finally {
+			dom?.window.close();
+			board.dispose();
+			workspaceActivity.dispose();
 			try {
 				await vscode.workspace.fs.delete(directory, { recursive: true });
 			} catch {
@@ -1087,6 +1362,9 @@ suite('BoardPanel Settings', () => {
 		let dom: JSDOM | undefined;
 		try {
 			const task = await store.create('Tree root');
+			const tallSection = (label: string) => Array.from({ length: 24 }, (_, index) => (
+				`${label} detail paragraph ${index + 1} keeps the task content tall enough to require scrolling.`
+			)).join('\n\n');
 			const tree = {
 				rootTaskId: task.id,
 				nodes: [
@@ -1105,10 +1383,34 @@ suite('BoardPanel Settings', () => {
 				},
 			});
 			const detail = {
-				...detailViewFor({ id: task.id, title: task.title, sections: {} }),
+				...detailViewFor({
+					id: task.id,
+					title: task.title,
+					sections: {
+						Request: tallSection('Request'),
+						Refined: tallSection('Refined'),
+						Scope: tallSection('Scope'),
+						Log: 'Latest activity remains reachable below the detail sections.',
+					},
+				}),
 				taskTree: tree,
 			};
 			dispatchWebviewMessage(dom, { type: 'task/detail', task: detail });
+			const detailModal = dom.window.document.getElementById('detail');
+			const detailHead = detailModal?.querySelector('.modal-head');
+			const detailBody = detailModal?.querySelector('.modal-body') as HTMLElement | null;
+			assert.ok(detailHead, 'the detail header must remain present when a tall task opens');
+			assert.strictEqual(detailModal?.querySelector('.modal-title')?.textContent, task.title);
+			assert.ok(detailModal?.querySelector('[aria-label="Close task detail"]'));
+			assert.ok(detailBody);
+			assert.match(detailBody?.textContent ?? '', /Request detail paragraph 1/);
+			assert.match(detailBody?.textContent ?? '', /Refined detail paragraph 24/);
+			assert.match(detailBody?.textContent ?? '', /Scope detail paragraph 24/);
+			assert.match(detailBody?.textContent ?? '', /Latest activity remains reachable/);
+			Object.defineProperty(detailBody, 'clientHeight', { configurable: true, value: 480 });
+			Object.defineProperty(detailBody, 'scrollHeight', { configurable: true, value: 2400 });
+			detailBody.scrollTop = detailBody.scrollHeight - detailBody.clientHeight;
+			assert.strictEqual(detailBody.scrollTop, 1920, 'the tall detail body must be vertically scrollable');
 			const showTree = Array.from(dom.window.document.querySelectorAll('button'))
 				.find((button) => button.textContent === 'Show Task Tree');
 			assert.ok(showTree);
@@ -1143,7 +1445,10 @@ suite('BoardPanel Settings', () => {
 			assert.match(panel.webview.html, /\.task-tree-sidecar[\s\S]*max-width: 480px/);
 			assert.match(panel.webview.html, /\.task-tree-viewport[\s\S]*height: min\(56vh, 520px\)/);
 			assert.match(panel.webview.html, /\.task-tree-sidecar \.modal-mermaid-rendered[\s\S]*max-width: none/);
-			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*overflow-y: auto[\s\S]*\.task-tree-sidecar \{ flex: none; width: 100%; max-width: none; min-width: 0; max-height: none; \}/);
+			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*\.modal-backdrop \{[\s\S]*align-items: flex-start;[\s\S]*overflow-y: auto;[\s\S]*\}/);
+			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*\.detail-dialog-layout \{[\s\S]*overflow: visible;[\s\S]*\}/);
+			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*\.detail-dialog-layout > \.modal \{[\s\S]*max-height: min\(calc\(100vh - 32px\), 960px\);[\s\S]*\}/);
+			assert.match(panel.webview.html, /@media \(max-width: 900px\)[\s\S]*\.task-tree-sidecar \{ flex: none; width: 100%; max-width: 100%; min-width: 0; max-height: none; \}/);
 			assert.match(sidecar?.textContent ?? '', /Mermaid renderer unavailable; source is shown below\./);
 			const bridge = loadMermaidBundles(dom);
 			dispatchWebviewMessage(dom, { type: 'task/detail', task: detail });
@@ -1549,8 +1854,8 @@ suite('BoardPanel Settings', () => {
 		);
 	});
 
-	test('keeps the in-board catalog aligned with all 25 contributed keys', () => {
-		assert.strictEqual(ALL_KANBAN_SETTING_KEYS.length, 25);
+	test('keeps the in-board catalog aligned with all 27 contributed keys', () => {
+		assert.strictEqual(ALL_KANBAN_SETTING_KEYS.length, 27);
 		assert.deepStrictEqual([...SETTING_DEFINITIONS].map((definition) => definition.key), [...ALL_KANBAN_SETTING_KEYS]);
 		assert.strictEqual(isEditableSettingKey('chat.agentNames'), true);
 		assert.strictEqual(isEditableSettingKey('kanbanPilot.chat.mode'), false);
@@ -1563,6 +1868,13 @@ suite('BoardPanel Settings', () => {
 		assert.strictEqual(validateSettingValue('run.timeoutMinutes', 2.5).ok, true);
 		assert.strictEqual(validateSettingValue('run.maxParallelTasks', 0).ok, false);
 		assert.strictEqual(validateSettingValue('run.maxParallelTasks', 1.5).ok, false);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', 0.8).ok, true);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', 1).ok, true);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', 0).ok, false);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', -0.1).ok, false);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', Number.NaN).ok, false);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', Number.POSITIVE_INFINITY).ok, false);
+		assert.strictEqual(validateSettingValue('chat.autoCompactThreshold', 1.01).ok, false);
 		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search', 'edit']).ok, true);
 		assert.strictEqual(validateSettingValue('refine.toolsInclude', ['search\nedit']).ok, false);
 		assert.deepStrictEqual(validateSettingValue('chat.agentDirectories', [' .agents ', 'shared/agents']), {
@@ -1588,6 +1900,8 @@ suite('BoardPanel Settings', () => {
 		assert.deepStrictEqual(values['chat.toolsExclude'], ['memory']);
 		assert.deepStrictEqual(values['chat.agentDirectories'], []);
 		assert.strictEqual(values['chat.closeTabOnDone'], true);
+		assert.strictEqual(values['chat.autoCompact'], false);
+		assert.strictEqual(values['chat.autoCompactThreshold'], 0.8);
 	});
 
 	test('persists validated settings at workspace scope and resets without writing invalid payloads', async () => {
@@ -2378,7 +2692,7 @@ suite('BoardPanel Settings', () => {
 			1,
 		);
 		assert.strictEqual(settingsDocument.querySelectorAll('.agent-setting-actions button').length, 7);
-		assert.strictEqual(settingsDocument.querySelectorAll('.setting-row').length, 15);
+		assert.strictEqual(settingsDocument.querySelectorAll('.setting-row').length, 17);
 		assert.strictEqual((settingsDocument.getElementById('setting-chat-agentDirectories') as HTMLTextAreaElement).value, 'shared/agents');
 		assert.strictEqual((settingsDocument.getElementById('setting-chat-toolsExclude') as HTMLTextAreaElement).value, 'memory');
 		assert.strictEqual((settingsDocument.getElementById('setting-chat-modelSelector-id') as HTMLInputElement).value, 'gpt');
@@ -2676,18 +2990,33 @@ suite('BoardPanel Settings', () => {
 			state: 'in-progress',
 			stateLabel: 'In Progress',
 			status: 'blocked',
+			activity: activityViewFor(
+				[],
+				{
+					availability: 'configured',
+					entries: [{ at: '2026-08-26T04:31:07Z', note: 'literal', source: 'hook', observedAt: '2026-08-26T04:31:08Z' }],
+					latestEventAt: '2026-08-26T04:31:07Z',
+					latestObservedAt: '2026-08-26T04:31:08Z',
+				},
+				{ availability: 'configured', entries: [] },
+				{ hookEnabled: true, transcriptEnabled: true, remoteAllowed: true, now: Date.parse('2026-08-26T04:32:00Z') },
+			),
 			feed: [
 				{
 					runId: 'r1',
 					taskId: edited.id,
 					at: '2026-08-26T04:31:07Z',
 					note: '<button type="button">literal</button><script>bad()</script>',
+					source: 'hook',
+					observedAt: '2026-08-26T04:31:08Z',
 				},
 				{
 					runId: 'r2',
 					taskId: edited.id,
 					at: '2026-08-26T04:31:08Z',
 					note: 'second activity',
+					source: 'transcript',
+					observedAt: '2026-08-26T04:31:09Z',
 				},
 			],
 		});
@@ -2707,6 +3036,19 @@ suite('BoardPanel Settings', () => {
 			'2026-08-26T04:31:07Z',
 			'2026-08-26T04:31:08Z',
 		]);
+		assert.deepStrictEqual(activityRows.map((row) => row.querySelector('.activity-source-label')?.textContent), [
+			'Near-real-time hook',
+			'Delayed transcript',
+		]);
+		assert.deepStrictEqual(activityRows.map((row) => row.querySelector('.activity-observed')?.textContent), [
+			'Observed: 2026-08-26T04:31:08Z',
+			'Observed: 2026-08-26T04:31:09Z',
+		]);
+		assert.strictEqual(activity?.querySelector('.activity-source-hook')?.textContent?.includes('Enabled · empty'), false);
+		assert.match(activity?.querySelector('.activity-source-hook')?.textContent ?? '', /Near-real-time hook/);
+		assert.match(activity?.querySelector('.activity-source-hook')?.textContent ?? '', /Available/);
+		assert.match(activity?.querySelector('.activity-source-transcript')?.textContent ?? '', /Delayed transcript/);
+		assert.match(activity?.querySelector('.activity-source-transcript')?.textContent ?? '', /Enabled · empty/);
 		assert.strictEqual(activityRows[0].querySelector('time')?.getAttribute('datetime'), '2026-08-26T04:31:07Z');
 		assert.strictEqual(activity?.querySelector('button, input, select, textarea, a'), null);
 		assert.strictEqual(activity?.querySelector('script'), null);
@@ -3334,6 +3676,41 @@ suite('BoardPanel Settings', () => {
 		assert.match(failed?.summary ?? '', /The build command failed/);
 	});
 
+	test('uses a manager correction reason instead of a successful Develop receipt summary', () => {
+		const evidenceFailure = 'Develop completion requires implementation evidence with changed files and verification.';
+		const guidance = outcomeGuidanceFor({
+			id: 'TASK-005',
+			state: 'in-progress',
+			status: 'blocked',
+			sections: {
+				Log: [
+					'- audit:activity-start at:2026-09-04T01:31:00Z task:TASK-005 stage:develop action:develop run:r-develop-correction note:"Started develop activity."',
+					'- run:r-develop-correction task:TASK-005 stage:develop result:ok note:"implemented traffic pool and collision detection"',
+					`- audit:activity-finish at:2026-09-04T01:31:06Z task:TASK-005 stage:develop run:r-develop-correction outcome:blocked correction:true note:"${evidenceFailure}"`,
+				].join('\n'),
+			},
+		}, []);
+
+		assert.deepStrictEqual(
+			{
+				kind: guidance?.kind,
+				stage: guidance?.stage,
+				runId: guidance?.runId,
+				action: guidance?.action,
+				reason: guidance?.reason,
+			},
+			{
+				kind: 'blocked',
+				stage: 'develop',
+				runId: 'r-develop-correction',
+				action: 'continue',
+				reason: evidenceFailure,
+			},
+		);
+		assert.match(guidance?.summary ?? '', /implementation evidence/);
+		assert.doesNotMatch(guidance?.summary ?? '', /implemented traffic pool/);
+	});
+
 	test('projects pending completion before retry guidance and stale completion before failure guidance', () => {
 		const pending = outcomeGuidanceFor({
 			id: 'TASK-004',
@@ -3573,15 +3950,7 @@ suite('BoardPanel Settings', () => {
 				JSON.parse(JSON.stringify(posted.at(-1))),
 				{ type: 'pending/apply', taskId: task.id },
 			);
-			dispatchWebviewMessage(dom, {
-				type: 'board/notice',
-				level: 'warning',
-				message: 'Pending completion was not applied because the task changed.',
-			});
-			const notice = dom.window.document.querySelector('.board-notice');
-			assert.strictEqual(notice?.textContent, 'Pending completion was not applied because the task changed.');
-			assert.strictEqual(notice?.getAttribute('role'), 'alert');
-			assert.strictEqual((notice as HTMLElement | null)?.hidden, false);
+			assert.strictEqual(dom.window.document.getElementById('boardNotice'), null);
 
 			const staleCandidate = {
 				taskId: 'TASK-905',
@@ -3663,7 +4032,7 @@ suite('BoardPanel Settings', () => {
 		}
 	});
 
-	test('reports a stale pending apply through a board-visible notice', async () => {
+	test('persists a stale pending apply in Workspace Activity without a board notice', async () => {
 		const directory = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-board-pending-notice-${Date.now()}-${Math.random().toString(36).slice(2)}`),
 		);
@@ -3672,6 +4041,7 @@ suite('BoardPanel Settings', () => {
 		const folder: vscode.WorkspaceFolder = { uri: directory, name: 'board-pending-notice-test', index: 0 };
 		const activeSet = makeTaskSet(directory);
 		const runManager = new RunManager(store, noopExecutor, folder);
+		const workspaceActivity = new WorkspaceActivityStore(directory, activeSet.id);
 		const surface = new BrowserBoardSurface('board-pending-notice-test');
 		const posted: Record<string, unknown>[] = [];
 		const postMessage = surface.postMessage.bind(surface);
@@ -3682,6 +4052,7 @@ suite('BoardPanel Settings', () => {
 		const host: BoardTaskSetHost = {
 			ready: new Promise<void>(() => undefined),
 			store,
+			workspaceActivity,
 			runManager,
 			activeSet,
 			async listTaskSets() {
@@ -3698,6 +4069,45 @@ suite('BoardPanel Settings', () => {
 		const board = BoardPanel.attach(surface, host, extensionUriForTests);
 		const onMessage = (board as unknown as { onMessage(message: unknown): Promise<void> }).onMessage.bind(board);
 		try {
+			const successfulTask = await store.create('Successful pending completion');
+			await store.appendLog(successfulTask.id, formatReceipt({
+				runId: 'r-successful-pending',
+				taskId: successfulTask.id,
+				stage: 'develop',
+				result: 'ok',
+				note: 'implementation complete',
+			}));
+			await store.patch(successfulTask.id, {
+				state: 'in-progress',
+				status: 'idle',
+				pending_outcome: encodePendingOutcome({
+					gate: 'developToValidation',
+					stage: 'develop',
+					result: 'ok',
+					runId: 'r-successful-pending',
+				}),
+			});
+			posted.length = 0;
+			await onMessage({ type: 'pending/apply', taskId: successfulTask.id });
+			const appliedTask = (await store.readAll()).tasks.find((candidate) => candidate.id === successfulTask.id);
+			assert.strictEqual(appliedTask?.state, 'validation');
+			assert.strictEqual(appliedTask?.status, 'idle');
+			assert.strictEqual(appliedTask?.pendingOutcome, undefined);
+			assert.strictEqual(
+				posted.some((message) => message.type === 'board/notice' && message.level === 'success'),
+				false,
+			);
+			assert.strictEqual((await workspaceActivity.readAll()).length, 0, 'successful pending apply remains silent');
+			const refreshedBoard = [...posted].reverse().find((message) => message.type === 'board/state') as {
+				snapshot?: { columns?: { id: string; cards?: { id: string }[] }[] };
+			} | undefined;
+			assert.ok(
+				refreshedBoard?.snapshot?.columns?.some((column) =>
+					column.id === 'validation' && column.cards?.some((card) => card.id === successfulTask.id),
+				),
+				'the successful pending apply must refresh the task into Validation',
+			);
+
 			const task = await store.create('Stale pending completion');
 			await store.patch(task.id, {
 				state: 'in-progress',
@@ -3711,14 +4121,22 @@ suite('BoardPanel Settings', () => {
 			});
 
 			await onMessage({ type: 'pending/apply', taskId: task.id });
-			const notice = [...posted].reverse().find((message) => message.type === 'board/notice');
-			assert.deepStrictEqual(notice, {
-				type: 'board/notice',
+			assert.strictEqual(
+				posted.some((message) => message.type === 'board/notice'),
+				false,
+			);
+			assert.deepStrictEqual((await workspaceActivity.readAll()).map((record) => ({
+				level: record.level,
+				message: record.message,
+				taskId: record.taskId,
+			})), [{
 				level: 'warning',
 				message: 'Pending completion was not applied because the task or receipt changed.',
-			});
+				taskId: task.id,
+			}]);
 		} finally {
 			board.dispose();
+			workspaceActivity.dispose();
 			try {
 				await vscode.workspace.fs.delete(directory, { recursive: true });
 			} catch {

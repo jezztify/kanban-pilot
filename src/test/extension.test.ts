@@ -80,6 +80,78 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('active task-set Workspace Activity stores persist, isolate, and guard swapped generations', async () => {
+		const root = vscode.Uri.file(
+			path.join(os.tmpdir(), `kanban-pilot-activity-context-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+		);
+		const folder: vscode.WorkspaceFolder = { uri: root, name: 'activity-context-test', index: 0 };
+		const taskSetContext = new WorkspaceTaskSetContext(folder, 'legacy/tasks');
+		const changes: WorkspaceTaskSetChange[] = [];
+		const changeSubscription = taskSetContext.onDidChange((change) => {
+			if (change) {
+				changes.push(change);
+			}
+		});
+		try {
+			await taskSetContext.ready;
+			assert.strictEqual(taskSetContext.workspaceActivity.taskSetId, DEFAULT_TASK_SET_ID);
+			assert.match(taskSetContext.workspaceActivity.file.path, /\.kanban-pilot[\\/]workspace-activity[\\/]default\.jsonl$/);
+
+			await taskSetContext.workspaceActivity.append({
+				timestamp: '2026-09-04T07:00:00Z',
+				level: 'warning',
+				message: 'Default task-set activity',
+				taskId: 'TASK-001',
+			});
+			assert.ok(changes.some((change) => change.kind === 'activity' && change.taskId === 'TASK-001'));
+
+			await taskSetContext.createTaskSet('Mobile release');
+			const mobileActivity = taskSetContext.workspaceActivity;
+			assert.notStrictEqual(mobileActivity.taskSetId, DEFAULT_TASK_SET_ID);
+			assert.notStrictEqual(mobileActivity.file.path, taskSetContext.registry.defaultSet.directory.path);
+			assert.deepStrictEqual(await mobileActivity.readAll(), []);
+
+			changes.length = 0;
+			await mobileActivity.append({
+				timestamp: '2026-09-04T07:01:00Z',
+				level: 'success',
+				message: 'Mobile task-set activity',
+				taskId: 'TASK-002',
+			});
+			assert.ok(changes.some((change) => change.kind === 'activity' && change.taskId === 'TASK-002'));
+
+			await taskSetContext.switchTaskSet(DEFAULT_TASK_SET_ID);
+			assert.strictEqual(taskSetContext.workspaceActivity.taskSetId, DEFAULT_TASK_SET_ID);
+			assert.deepStrictEqual((await taskSetContext.workspaceActivity.readAll()).map((record) => record.message), [
+				'Default task-set activity',
+			]);
+
+			changes.length = 0;
+			await mobileActivity.append({
+				timestamp: '2026-09-04T07:02:00Z',
+				level: 'error',
+				message: 'Stale mobile store activity',
+			});
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.strictEqual(
+				changes.some((change) => change.kind === 'activity'),
+				false,
+				'a disposed store cannot emit activity for the active set',
+			);
+			assert.deepStrictEqual((await taskSetContext.workspaceActivity.readAll()).map((record) => record.message), [
+				'Default task-set activity',
+			]);
+		} finally {
+			changeSubscription.dispose();
+			taskSetContext.dispose();
+			try {
+				await vscode.workspace.fs.delete(root, { recursive: true });
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
 	test('workspace synchronization reconciles task edits but only refreshes for attachments and order-only changes', async () => {
 		const root = vscode.Uri.file(
 			path.join(os.tmpdir(), `kanban-pilot-sync-${Date.now()}-${Math.random().toString(36).slice(2)}`),

@@ -1,7 +1,8 @@
 import { open, rm, stat } from 'node:fs/promises';
 import * as vscode from 'vscode';
+import { utcTimestamp } from '../model/taskLog';
 
-import type { FeedEntry } from './transcriptTail';
+import type { FeedEntry, FeedSourceAvailability, FeedSourceSnapshot } from './transcriptTail';
 
 /**
  * Receiver for the real-time hook feed (TASK-015,
@@ -35,6 +36,14 @@ export const SPOOL_RELATIVE_PATH = '.kanban-pilot/.hook-spool.jsonl';
 /** How often the spool is drained. */
 export const DEFAULT_DRAIN_INTERVAL_MS = 500;
 
+const STRUCTURAL_LABEL = /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/;
+const TASK_ID = /^TASK-\d{3,}$/;
+const EVENT_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+function isEventTimestamp(value: string): boolean {
+	return EVENT_TIMESTAMP.test(value) && Number.isFinite(Date.parse(value));
+}
+
 /** One structural event as the hook wrote it. */
 export interface SpoolLine {
 	v: number;
@@ -60,16 +69,21 @@ export function parseSpoolLine(raw: string): SpoolLine | undefined {
 	if (line.v !== SPOOL_SCHEMA_VERSION) {
 		return undefined;
 	}
-	if (typeof line.event !== 'string' || typeof line.at !== 'string') {
+	if (
+		typeof line.event !== 'string'
+		|| !STRUCTURAL_LABEL.test(line.event)
+		|| typeof line.at !== 'string'
+		|| !isEventTimestamp(line.at)
+	) {
 		return undefined;
 	}
 	return {
 		v: line.v,
 		event: line.event,
 		at: line.at,
-		...(typeof line.sessionId === 'string' ? { sessionId: line.sessionId } : {}),
-		...(typeof line.taskId === 'string' ? { taskId: line.taskId } : {}),
-		...(typeof line.toolName === 'string' ? { toolName: line.toolName } : {}),
+		...(typeof line.sessionId === 'string' && STRUCTURAL_LABEL.test(line.sessionId) ? { sessionId: line.sessionId } : {}),
+		...(typeof line.taskId === 'string' && TASK_ID.test(line.taskId) ? { taskId: line.taskId } : {}),
+		...(typeof line.toolName === 'string' && STRUCTURAL_LABEL.test(line.toolName) ? { toolName: line.toolName } : {}),
 	};
 }
 
@@ -83,12 +97,16 @@ export function describeSpoolLine(line: SpoolLine): string {
 		case 'SessionStart':
 			return 'chat session started';
 		case 'PreToolUse':
-			return line.toolName ? `running ${line.toolName}` : 'running a tool';
+			return line.toolName ? `running ${structuralLabel(line.toolName, 'a tool')}` : 'running a tool';
 		case 'PostToolUse':
-			return line.toolName ? `finished ${line.toolName}` : 'finished a tool';
+			return line.toolName ? `finished ${structuralLabel(line.toolName, 'a tool')}` : 'finished a tool';
 		default:
-			return line.event;
+			return structuralLabel(line.event, 'event observed');
 	}
+}
+
+function structuralLabel(value: string, fallback: string): string {
+	return value.length <= 64 && STRUCTURAL_LABEL.test(value) ? value : fallback;
 }
 
 /**
@@ -135,6 +153,8 @@ export function isHookCoveredTranscriptType(type: string): boolean {
 
 interface TaskBuffer {
 	entries: FeedEntry[];
+	latestEventAt?: string;
+	latestObservedAt?: string;
 }
 
 /**
@@ -153,8 +173,9 @@ export class HookSpoolReceiver {
 	private pending = '';
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private draining = false;
+	private availability: FeedSourceAvailability = 'missing';
 
-	/** Fires with a task id when new entries arrived, so the board republishes. */
+	/** Fires with a task id when entries arrive, or an empty id when availability changes. */
 	readonly onDidChange = this.changed.event;
 
 	constructor(
@@ -168,11 +189,23 @@ export class HookSpoolReceiver {
 		}
 		this.timer = setInterval(() => void this.drain(), intervalMs);
 		this.timer.unref?.();
+		void this.drain();
 	}
 
 	/** Bounded feed rows for a task; empty when the hook feed has reported nothing. */
 	entriesFor(taskId: string, limit = this.limit): FeedEntry[] {
-		return (this.buffers.get(taskId)?.entries ?? []).slice(-limit);
+		return this.snapshotFor(taskId, limit).entries;
+	}
+
+	/** Safe source state for the board; no spool path or hook payload is exposed. */
+	snapshotFor(taskId: string, limit = this.limit): FeedSourceSnapshot {
+		const buffer = this.buffers.get(taskId);
+		return {
+			availability: this.availability,
+			entries: (buffer?.entries ?? []).slice(-limit),
+			...(buffer?.latestEventAt ? { latestEventAt: buffer.latestEventAt } : {}),
+			...(buffer?.latestObservedAt ? { latestObservedAt: buffer.latestObservedAt } : {}),
+		};
 	}
 
 	/** Reads whatever the hook appended since the last pass. Never throws. */
@@ -184,10 +217,17 @@ export class HookSpoolReceiver {
 		try {
 			let size: number;
 			try {
-				({ size } = await stat(this.spoolPath));
-			} catch {
+				const spool = await stat(this.spoolPath);
+				if (!spool.isFile()) {
+					this.setAvailability('unreadable');
+					return;
+				}
+				size = spool.size;
+			} catch (error) {
+				this.setAvailability(availabilityForError(error));
 				return;
 			}
+			this.setAvailability('configured');
 			if (size < this.offset) {
 				// The spool was truncated or replaced; start over rather than reading
 				// from a stale offset into the middle of a line.
@@ -209,9 +249,10 @@ export class HookSpoolReceiver {
 				await handle.close();
 			}
 			this.ingest(chunk);
-		} catch {
+		} catch (error) {
 			// A missing, truncated, or unreadable spool is "no activity", never an
 			// error surfaced to the user or a failed run.
+			this.setAvailability(availabilityForError(error));
 		} finally {
 			this.draining = false;
 		}
@@ -219,6 +260,12 @@ export class HookSpoolReceiver {
 
 	/** Feeds raw appended text through the parser. Exposed for tests. */
 	ingest(chunk: string): void {
+		// Direct ingestion is also used by tests and by an already-open spool. It is
+		// evidence that the configured source is working. A task event below also
+		// carries that state change; otherwise publish one source-wide notification.
+		const availabilityChanged = this.availability !== 'configured';
+		this.availability = 'configured';
+		const observedAt = utcTimestamp();
 		const parts = (this.pending + chunk).split('\n');
 		this.pending = parts.pop() ?? '';
 		const touched = new Set<string>();
@@ -242,7 +289,16 @@ export class HookSpoolReceiver {
 				continue;
 			}
 			const buffer = this.buffers.get(taskId) ?? { entries: [] };
-			buffer.entries.push({ at: line.at, note: describeSpoolLine(line), source: 'hook' });
+			buffer.entries.push({
+				at: line.at,
+				note: describeSpoolLine(line),
+				source: 'hook',
+				observedAt,
+			});
+			buffer.latestObservedAt = observedAt;
+			if (!buffer.latestEventAt || Date.parse(line.at) > Date.parse(buffer.latestEventAt)) {
+				buffer.latestEventAt = line.at;
+			}
 			if (buffer.entries.length > this.limit) {
 				buffer.entries.splice(0, buffer.entries.length - this.limit);
 			}
@@ -253,12 +309,16 @@ export class HookSpoolReceiver {
 		for (const taskId of touched) {
 			this.changed.fire(taskId);
 		}
+		if (availabilityChanged && touched.size === 0) {
+			this.changed.fire('');
+		}
 	}
 
 	/** Removes the spool file; used when no run is live. */
 	async cleanup(): Promise<void> {
 		this.offset = 0;
 		this.pending = '';
+		this.setAvailability('missing');
 		try {
 			await rm(this.spoolPath, { force: true });
 		} catch {
@@ -273,4 +333,18 @@ export class HookSpoolReceiver {
 		}
 		this.changed.dispose();
 	}
+
+	private setAvailability(availability: FeedSourceAvailability): void {
+		if (this.availability === availability) {
+			return;
+		}
+		this.availability = availability;
+		this.changed.fire('');
+	}
+}
+
+function availabilityForError(error: unknown): FeedSourceAvailability {
+	return error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT'
+		? 'missing'
+		: 'unreadable';
 }

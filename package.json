@@ -276,6 +276,18 @@
           "default": false,
           "description": "Clear the task's conversation at the Approve gate (§6.8 layer 1). Off by default: Develop and Validate deliberately continue the same conversation Refine started, and every prompt inlines the current task content regardless, which is the actual mitigation for stale agent reasoning."
         },
+        "kanbanPilot.chat.autoCompact": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to Copilot's native automatic conversation compaction for task chats. Kanban Pilot configures the native experimental setting only when no explicit Copilot value conflicts; it never estimates usage from transcripts or token totals. Focus-only compact commands are not used without a supported task-session target."
+        },
+        "kanbanPilot.chat.autoCompactThreshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8,
+          "description": "Context-window ratio at which Copilot's native automatic compaction is requested. Must be greater than 0 and at most 1; 0.8 means 80%. Kanban Pilot does not use Copilot's separate absolute-token form."
+        },
         "kanbanPilot.chat.agentDirectories": {
           "type": "array",
           "items": {

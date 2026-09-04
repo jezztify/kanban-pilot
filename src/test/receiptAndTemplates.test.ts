@@ -318,7 +318,10 @@ suite('M3 prompt templates', () => {
 			assert.ok(rendered.includes('A signed webhook endpoint for Stripe billing events.'));
 			assert.ok(rendered.includes('- [ ] src/routes/webhooks/stripe.ts'));
 			assert.ok(rendered.includes('implementation-evidence run:r7 files:"<changed non-task files>" verify:"<verification performed>"'));
-			assert.ok(rendered.includes('Do not report success when you only created follow-up tasks'));
+			assert.ok(rendered.includes('Do not claim implementation or workflow success when you only created'));
+			assert.ok(rendered.includes('An agent-reported `PASSED` message in chat is only a progress report'));
+			assert.ok(rendered.includes('RunManager accepts Develop completion only after it'));
+			assert.ok(rendered.includes('cannot record the required evidence or receipt'));
 		} finally {
 			await dispose();
 		}

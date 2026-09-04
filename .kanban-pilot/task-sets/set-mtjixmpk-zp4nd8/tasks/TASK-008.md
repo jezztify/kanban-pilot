@@ -2,12 +2,12 @@
 id: TASK-008
 title: Add board-local find and filter controls
 type: feature
-state: in-progress
-status: failed
+state: done
+status: idle
 parent_task: TASK-003
-position: 2
+position: 4
 created: 2026-09-03T02:44:07Z
-updated: 2026-09-03T03:32:08Z
+updated: 2026-09-04T02:25:27Z
 chat: kanban-pilot-set-mtjixmpk-zp4nd8-TASK-008
 copilot_session_id: 7972d762-6fd6-44e4-95de-f2e046872680
 scope_hash: 80b18d7
@@ -68,3 +68,5 @@ For this ticket, a relationship means the card's role in the valid active-set gr
 - run:riekn58 task:TASK-008 stage:develop result:failed note:"timed out; awaiting late receipt"
 - audit:status-change at:2026-09-03T03:32:08Z task:TASK-008 from:running to:failed action:timeout run:riekn58 outcome:timeout note:"Status changed from running to failed via timeout."
 - audit:activity-finish at:2026-09-03T03:32:08Z task:TASK-008 stage:develop run:riekn58 outcome:timeout provisional:true note:"Activity timed out; awaiting late receipt."
+- audit:state-change at:2026-09-04T02:25:27Z task:TASK-008 from:in-progress to:done action:move note:"State changed from in-progress to done via move."
+- audit:status-change at:2026-09-04T02:25:27Z task:TASK-008 from:failed to:idle action:move note:"Status changed from failed to idle via move."

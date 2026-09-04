@@ -11,6 +11,14 @@ and edit panes, attachments, Mermaid rendering, Settings, gates, agent assignmen
 and any change to the board reaches both clients at once. Each connected browser holds its own
 board session, so one person's card selection does not move anybody else's.
 
+The browser board uses the same **Workspace Activity** button, modal, and
+`workspaceActivity/state` message protocol as the VS Code board. The state is read from the active
+task-set activity file, is delivered on the initial board push and on later activity changes, and
+is replayed when a browser reconnects. There is no separate activity API or browser-side history.
+Switching task sets rebinds the board to that set's activity file, so records from another set are
+never included. The history remains read-only from the modal; its controls do not mutate task
+Markdown.
+
 The endpoint is opt-in. Open **Kanban Pilot Settings** from the board, select **HTTP endpoint**,
 and enable it. Settings take effect immediately; no VS Code restart is required.
 
@@ -40,8 +48,13 @@ the immediate full snapshot.
 
 This is a real-time transport for the existing board and actions, not a replacement UI. The
 current `BoardPanel` remains canonical — it is what a browser runs. Existing Copilot Chat sessions
-remain VS Code editor sessions; task actions over HTTP still use the existing `RunManager`, but
-the private Copilot transcript is not scraped or mirrored over HTTP.
+remain VS Code editor sessions; task actions over HTTP still use the existing `RunManager`. When
+the existing `chat.transcriptFeedRemote` opt-in is enabled, the browser may receive the same
+bounded activity projection as the editor: durable progress, labeled structural hook rows, and
+delayed structural transcript rows with event/observation timestamps. It never receives private
+Copilot transcript content, prompts, reasoning, tool payloads, credentials, tokens, absolute paths,
+or sensitive command/query/file-target content, and reconnects do not fabricate new observations.
+With that opt-in disabled, hook/transcript activity is withheld from the browser entirely.
 
 Two board actions act on the editor rather than the board — **Open task file** and **Open Chat** —
 so they are hidden on browser clients instead of silently operating on the host's screen.

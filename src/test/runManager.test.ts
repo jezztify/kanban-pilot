@@ -6,10 +6,12 @@ import * as vscode from 'vscode';
 import { newTaskFile, Task } from '../model/task';
 import { TaskStore } from '../model/taskStore';
 import { CancellationResult, ChatCommandApi, ChatSessionExecutor, CHAT_NEW_COMMAND, Executor, ExecutorResult, RunOptions } from '../chat/executor';
+import type { ContextCompactionAdapter } from '../chat/contextCompaction';
 import { closeTaskChatTabs, CommandExecutor, normalizeMaxParallelTasks, normalizeTimeoutMinutes, RunManager } from '../chat/runManager';
 import { formatReceipt, parseReceipts } from '../chat/receipt';
 import { invokeTaskAction } from '../board/actions';
 import { parseAuditEvents } from '../model/taskLog';
+import { WorkspaceActivityStore } from '../model/workspaceActivity';
 import { sessionIdForTask, sessionUriForId, sessionUriForTask, sessionUriForTaskBinding } from '../chat/sessionUri';
 import { RECEIPT_COMPLETION_GATES } from '../model/gates';
 import { hashScope } from '../chat/scopeHash';
@@ -170,6 +172,9 @@ function receiptWithResult(
 ) {
 	return async (t: Task, prompt: string): Promise<ExecutorResult> => {
 		const runId = runIdFromPrompt(prompt);
+		if (stage === 'develop' && result === 'ok') {
+			await recordDevelopEvidence(store, t, runId);
+		}
 		await store.appendLog(t.id, formatReceipt({ runId, taskId: t.id, stage, result, note: 'done' }));
 		return { ok: true, sessionId: 's1' };
 	};
@@ -234,6 +239,16 @@ async function seedStaleCompletionHistory(
 ): Promise<void> {
 	const state = stage === 'refine' ? 'refine' : stage === 'develop' ? 'in-progress' : 'validation';
 	const fallbackStatus = fallback === 'timeout' ? 'failed' : 'blocked';
+	if (stage === 'develop') {
+		// These fixtures exercise stale-history identity and gate behavior, not
+		// implementation evidence. Opt them into the documented non-code path.
+		await store.edit(task.id, {
+			title: task.title,
+			request: task.sections['Request'] ?? '',
+			refined: task.sections['Refined'] ?? '',
+			scope: 'completion-evidence: task-only',
+		});
+	}
 	await store.patch(task.id, { state, status: fallbackStatus });
 	await store.auditedPatch(task.id, { state, status: fallbackStatus }, {
 		action: stage,
@@ -1034,6 +1049,12 @@ suite('M3 RunManager', () => {
 		test('a receipt written just before the missing-receipt marker still wins the race', async () => {
 			const task = await store.create('Recover a receipt-marker race');
 			const runId = 'r-marker-race';
+			await store.edit(task.id, {
+				title: task.title,
+				request: task.sections['Request'] ?? '',
+				refined: task.sections['Refined'] ?? '',
+				scope: 'completion-evidence: task-only',
+			});
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
 			await cfg.update('gates.developToValidation', 'auto', vscode.ConfigurationTarget.Global);
 			await waitUntil(() => vscode.workspace.getConfiguration('kanbanPilot').get('gates.developToValidation') === 'auto');
@@ -1079,6 +1100,16 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(blocked.status, 'blocked');
 
 			await store.appendLog(task.id, `- propose-task run:${runId} title:"Add retry backoff" note:"found late"`);
+			const sourceDirectory = vscode.Uri.joinPath(dir, 'src');
+			await vscode.workspace.fs.createDirectory(sourceDirectory);
+			await vscode.workspace.fs.writeFile(
+				vscode.Uri.joinPath(sourceDirectory, 'late-reconciliation.ts'),
+				Buffer.from('export {};', 'utf8'),
+			);
+			await store.appendLog(
+				task.id,
+				`- implementation-evidence run:${runId} files:"src/late-reconciliation.ts" verify:"npm test"`,
+			);
 			await store.appendLog(
 				task.id,
 				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'late completion' }),
@@ -1090,6 +1121,40 @@ suite('M3 RunManager', () => {
 			const { tasks } = await store.readAll();
 			assert.strictEqual(tasks.filter((candidate) => candidate.title === 'Add retry backoff').length, 1);
 			assert.strictEqual(tasks.find((candidate) => candidate.id === task.id)?.state, 'validation');
+		});
+
+		test('a late Develop receipt with evidence is recovered when the extension activates', async () => {
+			const task = await store.create('Recover implementation after activation');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const executor = new StubExecutor(async () => ({ ok: true, sessionId: 's1' }));
+			const firstManager = new RunManager(store, executor, folder);
+
+			await firstManager.handleAction(task.id, 'develop');
+			const blocked = await waitUntilSettled(store, task.id);
+			assert.strictEqual(blocked.status, 'blocked');
+
+			const runId = runIdFromPrompt(executor.calls[0].prompt);
+			const sourceDirectory = vscode.Uri.joinPath(dir, 'src');
+			await vscode.workspace.fs.createDirectory(sourceDirectory);
+			await vscode.workspace.fs.writeFile(
+				vscode.Uri.joinPath(sourceDirectory, 'activation-reconciliation.ts'),
+				Buffer.from('export {};', 'utf8'),
+			);
+			await store.appendLog(
+				task.id,
+				`- implementation-evidence run:${runId} files:"src/activation-reconciliation.ts" verify:"npm test"`,
+			);
+			await store.appendLog(
+				task.id,
+				formatReceipt({ runId, taskId: task.id, stage: 'develop', result: 'ok', note: 'written before activation' }),
+			);
+
+			const activatedManager = new RunManager(store, new StubExecutor(() => 'hang'), folder);
+			await activatedManager.reconcileOnActivation();
+
+			const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			assert.strictEqual(after.state, 'validation');
+			assert.strictEqual(after.status, 'idle');
 		});
 
 		test('a late receipt cannot reclaim a card that was manually moved after fallback', async () => {
@@ -1368,10 +1433,13 @@ suite('M3 RunManager', () => {
 				const executor = new StubExecutor(async (t, prompt) => {
 					runId = runIdFromPrompt(prompt);
 					setTimeout(() => {
-						void store.appendLog(
-							t.id,
-							formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'written after timeout' }),
-						);
+						void (async () => {
+							await recordDevelopEvidence(store, t, runId);
+							await store.appendLog(
+								t.id,
+								formatReceipt({ runId, taskId: t.id, stage: 'develop', result: 'ok', note: 'written after timeout' }),
+							);
+						})();
 					}, 900);
 					return new Promise<ExecutorResult>(() => {
 						/* the chat turn outlives the extension timeout */
@@ -1450,6 +1518,7 @@ suite('M3 RunManager', () => {
 					runId = runIdFromPrompt(prompt);
 					setTimeout(() => {
 						void (async () => {
+							await recordDevelopEvidence(store, t, runId);
 							await store.appendLog(t.id, `- propose-task run:${runId} title:"Late follow-up" note:"written after timeout"`);
 							await store.appendLog(
 								t.id,
@@ -1770,6 +1839,170 @@ suite('M3 RunManager', () => {
 		});
 	});
 
+	suite('context compaction lifecycle', () => {
+		test('prepares native threshold compaction without forcing a post-turn request', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			const previousEnabled = cfg.inspect<unknown>('chat.autoCompact')?.globalValue;
+			const previousThreshold = cfg.inspect<unknown>('chat.autoCompactThreshold')?.globalValue;
+			await cfg.update('chat.autoCompact', true, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.autoCompactThreshold', 0.8, vscode.ConfigurationTarget.Global);
+			const preparations: { enabled: unknown; threshold: unknown; mode: string; sessionPrefix: string }[] = [];
+			let requests = 0;
+			const compactionService: ContextCompactionAdapter = {
+				prepare: async (request) => {
+					preparations.push(request);
+					return { kind: 'ready', threshold: 0.8, experimental: true };
+				},
+				request: async () => {
+					requests += 1;
+					return { kind: 'success', threshold: 0.8, targeting: 'session', experimental: true };
+				},
+			};
+			const task = await store.create('Use native context compaction');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const runManager = new RunManager(
+				store,
+				new StubExecutor(okReceipt(store, 'develop')),
+				folder,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				compactionService,
+			);
+
+			try {
+				await runManager.handleAction(task.id, 'develop');
+				const after = await waitUntilSettled(store, task.id);
+
+				assert.strictEqual(after.state, 'validation');
+				assert.deepStrictEqual(preparations, [{
+					enabled: true,
+					threshold: 0.8,
+					mode: 'agent',
+					sessionPrefix: 'kanban-pilot-',
+				}]);
+				assert.strictEqual(requests, 0, 'Copilot native threshold handling must own automatic timing');
+			} finally {
+				runManager.dispose();
+				await cfg.update('chat.autoCompact', previousEnabled, vscode.ConfigurationTarget.Global);
+				await cfg.update('chat.autoCompactThreshold', previousThreshold, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('explicit compaction preserves task state and records only bounded activity', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			const previousEnabled = cfg.inspect<unknown>('chat.autoCompact')?.globalValue;
+			const previousThreshold = cfg.inspect<unknown>('chat.autoCompactThreshold')?.globalValue;
+			await cfg.update('chat.autoCompact', true, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.autoCompactThreshold', 0.8, vscode.ConfigurationTarget.Global);
+			const task = await store.create('Explicitly compact this task');
+			const session = sessionIdForTask(task.id, 'kanban-pilot-', store.setId);
+			await store.patch(task.id, {
+				state: 'in-progress',
+				status: 'failed',
+				run: 'r-compaction',
+				chat: session,
+				copilotSessionId: 'copilot-existing',
+			});
+			await store.appendLog(task.id, 'existing receipt history');
+			const before = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+			const requests: { taskId: string; session: string; threshold: unknown }[] = [];
+			const activity = new WorkspaceActivityStore(folder.uri, store.setId);
+			const compactionService: ContextCompactionAdapter = {
+				prepare: async () => ({ kind: 'ready', threshold: 0.8, experimental: true }),
+				request: async (currentTask, request) => {
+					requests.push({ taskId: currentTask.id, session: currentTask.chat ?? '', threshold: request.threshold });
+					return { kind: 'success', threshold: 0.8, targeting: 'session', experimental: true };
+				},
+			};
+			const executor = new StubExecutor(() => 'hang');
+			const runManager = new RunManager(
+				store,
+				executor,
+				folder,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				compactionService,
+				activity,
+			);
+
+			try {
+				const result = await runManager.compactTask(task.id);
+				assert.strictEqual(result?.kind, 'success');
+				assert.deepStrictEqual(requests, [{ taskId: task.id, session, threshold: 0.8 }]);
+				assert.strictEqual(executor.calls.length, 0);
+
+				const after = (await store.readAll()).tasks.find((candidate) => candidate.id === task.id)!;
+				assert.deepStrictEqual(
+					{ state: after.state, status: after.status, run: after.run, chat: after.chat, sections: after.sections },
+					{ state: before.state, status: before.status, run: before.run, chat: before.chat, sections: before.sections },
+				);
+				const records = await activity.readAll();
+				assert.strictEqual(records.length, 1);
+				assert.strictEqual(records[0].taskId, task.id);
+				assert.strictEqual(records[0].message, 'Automatic chat compaction requested at threshold 0.8 for the task-bound session.');
+				assert.strictEqual(records[0].message.includes('existing receipt history'), false);
+			} finally {
+				runManager.dispose();
+				activity.dispose();
+				await cfg.update('chat.autoCompact', previousEnabled, vscode.ConfigurationTarget.Global);
+				await cfg.update('chat.autoCompactThreshold', previousThreshold, vscode.ConfigurationTarget.Global);
+			}
+		});
+
+		test('resumes a failed develop task after compaction without changing its session binding', async () => {
+			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			const previousEnabled = cfg.inspect<unknown>('chat.autoCompact')?.globalValue;
+			const previousThreshold = cfg.inspect<unknown>('chat.autoCompactThreshold')?.globalValue;
+			await cfg.update('chat.autoCompact', true, vscode.ConfigurationTarget.Global);
+			await cfg.update('chat.autoCompactThreshold', 0.8, vscode.ConfigurationTarget.Global);
+			const task = await store.create('Resume after context compaction');
+			const session = sessionIdForTask(task.id, 'kanban-pilot-', store.setId);
+			await store.patch(task.id, { state: 'in-progress', status: 'failed', chat: session, copilotSessionId: 'copilot-existing' });
+			let compacted = false;
+			const compactionService: ContextCompactionAdapter = {
+				prepare: async () => ({ kind: 'ready', threshold: 0.8, experimental: true }),
+				request: async () => {
+					compacted = true;
+					return { kind: 'success', threshold: 0.8, targeting: 'session', experimental: true };
+				},
+			};
+			const executor = new StubExecutor(okReceipt(store, 'develop'));
+			const runManager = new RunManager(
+				store,
+				executor,
+				folder,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				compactionService,
+			);
+
+			try {
+				await runManager.compactTask(task.id);
+				assert.strictEqual(compacted, true);
+				await runManager.handleAction(task.id, 'continue');
+				const after = await waitUntilSettled(store, task.id);
+
+				assert.strictEqual(after.state, 'validation');
+				assert.strictEqual(after.status, 'idle');
+				assert.strictEqual(after.chat, session);
+				assert.strictEqual(executor.calls[0].options.newChatBefore, undefined);
+			} finally {
+				runManager.dispose();
+				await cfg.update('chat.autoCompact', previousEnabled, vscode.ConfigurationTarget.Global);
+				await cfg.update('chat.autoCompactThreshold', previousThreshold, vscode.ConfigurationTarget.Global);
+			}
+		});
+	});
+
 	suite('develop stage', () => {
 		test('a successful develop run advances In Progress → Validation', async () => {
 			const existing = await store.create('Already in validation');
@@ -1845,6 +2078,35 @@ suite('M3 RunManager', () => {
 			assert.strictEqual(after.state, 'in-progress');
 			assert.strictEqual(after.status, 'blocked');
 			assert.match(after.sections['Log'], /implementation evidence/i);
+		});
+
+		test('a Develop success receipt with invalid implementation evidence remains blocked', async () => {
+			const task = await store.create('Reject task and generated evidence');
+			await store.patch(task.id, { state: 'approved', status: 'idle' });
+			const executor = new StubExecutor(async (currentTask, prompt) => {
+				const runId = runIdFromPrompt(prompt);
+				await store.appendLog(currentTask.id, `- implementation-evidence run:${runId} files:".kanban-pilot/generated.js" verify:"npm test"`);
+				await store.appendLog(currentTask.id, formatReceipt({
+					runId,
+					taskId: currentTask.id,
+					stage: 'develop',
+					result: 'ok',
+					note: 'implementation reported as passed',
+				}));
+				return { ok: true, sessionId: 's1' };
+			});
+			const runManager = new RunManager(store, executor, folder);
+
+			await runManager.handleAction(task.id, 'develop');
+			const after = await waitUntilSettled(store, task.id);
+
+			assert.strictEqual(after.state, 'in-progress');
+			assert.strictEqual(after.status, 'blocked');
+			const finish = [...parseAuditEvents(after.sections['Log'])]
+				.reverse()
+				.find((event) => event.kind === 'activity-finish');
+			assert.strictEqual(finish?.outcome, 'blocked');
+			assert.strictEqual(finish?.note, 'Develop implementation evidence must name non-task, non-generated workspace files.');
 		});
 
 		test('a Develop success receipt with changed-file evidence advances', async () => {
@@ -3418,6 +3680,12 @@ suite('M3 RunManager', () => {
 
 		test('correctly infers stage from column when reconciling a lost In Progress run', async () => {
 			const task = await store.create('Set up billing webhook');
+			await store.edit(task.id, {
+				title: task.title,
+				request: task.sections['Request'] ?? '',
+				refined: task.sections['Refined'] ?? '',
+				scope: 'completion-evidence: task-only',
+			});
 			await store.patch(task.id, { state: 'in-progress', status: 'running', run: 'r-lost' });
 			await store.appendLog(task.id, formatReceipt({ runId: 'r-lost', taskId: task.id, stage: 'develop', result: 'ok', note: 'done before reload' }));
 
@@ -3481,6 +3749,12 @@ suite('M3 RunManager', () => {
 		test('reconciles a late timeout receipt when the extension activates', async () => {
 			const task = await store.create('Recover timeout after reload');
 			const runId = 'r-timeout-reload';
+			await store.edit(task.id, {
+				title: task.title,
+				request: task.sections['Request'] ?? '',
+				refined: task.sections['Refined'] ?? '',
+				scope: 'completion-evidence: task-only',
+			});
 			await store.auditedPatch(
 				task.id,
 				{ state: 'in-progress', status: 'running', run: runId },

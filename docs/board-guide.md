@@ -53,6 +53,10 @@ callout is text-based, so the meaning does not depend on the column colour or a 
 	progress and keeps the legal **Stop** action visible.
 - **Blocked** identifies the stage and the recorded reason when one exists. Detail explains that
 	host approval or another host action is holding the task and shows only the legal retry action.
+	For Develop, a chat `PASSED` message is an agent report, not acceptance: the task file's
+	same-run receipt, implementation evidence, and persisted state are authoritative. If
+	RunManager rejects that evidence, the manager's correction reason is shown instead of the
+	earlier success summary, and **Continue** remains the legal retry action.
 - **Failed** shows the stage, run, and failure reason when available. Detail points to the legal
 	retry action instead of treating the failure as a successful completion.
 - **Review Required** means a durable receipt completed but a manual finishing gate still holds
@@ -64,9 +68,47 @@ callout is text-based, so the meaning does not depend on the column colour or a 
 	candidate, so an active-run or stale race is reported as not applied rather than shown as a
 	successful recovery.
 
-After **Apply** or **Recover**, the board reports the host result in a visible status notice. A
-stale task, missing receipt, active run, or other conflict therefore leaves an explanation on the
-board while the task and its open detail refresh from disk.
+## Review Workspace Activity History
+
+Use the **Workspace Activity** button beside the **Task set** controls to open the read-only
+**Workspace Activity History** modal. It shows the active task set's name and a newest-first list
+of board outcomes. Each row includes its UTC timestamp, `success`, `warning`, or `error` level,
+the sanitized message, and the related task id and title when available.
+
+Activity is persisted separately from task Markdown under
+`.kanban-pilot/workspace-activity/<task-set-id>.jsonl`, so it survives board reloads without
+becoming a second task model. Only the newest 100 valid records are exposed; malformed or
+over-limit records are ignored. Switching task sets changes the history source and never mixes
+rows between sets. Pending-completion conflicts and errors, plus stale-recovery results, are
+recorded once with their outcome context. A successful pending completion remains silent when
+there is no former notice to replace.
+
+Opening, refreshing, or closing the modal never edits task files. Escape, the close control, and
+clicking the backdrop close it safely; a task-set refresh clears stale rows before loading the new
+set. The former transient board-notice banner and `board/notice` message are no longer used.
+
+## Read activity provenance and freshness
+
+Task detail labels every activity row and shows a source summary, so an empty or quiet feed is
+not mistaken for an idle or completed run:
+
+- **Durable progress** is a bounded, coarse summary recorded in the task's `## Log`. Its event
+	time is when the summary was recorded; it is durable, but it is not a transcript or a receipt.
+- **Near-real-time hook** is an optional structural observation from the workspace-local hook
+	spool. The summary says whether it is available, enabled but empty, missing, or unreadable.
+	When entries exist, the board distinguishes a recent observation from one whose last observation
+	is stale.
+- **Delayed transcript** is an optional structural observation from Copilot's read-only transcript
+	tail. It is explicitly marked delayed because Copilot flushes transcript records in batches. A
+	row's event time and its separate observed time show that delay without implying live run state.
+
+Each source can be **Disabled**, **Unavailable**, **Enabled · empty**, or **Available**. The
+transcript and hook feeds never change task state or the durable log. On the browser surface,
+hook/transcript activity is withheld unless `chat.transcriptFeedRemote` is also enabled; the
+browser then receives the same bounded metadata and structural rows as the editor, not private
+Copilot conversation content. Prompts, assistant/reasoning text, tool arguments/results,
+credentials, tokens, absolute paths, and sensitive command/query/file targets are not activity
+payloads.
 
 ## Reorder cards
 

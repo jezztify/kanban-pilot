@@ -33,16 +33,21 @@ paths are not reliable.
 Subscribe to `UserPromptSubmit`, `PostToolUse`, and `Stop` as shown, then set
 `kanbanPilot.chat.hookFeed` to `true`. This setup intentionally does not include `PermissionRequest`:
 the VS Code editor does not dispatch that event. The receiver appends redacted structural lines to
-`.kanban-pilot/.hook-spool.jsonl`; a missing or unreadable spool is treated as no activity, and the
-receiver cleans it up when no run is live. Hook entries include event, session/task attribution,
-timestamps, and a tool name where applicable. Tool arguments, tool output, prompt content beyond task
-attribution, transcript contents, and transcript paths are not exposed.
+`.kanban-pilot/.hook-spool.jsonl`; a missing or unreadable spool is reported as **Unavailable** in
+task detail, while a readable spool with no task rows is **Enabled · empty**. The receiver cleans
+it up when no run is live. Hook rows include an event timestamp and a separate observation timestamp,
+so the board can distinguish recent from stale observations without claiming anything about task
+completion. Hook entries include only bounded event, session/task attribution, and a tool name where
+applicable. Tool arguments, tool output, prompt content beyond task attribution, transcript contents,
+transcript paths, credentials, tokens, absolute paths, and sensitive command/query/file-target content
+are not exposed.
 
 The receiver is fail-open: every failure path exits successfully and never blocks a Copilot turn.
 The short five-second hook timeout also prevents a wedged receiver from holding a turn for the
 default thirty seconds. Hook-feed activity stays in the editor unless the existing authenticated
 HTTP endpoint is enabled and `chat.transcriptFeedRemote` is separately set to `true`. That remote
-setting is explicit sharing consent for observed hook or transcript activity; treat the endpoint's
+setting is explicit sharing consent for the bounded structural hook/transcript projection; when it
+is off, the browser receives neither optional rows nor their timestamps. Treat the endpoint's
 token-bearing share URL as a secret and follow the security warning in
 [Real-time HTTP endpoint](http-endpoint.md).
 
