@@ -9,13 +9,17 @@
 	// Turn off tsc task auto detection since we have the necessary tasks as npm scripts
 	"js/ts.tsc.autoDetect": "off",
 	"kanbanPilot.chat.agentNames": {
-		"refine": "Bro LocalRapidPrototyping Orchestrator",
-		"in-progress": "Bro LocalRapidPrototyping Orchestrator",
-		"validation": "Bro LocalRapidPrototyping Orchestrator",
-		"scoped": "Bro LocalRapidPrototyping Orchestrator",
-		"approved": "Bro LocalRapidPrototyping Orchestrator"
+		"refine": "Bro Rapid Architect",
+		"in-progress": "Bro Rapid Coder",
+		"validation": "Bro Rapid QA",
+		"scoped": "Bro Refiner",
+		"approved": "Bro Refiner"
 	},
 	"kanbanPilot.gates.validationAutoStart": "manual",
 	"kanbanPilot.gates.approvedToInProgress": "manual",
-	"kanbanPilot.gates.backlogToRefine": "manual"
+	"kanbanPilot.gates.backlogToRefine": "manual",
+	"kanbanPilot.chat.agentDirectories": [
+		"~/Library/Application Support/Code/User/prompts"
+	],
+	"kanbanPilot.run.maxParallelTasks": 4
 }

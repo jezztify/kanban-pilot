@@ -54,8 +54,35 @@ export interface ReceiptDetails {
 	issues: ReceiptIssue[];
 }
 
+/** Run-scoped proof that a Develop run changed implementation files and verified them. */
+export interface ImplementationEvidence {
+	runId: string;
+	files: string[];
+	verification: string;
+}
+
 const RECEIPT_LINE =
 	/^-\s*run:(\S+)\s+task:(\S+)\s+stage:(refine|develop|validate|split)\s+result:(ok|blocked|failed)\s+note:"([^"]*)"\s*$/;
+const IMPLEMENTATION_EVIDENCE_LINE =
+	/^\-\s*implementation-evidence\s+run:(\S+)\s+files:"([^"]+)"\s+verify:"([^"]+)"\s*$/;
+
+/** Parses well-formed implementation-evidence lines, ignoring malformed entries. */
+export function parseImplementationEvidence(logSection: string): ImplementationEvidence[] {
+	const evidence: ImplementationEvidence[] = [];
+	for (const line of logSection.split(/\r?\n/)) {
+		const match = IMPLEMENTATION_EVIDENCE_LINE.exec(line.trim());
+		if (!match) {
+			continue;
+		}
+		const [, runId, rawFiles, verification] = match;
+		const files = rawFiles.split(',').map((file) => file.trim()).filter(Boolean);
+		if (files.length === 0 || !verification.trim()) {
+			continue;
+		}
+		evidence.push({ runId, files, verification });
+	}
+	return evidence;
+}
 
 /** Parses every well-formed receipt line in a `## Log` section, in file order. */
 export function parseReceipts(logSection: string): Receipt[] {

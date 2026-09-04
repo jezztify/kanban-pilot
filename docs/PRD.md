@@ -498,13 +498,19 @@ A progress line is deliberately **not** a receipt: it carries no `stage`/`result
 completes or moves a task, and the receipt and `audit:` parsers ignore it (distinct `progress`
 prefix). Like a receipt, a line whose `task:` disagrees with the file it appears in is ignored
 (§6.9); `at:` follows the same UTC ISO 8601 second-precision rule as audit timestamps. The board
-projects the most recent `K = 20` progress lines of the selected task into the task detail as a
-bounded, read-only activity feed, re-derived from the task file on every projection so a
-reconnecting browser re-syncs for free. This is the source-D slice recommended by the
-browser-chat-proxy spike (`docs/browser-chat-proxy-spike.md`): notes are human/agent-authored
-summaries — never source, secrets, paths, or tokens — because the feed can ride a shared,
-token-gated HTTP surface, and a `blocked` run is surfaced honestly ("action required at the
-host") since a remote viewer cannot act on it.
+projects bounded, read-only activity metadata for three visibly labeled sources: durable progress
+recorded in the task log, near-real-time structural hook observations, and delayed structural
+transcript observations. Optional sources report Disabled, Unavailable, Enabled · empty, or
+Available rather than making an empty feed look like an idle run. Hook rows carry event and
+observed timestamps and can become stale; transcript rows are always labeled delayed. A browser
+receives optional sources only with the existing `chat.transcriptFeedRemote` opt-in, and
+reconnects reuse the same event/observation timestamps rather than fabricating freshness. This is
+still the source-D slice recommended by the browser-chat-proxy spike
+(`docs/browser-chat-proxy-spike.md`): rows contain bounded structural summaries only — never
+prompts, assistant/reasoning text, tool arguments/results, credentials, tokens, absolute paths,
+or sensitive command/query/file-target content — because the feed can ride a shared, token-gated
+HTTP surface. A `blocked` run is surfaced honestly ("action required at the host") since a remote
+viewer cannot act on it.
 
 ### 6.4 Run lifecycle
 
@@ -1027,6 +1033,33 @@ memory tool — M0's confirming probe used a session that had never existed befo
 still occurred. Splitting sessions is a fix for `newChat`'s reliability, not for R12; layer 0
 (tool exclusion) is required regardless of which reset strategy is in use.
 
+#### Native context compaction (TASK-014)
+
+Kanban Pilot offers an opt-in `chat.autoCompact` setting and a ratio-only
+`chat.autoCompactThreshold` setting. A value such as `0.8` means 80% of the active model's
+context window. The threshold decision and history rewrite belong to Copilot, not to Kanban
+Pilot: the extension never estimates live usage from `metadata.promptTokens`/
+`outputTokens`, transcript files, hook events, or turn counts. A live context-usage display is
+explicitly deferred until a supported usage source exists.
+
+The native settings are experimental and are the source of truth:
+`github.copilot.chat.summarizeAgentConversationHistory.enabled` and
+`github.copilot.chat.summarizeAgentConversationHistoryThreshold`. The extension checks their
+runtime registration and the installed Copilot metadata. It writes only missing values after the
+Kanban opt-in is enabled; an explicit Copilot value wins and a conflict is surfaced rather than
+overwritten. The Kanban setting accepts ratios only, even though Copilot's native threshold also
+supports absolute token counts.
+
+The compatibility check recorded on 2026-09-04 found both native settings in the VS Code 1.133.0
+/ Copilot Chat 0.61.0 and VS Code 1.136.1 / Copilot Chat 0.64.1 test builds. The supported
+extension engine remains `^1.125.0`, but no minimum Copilot version is guaranteed because the
+settings are experimental. Those builds expose `github.copilot.chat.compact`, but its
+implementation opens `/compact` in the focused chat and accepts no supported
+`vscode-chat-session://local` target. Kanban Pilot therefore detects the command for bounded
+diagnostics but never invokes it; only a future explicitly session-targeted host API may be
+used. This prevents an unrelated focused chat from being compacted while preserving the existing
+task session identity and normal run/resume behavior.
+
 ### 6.9 Misroute handling — what M0 changed
 
 The sharpest risk in the system (R8). Three properties compound:
@@ -1240,6 +1273,25 @@ transition logic; it renders a snapshot and emits intents.
 | view → ext | `settings/save` | `{ values }` — validates a batch before writing any values, so malformed settings cannot cause a partial update (§6.17) |
 | view → ext | `settings/reset` | `{ key }` — removes one workspace override, restoring its effective global/default value; gate resets also re-run gate policies (§6.17) |
 | ext → view | `settings/error` | `{ key?, error }` — inline validation or persistence failure for the affected setting (§6.17) |
+
+The board also exposes local find and filter controls above the projection. The Find field
+matches a card's own task id, title fragment, or known parent task id, case-insensitively;
+whitespace-only input is treated as empty. Type offers All, Feature, and Bug. Status offers All
+plus every runtime status (`idle`, `running`, `paused`, `blocked`, and `failed`). Relationship
+offers All, Parent, Child, and Standalone, where Parent means the card has children, Child means
+the card has a parent, and Standalone means it has neither. An intermediate card may match both
+Parent and Child. Active criteria are combined with AND semantics.
+
+Find and filter values are webview-local presentation state. They do not add a protocol message,
+write task files or frontmatter, change positions, invoke task actions, or alter task-set
+selection or workflow state. The board keeps all seven canonical columns and their canonical card
+order; filtered columns show visible counts and a distinct no-match state, while genuinely empty
+columns retain their normal drop target. A result summary reports visible and total card counts.
+A fresh `board/state` snapshot for the same active task set reapplies the local values. When
+`activeTaskSetId` changes, the controls reset while the existing task-set selection flow remains
+unchanged. Labels, keyboard-focusable controls, clear/reset behavior, and the live result summary
+must remain usable at the narrow board breakpoint. The editor and browser surfaces use this same
+generated document, so filtering requires no server-side search API or persisted protocol state.
 
 `task/move` is a manual state override, not a state-machine action: a valid cross-column move
 updates the task's `state`, resets `status` to `idle`, and clears `run` in one frontmatter patch.
@@ -2087,10 +2139,12 @@ session?), which decides §6.8 layer 1 rather than the executor choice.
 6. ~~**Session context across stages.**~~ **Resolved in §6.8** — layer 0 (memory tool
    exclusion) targets the *confirmed* leak vector (R12); layers 1–3 (conversation reset, scope
    hash, inlining) remain for ordinary conversational carryover. The closing exclusion probe
-   answered the side question too: with memory denied on both turns and `newChat` between them,
-   the codeword was **not** recalled — ordinary conversational clearing worked in this run once
-   isolated from the memory-tool confound. One data point, not exhaustive, but no longer
-   "unknown." `/compact` vs `newChat` remains an open efficiency question, not a correctness one.
+  answered the side question too: with memory denied on both turns and `newChat` between them,
+  the codeword was **not** recalled — ordinary conversational clearing worked in this run once
+  isolated from the memory-tool confound. One data point, not exhaustive, but no longer
+  "unknown." TASK-014 now delegates automatic threshold compaction to Copilot's native
+  experimental settings; `/compact` remains unsupported for task-session targeting and is not
+  substituted with `newChat`.
 7. ~~**Tab pressure.**~~ **Resolved in §6.10** — the docked chat opens unpinned, so clicking
    through cards replaces one preview tab instead of accumulating. `closeTabOnDone` remains for
    tabs a user explicitly pinned.

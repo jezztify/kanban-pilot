@@ -192,6 +192,107 @@ function compareTaskIds(a: Task, b: Task): number {
 	return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
+function isTaskId(value: unknown): value is string {
+	return typeof value === 'string' && /^TASK-\d+$/.test(value);
+}
+
+/** Legacy relationship data is tolerated on reads, but only valid links enter projections. */
+function normalizeParentLinks(tasks: Task[]): void {
+	const byId = new Map<string, Task>();
+	for (const task of tasks) {
+		if (!byId.has(task.id)) {
+			byId.set(task.id, task);
+		}
+	}
+
+	const parentIds = new Map<string, string | undefined>();
+	const malformed = new Set<string>();
+	for (const task of tasks) {
+		if (task.parentTaskId === undefined) {
+			parentIds.set(task.id, undefined);
+		} else if (isTaskId(task.parentTaskId)) {
+			parentIds.set(task.id, task.parentTaskId);
+		} else {
+			parentIds.set(task.id, undefined);
+			malformed.add(task.id);
+		}
+	}
+
+	const validity = new Map<string, boolean>();
+	const visiting = new Set<string>();
+	const parentLinkIsValid = (taskId: string): boolean => {
+		if (validity.has(taskId)) {
+			return validity.get(taskId)!;
+		}
+		if (malformed.has(taskId)) {
+			validity.set(taskId, false);
+			return false;
+		}
+		const parentId = parentIds.get(taskId);
+		if (parentId === undefined) {
+			validity.set(taskId, true);
+			return true;
+		}
+		if (parentId === taskId || !byId.has(parentId) || visiting.has(taskId)) {
+			validity.set(taskId, false);
+			return false;
+		}
+
+		visiting.add(taskId);
+		const valid = parentLinkIsValid(parentId);
+		visiting.delete(taskId);
+		validity.set(taskId, valid);
+		return valid;
+	};
+
+	for (const task of tasks) {
+		if (task.parentTaskId !== undefined && !parentLinkIsValid(task.id)) {
+			task.parentTaskId = undefined;
+		}
+	}
+}
+
+function validateParentLink(tasks: readonly Task[], childId: string, parentId: unknown): void {
+	if (parentId === undefined || parentId === '') {
+		return;
+	}
+	if (!isTaskId(parentId)) {
+		throw new Error('Parent task must be a valid Task ID.');
+	}
+	if (parentId === childId) {
+		throw new Error(`Task ${childId} cannot be its own parent.`);
+	}
+
+	const parent = tasks.find((task) => task.id === parentId);
+	if (!parent) {
+		throw new Error(`Parent task ${parentId} was not found in the active task set.`);
+	}
+
+	const byId = new Map(tasks.map((task) => [task.id, task]));
+	const visited = new Set<string>([childId]);
+	let current: Task | undefined = parent;
+	while (current) {
+		if (visited.has(current.id)) {
+			throw new Error('Parent task links cannot contain a cycle.');
+		}
+		visited.add(current.id);
+		if (current.parentTaskId === undefined) {
+			return;
+		}
+		current = byId.get(current.parentTaskId);
+		if (!current) {
+			return;
+		}
+	}
+}
+
+function validateParentUpdate(tasks: readonly Task[], childId: string, updates: Record<string, string | undefined>): void {
+	if (!Object.prototype.hasOwnProperty.call(updates, 'parent_task')) {
+		return;
+	}
+	validateParentLink(tasks, childId, updates.parent_task);
+}
+
 /**
  * Positions are intentionally sparse and may have been hand-edited. Valid
  * values sort first; absent/invalid values retain a deterministic legacy
@@ -452,6 +553,7 @@ export class TaskStore {
 			}
 		}
 
+		normalizeParentLinks(tasks);
 		return { tasks, malformed };
 	}
 
@@ -770,6 +872,7 @@ export class TaskStore {
 			await this.ensureDirectory();
 			const id = await this.nextId();
 			const { tasks } = await this.readAllInternal(false);
+			validateParentLink(tasks, id, options.parentTaskId);
 			const backlog = orderTasks(tasks.filter((task) => task.state === 'backlog'));
 			const position = backlog.length;
 			const allocated = await this.allocateAttachments(id, attachmentChanges.add);
@@ -781,6 +884,7 @@ export class TaskStore {
 			}, allocated, []);
 			const content = newTaskFile(id, title, {
 				type: options.type,
+				parentTaskId: options.parentTaskId,
 				request: options.origin ? options.request : materialized.request,
 				origin: options?.origin,
 				position,
@@ -1010,6 +1114,10 @@ export class TaskStore {
 			validatePendingUpdate(updates);
 			const uri = this.fileFor(id);
 			const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+			if (Object.prototype.hasOwnProperty.call(updates, 'parent_task')) {
+				const { tasks } = await this.readAllInternal(false);
+				validateParentUpdate(tasks, id, updates);
+			}
 			const invalidatesPending = ['state', 'status', 'run'].some((key) =>
 				Object.prototype.hasOwnProperty.call(updates, key),
 			);
@@ -1044,6 +1152,10 @@ export class TaskStore {
 			const before = taskFromRaw(raw, id, this.setId);
 			if (!before) {
 				throw new Error(`Cannot audit an unparseable task: ${id}`);
+			}
+			if (Object.prototype.hasOwnProperty.call(updates, 'parent_task')) {
+				const { tasks } = await this.readAllInternal(false);
+				validateParentUpdate(tasks, id, updates);
 			}
 			if (
 				options.expected?.state !== undefined && before.state !== options.expected.state ||
@@ -1147,6 +1259,11 @@ export class TaskStore {
 		await this.serialize(async () => {
 			if (!/^TASK-\d+$/.test(id)) {
 				throw new Error(`Invalid task id: ${id}`);
+			}
+			const { tasks } = await this.readAllInternal(false);
+			const children = tasks.filter((task) => task.parentTaskId === id);
+			if (children.length > 0) {
+				throw new Error(`Cannot delete ${id} while it has child tasks: ${children.map((task) => task.id).join(', ')}.`);
 			}
 			try {
 				await vscode.workspace.fs.delete(this.attachmentDirectoryFor(id), { recursive: true });

@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import {
 	applyPendingOutcome as applyPendingTaskOutcome,
@@ -15,12 +16,18 @@ import { AgentNameOverrides, resolveAgentName } from './agentNames';
 import { TranscriptTailService } from './transcriptTail';
 import type { HookSpoolReceiver } from './hookSpool';
 import { Executor, ExecutorResult } from './executor';
+import {
+	ContextCompactionRequest,
+	ContextCompactionResult,
+	ContextCompactionAdapter,
+} from './contextCompaction';
 import { TASK_ATTACHMENT_CONTEXT, loadPromptTemplate, renderTemplate } from './promptTemplates';
 import { proposalFingerprint, proposalsForRun } from './proposals';
 import type { Proposal } from './proposals';
 import {
 	findReceiptDetails,
 	formatReceipt,
+	parseImplementationEvidence,
 	parseReceipts,
 	Receipt,
 	ReceiptExpectation,
@@ -38,6 +45,7 @@ import {
 	GatePolicy,
 	StageStartGateDefinition,
 } from '../model/gates';
+import type { WorkspaceActivityStore } from '../model/workspaceActivity';
 
 /** §6.12: a run can propose at most this many follow-up tasks — a cap, not a target. */
 const MAX_PROPOSALS_PER_RUN = 5;
@@ -53,6 +61,15 @@ const POST_RECEIPT_PROPOSAL_GRACE_MS = 5_000;
 const LATE_RECEIPT_MARKER = 'awaiting late receipt';
 const appliedReceiptKeys = new Set<string>();
 const inFlightReceiptKeys = new Set<string>();
+const IMPLEMENTATION_EVIDENCE_EXCLUDED_DIRECTORIES = new Set([
+	'.git',
+	'.kanban-pilot',
+	'.vscode-test',
+	'dist',
+	'dist-test',
+	'node_modules',
+]);
+const IMPLEMENTATION_BASELINE_DIRECTORY = ['.kanban-pilot', '.develop-baselines'] as const;
 
 class AdmissionMutex {
 	private tail: Promise<void> = Promise.resolve();
@@ -233,6 +250,8 @@ interface RunManagerConfig {
 	dockChat: boolean;
 	dockChatOnSelect: boolean;
 	allowTaskProposals: boolean;
+	autoCompact: boolean;
+	autoCompactThreshold: unknown;
 	gatePolicies: Record<GateId, GatePolicy>;
 }
 
@@ -253,6 +272,8 @@ function readConfig(): RunManagerConfig {
 		dockChat: cfg.get<boolean>('layout.dockChat', true),
 		dockChatOnSelect: cfg.get<boolean>('layout.dockChatOnSelect', false),
 		allowTaskProposals: cfg.get<boolean>('chat.allowTaskProposals', true),
+		autoCompact: cfg.get<boolean>('chat.autoCompact', false),
+		autoCompactThreshold: cfg.get<unknown>('chat.autoCompactThreshold', 0.8),
 		gatePolicies: Object.fromEntries(
 			GATE_CATALOG.map((gate) => [
 				gate.id,
@@ -424,6 +445,7 @@ export type CommandExecutor = <T>(command: string, ...args: unknown[]) => Thenab
 export type RunChangeKind =
 	| 'start'
 	| 'progress'
+	| 'task'
 	| 'stop'
 	| 'blocked'
 	| 'failed'
@@ -467,10 +489,12 @@ export class RunManager {
 	private readonly postReceiptProposalRuns = new Set<string>();
 	private readonly ownedReservations = new Map<string, { taskId: string; runId: string }>();
 	private readonly activeExecutorRuns = new Map<string, Task>();
+	private readonly implementationBaselines = new Map<string, Map<string, string>>();
 	private readonly changed = new vscode.EventEmitter<RunManagerChange>();
 	private readonly progressTimers = new Set<ReturnType<typeof setInterval>>();
 	private disposed = false;
 	private readonly hookFeedSubscription: vscode.Disposable | undefined;
+	private readonly transcriptFeedSubscription: vscode.Disposable | undefined;
 
 	constructor(
 		private readonly store: TaskStore,
@@ -483,12 +507,21 @@ export class RunManager {
 		readonly transcriptTail?: TranscriptTailService,
 		/** Optional real-time hook feed receiver (TASK-015). */
 		readonly hookSpool?: HookSpoolReceiver,
+		/** Optional native Copilot compaction adapter (TASK-014). */
+		readonly compactionService?: ContextCompactionAdapter,
+		/** Optional sanitized activity sink for compaction outcomes (TASK-014). */
+		readonly workspaceActivity?: WorkspaceActivityStore,
 	) {
 		this.concurrency = coordinatorFor(workspaceFolder, store);
 		// A hook spool write touches no task file, so nothing would republish the
 		// projection on its own. Re-firing it as a run change routes it through the
 		// same path the board and the browser already listen on.
 		this.hookFeedSubscription = hookSpool?.onDidChange((taskId) => {
+			this.notify({ kind: 'progress', ...(taskId ? { taskId } : {}) });
+		});
+		// Transcript observations arrive outside the task-file watcher, so route
+		// them through the same board/browser refresh path as hook observations.
+		this.transcriptFeedSubscription = transcriptTail?.onDidChange((taskId) => {
 			this.notify({ kind: 'progress', taskId });
 		});
 	}
@@ -503,8 +536,181 @@ export class RunManager {
 		}
 	}
 
+	private compactionRequest(cfg: RunManagerConfig): ContextCompactionRequest {
+		return {
+			enabled: cfg.autoCompact,
+			threshold: cfg.autoCompactThreshold,
+			mode: cfg.mode,
+			sessionPrefix: cfg.sessionPrefix,
+		};
+	}
+
+	private compactionAdapterFailure(): ContextCompactionResult {
+		return {
+			kind: 'unavailable',
+			reason: 'adapter-failed',
+			experimental: true,
+		};
+	}
+
+	/**
+	 * Persists fixed structural messages only. The adapter intentionally returns
+	 * no command error text, and this method never copies a prompt, response,
+	 * transcript, path, or secret into workspace activity.
+	 */
+	private async recordCompactionOutcome(task: Task, outcome: ContextCompactionResult): Promise<void> {
+		if (!this.workspaceActivity || outcome.kind === 'ready') {
+			return;
+		}
+		let level: 'success' | 'warning' | 'error';
+		let message: string;
+		switch (outcome.kind) {
+			case 'disabled':
+				return;
+			case 'invalid':
+				level = 'error';
+				message = 'Automatic chat compaction was skipped because its threshold is invalid.';
+				break;
+			case 'unsupported':
+				level = 'warning';
+				message = outcome.reason === 'session-target-unavailable'
+					? 'Automatic chat compaction is unsupported because Copilot exposes no task-session target; native background compaction remains available when configured.'
+					: 'Automatic chat compaction is unsupported by the current Copilot capability.';
+				break;
+			case 'unavailable':
+				level = 'warning';
+				message = 'Automatic chat compaction is unavailable; normal task execution remains usable.';
+				break;
+			case 'conflict':
+				level = 'warning';
+				message = 'Automatic chat compaction was not applied because an explicit Copilot setting conflicts.';
+				break;
+			case 'duplicate':
+				level = 'warning';
+				message = 'Duplicate automatic chat compaction was suppressed while the task session was busy.';
+				break;
+			case 'success':
+				level = 'success';
+				message = `Automatic chat compaction requested at threshold ${outcome.threshold} for the task-bound session.`;
+				break;
+			case 'failed':
+				level = 'error';
+				message = 'Automatic chat compaction failed; normal task execution remains usable.';
+				break;
+		}
+		try {
+			await this.workspaceActivity.append({ level, message, taskId: task.id });
+		} catch {
+			// Activity is diagnostic only; a write failure must not alter a task run.
+		}
+	}
+
 	private reservationKey(taskId: string, runId: string): string {
 		return `${taskId}\u0000${runId}`;
+	}
+
+	private isImplementationEvidencePath(path: string): boolean {
+		const segments = path.split('/');
+		return path.length > 0 && !segments.some((segment) =>
+			segment === '..' || IMPLEMENTATION_EVIDENCE_EXCLUDED_DIRECTORIES.has(segment),
+		);
+	}
+
+	private async implementationFileSnapshot(
+		directory = this.workspaceFolder.uri,
+		prefix = '',
+		files = new Map<string, string>(),
+	): Promise<Map<string, string>> {
+		for (const [name, type] of await vscode.workspace.fs.readDirectory(directory)) {
+			const relativePath = prefix ? `${prefix}/${name}` : name;
+			if (!this.isImplementationEvidencePath(relativePath)) {
+				continue;
+			}
+			const uri = vscode.Uri.joinPath(directory, name);
+			if (type === vscode.FileType.Directory) {
+				await this.implementationFileSnapshot(uri, relativePath, files);
+			} else if (type === vscode.FileType.File) {
+				const contents = await vscode.workspace.fs.readFile(uri);
+				files.set(relativePath, createHash('sha256').update(contents).digest('hex'));
+			}
+		}
+		return files;
+	}
+
+	private implementationBaselineUri(taskId: string, runId: string): vscode.Uri {
+		const key = createHash('sha256')
+			.update(`${this.store.setId}\u0000${taskId}\u0000${runId}`)
+			.digest('hex');
+		return vscode.Uri.joinPath(this.workspaceFolder.uri, ...IMPLEMENTATION_BASELINE_DIRECTORY, `${key}.json`);
+	}
+
+	private async persistImplementationBaseline(taskId: string, runId: string, baseline: Map<string, string>): Promise<void> {
+		const uri = this.implementationBaselineUri(taskId, runId);
+		const directory = vscode.Uri.joinPath(this.workspaceFolder.uri, ...IMPLEMENTATION_BASELINE_DIRECTORY);
+		await vscode.workspace.fs.createDirectory(directory);
+		const temporary = uri.with({ path: `${uri.path}.tmp` });
+		await vscode.workspace.fs.writeFile(
+			temporary,
+			Buffer.from(JSON.stringify(Object.fromEntries(baseline)), 'utf8'),
+		);
+		await vscode.workspace.fs.rename(temporary, uri, { overwrite: true });
+	}
+
+	private async implementationBaselineFor(taskId: string, runId: string): Promise<Map<string, string> | undefined> {
+		const key = this.reservationKey(taskId, runId);
+		const inMemory = this.implementationBaselines.get(key);
+		if (inMemory) {
+			return inMemory;
+		}
+
+		try {
+			const raw = Buffer.from(await vscode.workspace.fs.readFile(this.implementationBaselineUri(taskId, runId))).toString('utf8');
+			const parsed: unknown = JSON.parse(raw);
+			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+				return undefined;
+			}
+			const entries = Object.entries(parsed);
+			if (entries.some(([, hash]) => typeof hash !== 'string')) {
+				return undefined;
+			}
+			const baseline = new Map(entries as [string, string][]);
+			this.implementationBaselines.set(key, baseline);
+			return baseline;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async clearImplementationBaseline(taskId: string, runId: string): Promise<void> {
+		this.implementationBaselines.delete(this.reservationKey(taskId, runId));
+		try {
+			await vscode.workspace.fs.delete(this.implementationBaselineUri(taskId, runId));
+		} catch {
+			// A missing baseline is already clean; cleanup must not change the outcome.
+		}
+	}
+
+	private async developEvidenceFailure(task: Task, runId: string): Promise<string | undefined> {
+		if (/^\s*completion-evidence:\s*task-only\s*$/mi.test(task.sections['Scope'] ?? '')) {
+			return undefined;
+		}
+		const evidence = parseImplementationEvidence(task.sections['Log'] ?? '').filter((entry) => entry.runId === runId);
+		if (evidence.length === 0) {
+			return 'Develop completion requires implementation evidence with changed files and verification.';
+		}
+		const baseline = await this.implementationBaselineFor(task.id, runId);
+		if (!baseline) {
+			return 'Develop completion cannot verify implementation changes because its workspace baseline is unavailable.';
+		}
+		const current = await this.implementationFileSnapshot();
+		const files = evidence.flatMap((entry) => entry.files);
+		if (files.some((file) => !this.isImplementationEvidencePath(file))) {
+			return 'Develop implementation evidence must name non-task, non-generated workspace files.';
+		}
+		if (!files.some((file) => current.has(file) && current.get(file) !== baseline.get(file))) {
+			return 'Develop completion evidence does not identify a workspace file changed during this run.';
+		}
+		return undefined;
 	}
 
 	private releaseReservation(taskId: string, runId: string): void {
@@ -518,6 +724,7 @@ export class RunManager {
 		}
 		this.disposed = true;
 		this.hookFeedSubscription?.dispose();
+		this.transcriptFeedSubscription?.dispose();
 		for (const { taskId, runId } of this.ownedReservations.values()) {
 			this.releaseReservation(taskId, runId);
 		}
@@ -758,6 +965,31 @@ export class RunManager {
 			// Docking is a convenience; a task with no session yet (never run) has
 			// nothing to open, and that's fine — the first run will mint it.
 		}
+	}
+
+	/**
+	 * Requests native compaction for one task without changing its workflow
+	 * state, receipt history, run id, or capacity reservation. Automatic timing
+	 * is owned by Copilot's native threshold setting; an explicit request is
+	 * delegated only when a supported task-session target is available.
+	 */
+	async compactTask(taskId: string): Promise<ContextCompactionResult | undefined> {
+		if (this.disposed || !this.compactionService) {
+			return undefined;
+		}
+		const cfg = readConfig();
+		const task = (await this.store.readAll()).tasks.find((candidate) => candidate.id === taskId);
+		if (this.disposed || !task) {
+			return undefined;
+		}
+		let outcome: ContextCompactionResult;
+		try {
+			outcome = await this.compactionService.request(task, this.compactionRequest(cfg));
+		} catch {
+			outcome = this.compactionAdapterFailure();
+		}
+		await this.recordCompactionOutcome(task, outcome);
+		return outcome;
 	}
 
 	/** `Kanban Pilot: Mark Run Complete` (§6.4) — the escape hatch for a missing receipt. */
@@ -1238,6 +1470,11 @@ export class RunManager {
 				return;
 			}
 			const executorRunKey = this.reservationKey(taskId, runId);
+			if (stage === 'develop') {
+				const baseline = await this.implementationFileSnapshot();
+				await this.persistImplementationBaseline(taskId, runId, baseline);
+				this.implementationBaselines.set(executorRunKey, baseline);
+			}
 			this.activeExecutorRuns.set(executorRunKey, latest);
 			if (cfg.transcriptFeed) {
 				// A first run has no copilot_session_id yet — it is harvested from the
@@ -1246,6 +1483,17 @@ export class RunManager {
 				await this.transcriptTail?.start(taskId, {
 					...(latest.copilotSessionId ? { sessionId: latest.copilotSessionId } : {}),
 				});
+			}
+			if (cfg.autoCompact && this.compactionService) {
+				let compactionPreparation: ContextCompactionResult;
+				try {
+					compactionPreparation = await this.compactionService.prepare(this.compactionRequest(cfg));
+				} catch {
+					compactionPreparation = this.compactionAdapterFailure();
+				}
+				if (compactionPreparation.kind !== 'ready') {
+					await this.recordCompactionOutcome(latest, compactionPreparation);
+				}
 			}
 			const outcome = await raceWithTimeout(
 				this.executor.run(latest, this.store.fileFor(latest.id), prompt, stage, {
@@ -1280,6 +1528,9 @@ export class RunManager {
 		} finally {
 			this.transcriptTail?.stop(taskId);
 			this.activeExecutorRuns.delete(this.reservationKey(taskId, runId));
+			// Keep the persisted Develop baseline available for a late receipt after
+			// this executor chain and its manager instance have finished.
+			this.implementationBaselines.delete(this.reservationKey(taskId, runId));
 			clearInterval(progressTimer);
 			this.progressTimers.delete(progressTimer);
 			this.notify({ kind: 'completion', taskId, runId, stage });
@@ -1921,6 +2172,21 @@ export class RunManager {
 			if (this.disposed || !fresh || !isCurrent(fresh)) {
 				return;
 			}
+			if (stage === 'develop' && receipt.result === 'ok') {
+				const evidenceFailure = await this.developEvidenceFailure(fresh, runId);
+				if (evidenceFailure) {
+					await this.applyOutcome(taskId, runId, stage, 'blocked', fresh.sections['Scope'], {
+						correction: options.correction ?? !initial.run,
+						note: evidenceFailure,
+						action: options.action ?? (initial.run ? 'receipt' : 'late-receipt'),
+						transitionAction: options.transitionAction,
+					});
+					await this.clearImplementationBaseline(taskId, runId);
+					this.notify({ kind: 'blocked', taskId, runId, stage, note: evidenceFailure });
+					appliedReceiptKeys.add(key);
+					return;
+				}
+			}
 
 			await this.applyOutcome(
 				taskId,
@@ -1935,6 +2201,9 @@ export class RunManager {
 					transitionAction: options.transitionAction,
 				},
 			);
+			if (stage === 'develop') {
+				await this.clearImplementationBaseline(taskId, runId);
+			}
 			if (this.disposed) {
 				return;
 			}
@@ -2392,7 +2661,11 @@ export class RunManager {
 		type: Task['type'],
 		fingerprint: string,
 	): boolean {
-		if (child.originTask !== parent.id || child.type !== type) {
+		const effectiveParentId = proposal.parentTaskId ?? parent.id;
+		const parentMatches = child.parentTaskId === effectiveParentId || (
+			proposal.parentTaskId === undefined && child.parentTaskId === undefined
+		);
+		if (child.originTask !== parent.id || child.type !== type || !parentMatches) {
 			return false;
 		}
 		if (child.originRunId !== undefined && child.originRunId !== runId) {
@@ -2427,6 +2700,7 @@ export class RunManager {
 			.filter((candidate, index, all) =>
 				all.findIndex((other) =>
 					other.type === candidate.type &&
+					(other.proposal.parentTaskId ?? task.id) === (candidate.proposal.parentTaskId ?? task.id) &&
 					other.proposal.title === candidate.proposal.title &&
 					other.proposal.note === candidate.proposal.note,
 				) === index,
@@ -2440,11 +2714,17 @@ export class RunManager {
 			const fingerprint = proposalFingerprint(proposal, type);
 			accepted.push({ proposal, type, fingerprint });
 			if (known.some((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint))) {
+				const existing = known.find((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint));
+				if (existing && proposal.parentTaskId === undefined && existing.parentTaskId === undefined) {
+					await this.store.patch(existing.id, { parent_task: task.id });
+					existing.parentTaskId = task.id;
+				}
 				continue;
 			}
 
 			const child = await this.store.create(proposal.title, {
 				type,
+				parentTaskId: proposal.parentTaskId ?? task.id,
 				origin: { taskId: task.id, runId, note: proposal.note, proposalKey: fingerprint },
 			});
 			known.push(child);
@@ -2455,6 +2735,9 @@ export class RunManager {
 		const persisted = accepted.filter(({ proposal, type, fingerprint }) =>
 			persistedTasks.some((child) => this.proposalMatches(child, task, runId, proposal, type, fingerprint)),
 		).length;
+		if (created > 0) {
+			this.notify({ kind: 'task', taskId: task.id, note: `${created} child task${created === 1 ? '' : 's'} created.` });
+		}
 		return { accepted: accepted.length, persisted, created };
 	}
 

@@ -2,13 +2,15 @@ import * as vscode from 'vscode';
 import { deleteTask, pickTaskFor } from './board/actions';
 import { BoardPanel, BoardTaskSetChange } from './board/boardPanel';
 import { TaskAction } from './board/stateMachine';
-import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, OutboundPayloadSeam } from './chat/executor';
+import { ChatSessionExecutor, ChatCommandApi, CHAT_CANCEL_COMMAND, CHAT_COMPACT_COMMAND, OutboundPayloadSeam } from './chat/executor';
+import { ContextCompactionService, NATIVE_COMPACTION_ENABLED, NATIVE_COMPACTION_THRESHOLD } from './chat/contextCompaction';
 import { CommandExecutor, normalizeMaxParallelTasks, RunManager, StaleCompletionCandidate } from './chat/runManager';
 import { TranscriptTailService } from './chat/transcriptTail';
 import { HookSpoolReceiver, SPOOL_RELATIVE_PATH } from './chat/hookSpool';
 import { isTaskType, TaskType } from './model/task';
 import { DEFAULT_TASK_SET_ID, TaskSet, TaskSetError, TaskSetRegistry } from './model/taskSets';
 import { TaskStore, TaskStoreChange } from './model/taskStore';
+import { WorkspaceActivityStore } from './model/workspaceActivity';
 import { CHAT_SESSION_SCHEME, parseSessionUri } from './chat/sessionUri';
 import { endpointConnectionUrl, httpEndpointConfig, isNonLoopbackBindAddress, RealtimeBoardServer, startRealtimeBoardServer } from './http/realtimeBoardServer';
 import { showEndpointSharePanel } from './http/endpointSharePanel';
@@ -43,6 +45,7 @@ const outboundSeam: OutboundPayloadSeam = {
 };
 
 const executor = new ChatSessionExecutor(tracedChatCommands(), {}, outboundSeam);
+const contextCompactionService = new ContextCompactionService(executor);
 
 /**
  * Diagnostic tracing for the chat-open path. Every VS Code command that can
@@ -71,7 +74,7 @@ function describeChatCommandArgs(command: string, args: readonly unknown[]): str
 function logChatCommand(source: string, command: string, args: readonly unknown[]): void {
 	const isChatCommand = command === 'vscode.open'
 		? args[0] instanceof vscode.Uri && (args[0] as vscode.Uri).scheme === CHAT_SESSION_SCHEME
-		: command.startsWith('workbench.action.chat.');
+		: command.startsWith('workbench.action.chat.') || command === CHAT_COMPACT_COMMAND;
 	if (!isChatCommand) {
 		return;
 	}
@@ -101,7 +104,7 @@ function traceRunManagerAction(message: string): void {
 	outboundLog.appendLine(`[chat-trace] ${new Date().toISOString()} via=action ${message}`);
 }
 
-export type WorkspaceChangeKind = 'task' | 'attachment' | 'configuration' | 'task-set' | 'run' | 'reconnect';
+export type WorkspaceChangeKind = 'task' | 'attachment' | 'configuration' | 'task-set' | 'run' | 'activity' | 'reconnect';
 
 export interface WorkspaceTaskSetChange extends BoardTaskSetChange {
 	kind: WorkspaceChangeKind;
@@ -125,9 +128,11 @@ export class WorkspaceTaskSetContext {
 	readonly registry: TaskSetRegistry;
 	private currentSet: TaskSet;
 	private currentStore: TaskStore;
+	private currentWorkspaceActivity: WorkspaceActivityStore;
 	private currentRunManager: RunManager;
 	private watcher: vscode.Disposable | undefined;
 	private runChange: vscode.Disposable | undefined;
+	private activityChange: vscode.Disposable | undefined;
 	private readonly configurationWatcher: vscode.Disposable;
 	private watcherQueue: Promise<void> = Promise.resolve();
 	private taskSetOperationTail: Promise<void> = Promise.resolve();
@@ -146,8 +151,18 @@ export class WorkspaceTaskSetContext {
 		this.registry = new TaskSetRegistry(folder, tasksDir);
 		this.currentSet = this.registry.defaultSet;
 		this.currentStore = new TaskStore(this.currentSet.directory, this.currentSet.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(folder.uri, this.currentSet.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
 		this.configurationWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
+			if (
+				event.affectsConfiguration('kanbanPilot.chat.autoCompact') ||
+				event.affectsConfiguration('kanbanPilot.chat.autoCompactThreshold') ||
+				event.affectsConfiguration(NATIVE_COMPACTION_ENABLED) ||
+				event.affectsConfiguration(NATIVE_COMPACTION_THRESHOLD)
+			) {
+				contextCompactionService.invalidate();
+				void contextCompactionService.synchronize().catch(() => undefined);
+			}
 			if (event.affectsConfiguration('kanbanPilot') || event.affectsConfiguration('chat.agentFilesLocations')) {
 				this.emitChange('configuration');
 			}
@@ -156,7 +171,7 @@ export class WorkspaceTaskSetContext {
 	}
 
 	get revision(): number {
-		return Math.max(this.revisionValue, this.currentStore.revision);
+		return Math.max(this.revisionValue, this.currentStore.revision, this.currentWorkspaceActivity.revision);
 	}
 
 	get activeSet(): TaskSet {
@@ -169,6 +184,10 @@ export class WorkspaceTaskSetContext {
 
 	get runManager(): RunManager {
 		return this.currentRunManager;
+	}
+
+	get workspaceActivity(): WorkspaceActivityStore {
+		return this.currentWorkspaceActivity;
 	}
 
 	onDidChange(listener: (change?: WorkspaceTaskSetChange) => void): vscode.Disposable {
@@ -217,15 +236,19 @@ export class WorkspaceTaskSetContext {
 		const generation = ++this.setGeneration;
 		this.watcher?.dispose();
 		this.runChange?.dispose();
+		this.activityChange?.dispose();
 		if (this.storeChangeTimer !== undefined) {
 			clearTimeout(this.storeChangeTimer);
 			this.storeChangeTimer = undefined;
 		}
 		this.pendingStoreChanges.clear();
 		const previousManager = this.currentRunManager;
+		const previousActivity = this.currentWorkspaceActivity;
 		this.currentSet = set;
 		this.currentStore = new TaskStore(set.directory, set.id);
-		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool);
+		this.currentWorkspaceActivity = new WorkspaceActivityStore(this.folder.uri, set.id);
+		this.currentRunManager = new RunManager(this.currentStore, executor, this.folder, undefined, tracedRunManagerCommand, traceRunManagerAction, transcriptTail, hookSpool, contextCompactionService, this.currentWorkspaceActivity);
+		previousActivity.dispose();
 		if (previousManager !== this.currentRunManager) {
 			previousManager.dispose();
 		}
@@ -234,7 +257,14 @@ export class WorkspaceTaskSetContext {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {
 				return;
 			}
-			this.emitChange('run', change.taskId, change.note);
+			this.emitChange(change.kind === 'task' ? 'task' : 'run', change.taskId, change.note);
+		});
+		const activity = this.currentWorkspaceActivity;
+		this.activityChange = activity.onDidChange((record) => {
+			if (generation !== this.setGeneration || activity !== this.currentWorkspaceActivity) {
+				return;
+			}
+			this.emitChange('activity', record.taskId, 'workspace activity appended');
 		});
 		this.watcher = this.currentStore.watchChanges((change) => {
 			if (generation !== this.setGeneration || manager !== this.currentRunManager) {
@@ -469,8 +499,11 @@ export class WorkspaceTaskSetContext {
 		this.pendingStoreChanges.clear();
 		this.runChange?.dispose();
 		this.runChange = undefined;
+		this.activityChange?.dispose();
+		this.activityChange = undefined;
 		this.configurationWatcher.dispose();
 		this.currentRunManager.dispose();
+		this.currentWorkspaceActivity.dispose();
 		this.changed.dispose();
 	}
 }
@@ -591,6 +624,8 @@ function registerActionCommand(
 }
 
 export function activate(context_: vscode.ExtensionContext) {
+	context_.subscriptions.push({ dispose: () => contextCompactionService.dispose() });
+	void contextCompactionService.synchronize().catch(() => undefined);
 	if (context_.storageUri) {
 		transcriptTail = new TranscriptTailService(context_.storageUri);
 		context_.subscriptions.push({ dispose: () => transcriptTail?.dispose() });
