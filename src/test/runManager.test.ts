@@ -973,9 +973,21 @@ suite('M3 RunManager', () => {
 
 			await runManager.handleAction(task.id, 'refine');
 			const after = await waitUntilSettled(store, task.id);
+			const runId = runIdFromPrompt(executor.calls[0].prompt);
 
 			assert.strictEqual(after.state, 'scoped');
 			assert.strictEqual(after.status, 'idle');
+			assert.strictEqual(after.run, undefined);
+			assert.strictEqual(after.pendingOutcome, undefined);
+			assert.strictEqual(after.sections['Log'].includes('awaiting late receipt'), false);
+			const receipts = parseReceipts(after.sections['Log']).filter((receipt) => receipt.runId === runId);
+			assert.strictEqual(receipts.length, 1);
+			assert.strictEqual(receipts[0].result, 'ok');
+			assert.strictEqual(receipts[0].note, 'written after executor return');
+			const finishes = parseAuditEvents(after.sections['Log']).filter(
+				(event) => event.kind === 'activity-finish' && event.runId === runId,
+			);
+			assert.strictEqual(finishes.length, 1, 'the delayed receipt must be applied exactly once');
 		});
 
 		test('a receipt written after the reconciliation grace period is recovered without a file watcher', async () => {
@@ -988,7 +1000,7 @@ suite('M3 RunManager', () => {
 						t.id,
 						formatReceipt({ runId, taskId: t.id, stage: 'refine', result: 'ok', note: 'written after fallback' }),
 					);
-				}, 300);
+				}, 750);
 				return { ok: true, sessionId: 's1' };
 			});
 			const runManager = new RunManager(store, executor, folder);
@@ -3261,11 +3273,17 @@ suite('M3 RunManager', () => {
 	suite('configurable run capacity', () => {
 		async function withMaxParallelTasks(value: unknown, fn: () => Promise<void>): Promise<void> {
 			const cfg = vscode.workspace.getConfiguration('kanbanPilot');
+			const expected = normalizeMaxParallelTasks(value);
+			const observed = (): number => normalizeMaxParallelTasks(
+				vscode.workspace.getConfiguration('kanbanPilot').get<unknown>('run.maxParallelTasks', 1),
+			);
 			try {
 				await cfg.update('run.maxParallelTasks', value, vscode.ConfigurationTarget.Global);
+				await waitUntil(() => observed() === expected);
 				await fn();
 			} finally {
 				await cfg.update('run.maxParallelTasks', undefined, vscode.ConfigurationTarget.Global);
+				await waitUntil(() => observed() === normalizeMaxParallelTasks(undefined));
 			}
 		}
 
