@@ -49,7 +49,7 @@ import type { WorkspaceActivityStore } from '../model/workspaceActivity';
 
 /** §6.12: a run can propose at most this many follow-up tasks — a cap, not a target. */
 const MAX_PROPOSALS_PER_RUN = 5;
-const RECEIPT_GRACE_MS = 250;
+const RECEIPT_GRACE_MS = 500;
 const RECEIPT_POLL_MS = 10;
 // The fallback must remain responsive when watcher events are coalesced with
 // the timeout write; defer only long enough to let the usual watcher win.

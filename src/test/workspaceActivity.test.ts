@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
@@ -8,7 +9,7 @@ import {
 
 function workspaceRoot(label: string): vscode.Uri {
 	return vscode.Uri.file(path.join(
-	process.env.TEMP || process.env.TMP || '.',
+	os.tmpdir(),
 	`kanban-pilot-workspace-activity-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
 	));
 }

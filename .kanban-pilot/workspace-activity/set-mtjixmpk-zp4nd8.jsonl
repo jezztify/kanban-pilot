@@ -7,3 +7,5 @@
 {"timestamp":"2026-09-06T03:00:04.375Z","level":"warning","message":"Automatic chat compaction is unavailable; normal task execution remains usable.","taskId":"TASK-020"}
 {"timestamp":"2026-09-06T03:17:27.670Z","level":"warning","message":"Automatic chat compaction is unavailable; normal task execution remains usable.","taskId":"TASK-021"}
 {"timestamp":"2026-09-06T03:19:03.599Z","level":"warning","message":"Automatic chat compaction is unavailable; normal task execution remains usable.","taskId":"TASK-021"}
+{"timestamp":"2026-09-06T03:41:15.481Z","level":"warning","message":"Automatic chat compaction is unavailable; normal task execution remains usable.","taskId":"TASK-024"}
+{"timestamp":"2026-09-06T03:46:22.268Z","level":"warning","message":"Automatic chat compaction is unavailable; normal task execution remains usable.","taskId":"TASK-024"}
