@@ -123,10 +123,15 @@ suite('Automatic local workspace registry', () => {
 
 			const listing = await (await fetch(`${first.baseUrl}/api/workspaces`)).json() as { workspaces: Array<{ id: string }> };
 			assert.deepStrictEqual(listing.workspaces.map((workspace) => workspace.id), ['workspace-a', 'workspace-b']);
+			await first.release();
+			const stillShared = await fetch(`${second.baseUrl}/health`);
+			assert.strictEqual(stillShared.status, 200, 'releasing one host must not stop the shared registry');
+			await second.shutdown();
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			await assert.rejects(() => fetch(`${second.baseUrl}/health`), TypeError, 'forced shutdown must stop the registry despite another client lease');
 		} finally {
 			first.dispose();
 			second.dispose();
-			await new Promise((resolve) => setTimeout(resolve, 250));
 			await fsRm(directory);
 		}
 	});

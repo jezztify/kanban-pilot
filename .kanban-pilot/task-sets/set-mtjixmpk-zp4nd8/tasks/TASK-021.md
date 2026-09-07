@@ -2,11 +2,11 @@
 id: TASK-021
 title: Update CHANGELOGS.md for 0.4.4
 type: feature
-state: in-progress
-status: blocked
-position: 0
+state: done
+status: idle
+position: 19
 created: 2026-09-06T03:17:25Z
-updated: 2026-09-06T03:19:59Z
+updated: 2026-09-06T06:12:50Z
 chat: kanban-pilot-set-mtjixmpk-zp4nd8-TASK-021
 copilot_session_id: a472d62a-7a93-4ae5-bbfd-f5b9e0fe7282
 scope_hash: bfbd36e
@@ -75,3 +75,5 @@ Feature: update the 0.4.4 release notes in the canonical changelog.
 - run:ruj2tz8 task:TASK-021 stage:develop result:ok note:"2026-09-06T03:19:26Z — verified the existing CHANGELOG.md 0.4.4 section already contains the scoped release facts with one heading and no changelog diff required"
 - audit:status-change at:2026-09-06T03:19:59Z task:TASK-021 from:running to:blocked action:receipt run:ruj2tz8 outcome:blocked note:"Status changed from running to blocked via receipt."
 - audit:activity-finish at:2026-09-06T03:19:59Z task:TASK-021 stage:develop action:receipt run:ruj2tz8 outcome:blocked note:"Develop completion requires implementation evidence with changed files and verification."
+- audit:state-change at:2026-09-06T06:12:50Z task:TASK-021 from:in-progress to:done action:move note:"State changed from in-progress to done via move."
+- audit:status-change at:2026-09-06T06:12:50Z task:TASK-021 from:blocked to:idle action:move note:"Status changed from blocked to idle via move."

@@ -53,6 +53,10 @@ export interface SharedLocalWorkspaceRegistry extends LocalWorkspaceRegistry {
 	readonly baseUrl: string;
 	readonly credential: string;
 	readonly clientId: string;
+	/** Releases this extension host's lease and waits for the registry to acknowledge it. */
+	release(): Promise<void>;
+	/** Stops the shared registry even if another extension host still holds a lease. */
+	shutdown(): Promise<void>;
 }
 
 interface WorkspaceRegistration {
@@ -558,6 +562,11 @@ export async function startLocalWorkspaceRegistry(options: LocalWorkspaceRegistr
 	const startedAt = Date.now();
 	let readyForIdle = false;
 	let disposed = false;
+	const stopIfIdle = (): void => {
+		if (readyForIdle && !disposed && clients.size === 0) {
+			options.onIdle?.();
+		}
+	};
 	const idleSweep = options.onIdle
 		? setInterval(() => {
 			const threshold = Date.now() - idleTtlMs;
@@ -566,8 +575,8 @@ export async function startLocalWorkspaceRegistry(options: LocalWorkspaceRegistr
 					clients.delete(clientId);
 				}
 			}
-			if (readyForIdle && !disposed && clients.size === 0 && Date.now() - startedAt >= idleTtlMs) {
-				options.onIdle?.();
+			if (Date.now() - startedAt >= idleTtlMs) {
+				stopIfIdle();
 			}
 		}, Math.max(100, Math.min(idleTtlMs, 5_000)))
 		: undefined;
@@ -613,6 +622,15 @@ export async function startLocalWorkspaceRegistry(options: LocalWorkspaceRegistr
 				json(response, 204);
 				return;
 			}
+			if (request.method === 'POST' && url.pathname === '/api/shutdown') {
+				if (!authorized(request, options.credential)) {
+					json(response, 401, { error: 'Authentication required.' });
+					return;
+				}
+				json(response, 204);
+				options.onIdle?.();
+				return;
+			}
 			const client = /^\/api\/clients\/([^/]+)$/.exec(url.pathname);
 			if ((request.method === 'PUT' || request.method === 'DELETE') && client) {
 				if (!authorized(request, options.credential)) {
@@ -628,6 +646,7 @@ export async function startLocalWorkspaceRegistry(options: LocalWorkspaceRegistr
 					clients.set(clientId, Date.now());
 				} else {
 					clients.delete(clientId);
+					stopIfIdle();
 				}
 				json(response, 204);
 				return;
@@ -893,18 +912,37 @@ async function attachSharedRegistry(
 	}, 30_000);
 	heartbeat.unref?.();
 	const port = Number(new URL(metadata.baseUrl).port);
+	const release = async (): Promise<void> => {
+		if (disposed) {
+			return;
+		}
+		disposed = true;
+		clearInterval(heartbeat);
+		await updateSharedRegistryClient(metadata, clientId, 'DELETE');
+	};
+	const shutdown = async (): Promise<void> => {
+		if (disposed) {
+			return;
+		}
+		disposed = true;
+		clearInterval(heartbeat);
+		const response = await registryRequest(
+			`${metadata.baseUrl}/api/shutdown`,
+			{ method: 'POST', headers: { authorization: `Bearer ${metadata.credential}` } },
+		);
+		if (!response.ok) {
+			throw new Error(`Shared local registry shutdown was rejected (${response.status}).`);
+		}
+	};
 	return {
 		port,
 		baseUrl: metadata.baseUrl,
 		credential: metadata.credential,
 		clientId,
+		release,
+		shutdown,
 		dispose: () => {
-			if (disposed) {
-				return;
-			}
-			disposed = true;
-			clearInterval(heartbeat);
-			void updateSharedRegistryClient(metadata, clientId, 'DELETE').catch(() => undefined);
+			void release().catch(() => undefined);
 		},
 	};
 }

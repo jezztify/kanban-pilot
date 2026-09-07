@@ -611,6 +611,7 @@ export class WorkspaceTaskSetContext {
 }
 
 const workspaceContexts = new Map<string, WorkspaceTaskSetContext>();
+let shutdownEndpointLifecycle: (() => Promise<void>) | undefined;
 
 function activeWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
 	// v1 binds the board to the first workspace folder (R7).
@@ -774,6 +775,7 @@ export function activate(context_: vscode.ExtensionContext) {
 		const endpointServers = new Map<string, { server: RealtimeBoardServer; host: EndpointTaskSetHost; url: string; requestedPort: number }>();
 		let endpointGeneration = 0;
 		let lifecycleDisposed = false;
+		let shutdownPromise: Promise<void> | undefined;
 		let localRegistry: SharedLocalWorkspaceRegistry | undefined;
 		let localRegistryConfig: WorkspaceRegistryConfig | undefined;
 		const localRegistryReady = connectSharedLocalWorkspaceRegistry({
@@ -885,21 +887,31 @@ export function activate(context_: vscode.ExtensionContext) {
 		};
 		const registryHeartbeat = setInterval(() => { void syncRegistry(); }, 30_000);
 		registryHeartbeat.unref?.();
+		const shutdown = (): Promise<void> => {
+			if (shutdownPromise) {
+				return shutdownPromise;
+			}
+			lifecycleDisposed = true;
+			clearInterval(registryHeartbeat);
+			for (const entry of endpointServers.values()) { entry.server.dispose(); entry.host.dispose(); }
+			endpointServers.clear();
+			shutdownPromise = (async () => {
+				await localRegistryReady;
+				await registrySyncTail;
+				if (registeredRegistry) {
+					await registryClient.remove(registeredRegistry).catch(() => undefined);
+					registeredRegistry = undefined;
+				}
+				if (localRegistry) {
+					await localRegistry.shutdown().catch(() => undefined);
+				}
+			})();
+			return shutdownPromise;
+		};
+		shutdownEndpointLifecycle = shutdown;
 		context_.subscriptions.push({
 			dispose: () => {
-				lifecycleDisposed = true;
-				clearInterval(registryHeartbeat);
-				for (const entry of endpointServers.values()) { entry.server.dispose(); entry.host.dispose(); }
-				endpointServers.clear();
-				void (async () => {
-					await localRegistryReady;
-					await registrySyncTail;
-					if (registeredRegistry) {
-						await registryClient.remove(registeredRegistry);
-						registeredRegistry = undefined;
-					}
-					localRegistry?.dispose();
-				})();
+				void shutdown();
 			},
 		});
 		context_.subscriptions.push(workspaceContext?.onDidChange((change) => { if (change?.kind === 'task-set') { void restartEndpoint(); } }) ?? new vscode.Disposable(() => undefined));
@@ -1281,7 +1293,9 @@ export function activate(context_: vscode.ExtensionContext) {
 	}
 }
 
-export function deactivate() {
+export async function deactivate() {
+	await shutdownEndpointLifecycle?.();
+	shutdownEndpointLifecycle = undefined;
 	for (const workspaceContext of workspaceContexts.values()) {
 		workspaceContext.dispose();
 	}

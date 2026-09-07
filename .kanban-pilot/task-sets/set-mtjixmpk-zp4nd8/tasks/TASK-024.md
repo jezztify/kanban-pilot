@@ -2,11 +2,11 @@
 id: TASK-024
 title: Tests fail when running in Github Actions
 type: feature
-state: in-progress
-status: blocked
-position: 1
+state: done
+status: idle
+position: 18
 created: 2026-09-06T03:41:13Z
-updated: 2026-09-06T03:58:03Z
+updated: 2026-09-06T06:12:48Z
 chat: kanban-pilot-set-mtjixmpk-zp4nd8-TASK-024
 copilot_session_id: e529f2aa-da6d-402b-ba56-f4a477e98487
 scope_hash: 31c530c
@@ -136,3 +136,5 @@ Implementation checklist for the three recommended feature tasks:
 - run:rukya1q task:TASK-024 stage:develop result:ok note:"2026-09-06T03:56:50Z — develop completed: fixed writable test roots, stabilized bounded receipt reconciliation, synchronized capacity configuration visibility, and passed full validation"
 - audit:status-change at:2026-09-06T03:58:03Z task:TASK-024 from:running to:blocked action:receipt run:rukya1q outcome:blocked note:"Status changed from running to blocked via receipt."
 - audit:activity-finish at:2026-09-06T03:58:03Z task:TASK-024 stage:develop action:receipt run:rukya1q outcome:blocked note:"Develop completion requires implementation evidence with changed files and verification."
+- audit:state-change at:2026-09-06T06:12:48Z task:TASK-024 from:in-progress to:done action:move note:"State changed from in-progress to done via move."
+- audit:status-change at:2026-09-06T06:12:48Z task:TASK-024 from:blocked to:idle action:move note:"Status changed from blocked to idle via move."
